@@ -1,0 +1,8 @@
+{
+  "job_id": "job-01JFC8X2W3D4E5F6G7H8J9K0M",
+  "user_id": "local_user",
+  "molecule_smiles": "CCOc1ccc2nc(S(N)(=O)=O)sc2c1",
+  "solvent_smiles": "CCO",
+  "model_choice": "fluorcast-default",
+  "requested_at": "2026-07-03T14:30:00.000Z"
+}

@@ -1,0 +1,7 @@
+{
+  "job_id": "job-01JFC8X2W3D4E5F6G7H8J9K0M",
+  "status": "failed",
+  "completed_at": "2026-07-03T14:31:08.000Z",
+  "predictions": [],
+  "error": "The selected model could not process this molecule/solvent pair."
+}

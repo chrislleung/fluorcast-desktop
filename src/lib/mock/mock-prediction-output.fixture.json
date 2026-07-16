@@ -1,0 +1,40 @@
+{
+  "job_id": "mock-job-output",
+  "status": "succeeded",
+  "completed_at": "2026-07-03T14:34:12.000Z",
+  "canonical_molecule_smiles": "CCOc1ccc2nc(S(N)(=O)=O)sc2c1",
+  "canonical_solvent_smiles": "CCO",
+  "predictions": [
+    {
+      "property": "emission_wavelength",
+      "value": 462.7,
+      "unit": "nm",
+      "model": "mock-fluorcast",
+      "applicability_domain": {
+        "in_domain": true,
+        "score": 0.91,
+        "message": "Mock result within the training-set chemical space"
+      }
+    },
+    {
+      "property": "quantum_yield",
+      "value": 0.64,
+      "unit": "ratio",
+      "model": "mock-fluorcast",
+      "applicability_domain": {
+        "in_domain": true,
+        "score": 0.88
+      }
+    }
+  ],
+  "applicability_domain": {
+    "nearest_training_similarity": 0.91,
+    "outside_applicability_domain": false,
+    "exact_molecule_match": false,
+    "exact_solvent_pair_match": false,
+    "scaffold_match": true
+  },
+  "warnings": [
+    "Mock result generated locally. Do not use for scientific decisions."
+  ]
+}
