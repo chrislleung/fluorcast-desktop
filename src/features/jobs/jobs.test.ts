@@ -69,4 +69,32 @@ describe("jobsReducer", () => {
       error_message: "Mock backend failed",
     });
   });
+
+  it("stores upload status and remote job directory", () => {
+    const state = jobsReducer({ jobs: [baseJob] }, {
+      type: "update_status",
+      id: "job-1",
+      status: "uploaded_to_nibi",
+      remote_job_dir: "/home/user/scratch/fluorcast-jobs/job-1",
+    });
+
+    expect(state.jobs[0]).toMatchObject({
+      status: "uploaded_to_nibi",
+      remote_job_dir: "/home/user/scratch/fluorcast-jobs/job-1",
+    });
+  });
+
+  it("stores upload failures", () => {
+    const state = jobsReducer({ jobs: [baseJob] }, {
+      type: "upload_failed",
+      id: "job-1",
+      completed_at: "2026-07-03T14:34:12.000Z",
+      error_message: "Upload failed",
+    });
+
+    expect(state.jobs[0]).toMatchObject({
+      status: "upload_failed",
+      error_message: "Upload failed",
+    });
+  });
 });

@@ -31,6 +31,8 @@ describe("manual MFA session helpers", () => {
     expect(commands.login_command).toContain("host=\"alice@nibi.alliancecan.ca\"");
     expect(commands.login_command).toContain("ssh -fMN");
     expect(commands.login_command).toContain('-S "$ctl"');
+    expect(commands.login_command).toContain("-o ControlMaster=yes");
+    expect(commands.login_command).toContain('-o ControlPath="$ctl"');
     expect(commands.login_command).toContain("-o ControlPersist=4h");
     expect(commands.login_command).not.toContain("pkill -f");
     expect(commands.login_command).toContain('ssh -S "$ctl" -O check "$host" >/dev/null 2>&1');
@@ -107,7 +109,7 @@ describe("manual MFA session helpers", () => {
       stderr: "Duo two-factor login. Passcode:",
       control_path_exists: true,
     })).toMatchObject({
-      status: "authentication_required",
+      status: "session_not_reused",
       can_run_background_commands: false,
     });
   });
@@ -126,7 +128,34 @@ describe("manual MFA session helpers", () => {
 
   it("maps connection refused to session inactive", () => {
     expect(mapManualMfaSessionError("Control socket connect failed: Connection refused"))
-      .toBe("The NIBI login session is not active. Start manual login again.");
+      .toBe("FluorCast did not find the reusable SSH session. Start login from FluorCast and keep the session alive.");
+    expect(classifyManualMfaSessionTest({
+      exit_code: 255,
+      stdout: "",
+      stderr: "No such file or directory",
+      control_path_exists: false,
+    })).toMatchObject({
+      status: "session_not_found",
+    });
+  });
+
+  it("maps ControlMaster and permission failures to specific causes", () => {
+    expect(classifyManualMfaSessionTest({
+      exit_code: 255,
+      stdout: "",
+      stderr: "Bad configuration option: controlmaster",
+      control_path_exists: true,
+    })).toMatchObject({
+      status: "controlmaster_unsupported",
+    });
+    expect(classifyManualMfaSessionTest({
+      exit_code: 255,
+      stdout: "",
+      stderr: "Permission denied (publickey)",
+      control_path_exists: true,
+    })).toMatchObject({
+      status: "permission_denied",
+    });
   });
 
   it("maps terminal exit code 15 to terminal-exited-before-authentication guidance", () => {

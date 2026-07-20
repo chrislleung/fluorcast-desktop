@@ -24,6 +24,7 @@ export type RemoteCommandSpec = {
   env?: Record<string, string>;
   timeout_ms?: number;
   redacted_preview?: string;
+  settings?: unknown;
 };
 
 export type RemoteCommandResult = {
@@ -33,6 +34,7 @@ export type RemoteCommandResult = {
   duration_ms: number;
   command_label: string;
   redacted_command_preview: string;
+  timed_out?: boolean;
 };
 
 export class RemoteExecutionError extends Error {

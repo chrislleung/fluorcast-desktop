@@ -1,4 +1,5 @@
-import { useEffect, useReducer, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { AppShell, type AppPage } from "./components/AppShell";
 import { AboutPage } from "./pages/AboutPage";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
@@ -31,8 +32,19 @@ import {
   type JobWithResult,
 } from "../lib/db";
 import {
+  createRemoteExecutor,
   defaultManualMfaSessionState,
+  InteractiveMfaRemoteExecutor,
+  applyManualMfaSessionResult,
+  applyManualMfaTerminalLaunchResult,
+  cancelSlurmJob,
+  pollSlurmJobStatus,
+  submitPredictionSlurmJob,
+  type ManualMfaSessionCommands,
+  type ManualMfaSessionResult,
+  type ManualMfaTerminalLaunchResult,
   type ManualMfaSessionUiState,
+  type SlurmPollingResult,
 } from "../lib/remote";
 import { PredictionJobValidationError } from "../lib/schemas";
 
@@ -40,6 +52,13 @@ const ACCENT_COLOR_SETTING_KEY = "accentColor";
 const SECONDARY_COLOR_SETTING_KEY = "secondaryColor";
 const DEFAULT_SECONDARY_COLOR = "#8ee6c8";
 type DatabaseStatus = "initializing" | "ready" | "fatal";
+type PersistentShellSessionStatus = {
+  process_id: number | null;
+  started_at: string;
+  status: "not_started" | "connecting" | "waiting_for_login_mfa" | "active" | "failed" | "disconnected";
+  output: string;
+  message: string;
+};
 
 function getPageFromHash(): { page: AppPage; jobId: string | null } {
   const hash = window.location.hash.replace(/^#\/?/, "");
@@ -77,8 +96,18 @@ export function App() {
   const [databaseError, setDatabaseError] = useState<string | null>(null);
   const [databaseStatus, setDatabaseStatus] = useState<DatabaseStatus>("initializing");
   const [jobsState, dispatchJobs] = useReducer(jobsReducer, initialJobsState);
+  const [latestPollingResult, setLatestPollingResult] = useState<SlurmPollingResult | null>(null);
+  const [manualMfaJobStatus, setManualMfaJobStatus] = useState("");
+  const [isManualMfaJobActionWorking, setIsManualMfaJobActionWorking] = useState(false);
+  const [lastJobsSessionProbeKey, setLastJobsSessionProbeKey] = useState("");
+  const activeSlurmSubmissionsRef = useRef<Set<string>>(new Set());
 
   const selectedJob = selectedJobDetail ?? undefined;
+
+  const refreshJobsFromDatabase = useCallback(async () => {
+    const persistedJobs = await listJobs();
+    dispatchJobs({ type: "set_jobs", jobs: persistedJobs });
+  }, []);
 
   useEffect(() => {
     function syncPageFromHash() {
@@ -208,7 +237,7 @@ export function App() {
     void refreshJobsFromDatabase().catch((error: unknown) => {
       setDatabaseError(error instanceof Error ? error.message : "Local jobs failed to load.");
     });
-  }, [currentPage, databaseStatus]);
+  }, [currentPage, databaseStatus, refreshJobsFromDatabase]);
 
   function navigate(page: AppPage) {
     setHashForPage(page);
@@ -228,10 +257,318 @@ export function App() {
     setCurrentPage("result");
   }
 
-  async function refreshJobsFromDatabase() {
-    const persistedJobs = await listJobs();
-    dispatchJobs({ type: "set_jobs", jobs: persistedJobs });
-  }
+  const createSelectedRemoteExecutor = useCallback(() => {
+    const remoteExecutor = createRemoteExecutor(nibiSettings.connection_mode);
+    if (remoteExecutor instanceof InteractiveMfaRemoteExecutor) {
+      remoteExecutor.setAuthenticated(
+        manualMfaSession.status === "authenticated"
+        && manualMfaSession.can_run_background_commands,
+      );
+    }
+    return remoteExecutor;
+  }, [manualMfaSession, nibiSettings]);
+
+  const createAuthenticatedManualExecutor = useCallback(() => {
+    const remoteExecutor = createRemoteExecutor(nibiSettings.connection_mode);
+    if (remoteExecutor instanceof InteractiveMfaRemoteExecutor) {
+      remoteExecutor.setAuthenticated(true);
+    }
+    return remoteExecutor;
+  }, [nibiSettings.connection_mode]);
+
+  const isManualMfaReady = useCallback(() => (
+    nibiSettings.connection_mode !== "interactive_mfa"
+    || nibiSettings.manual_mfa_provider === "terminal_action"
+    || (manualMfaSession.status === "authenticated" && manualMfaSession.can_run_background_commands)
+  ), [manualMfaSession, nibiSettings.connection_mode, nibiSettings.manual_mfa_provider]);
+
+  const testManualMfaSessionForJobs = useCallback(async (options: { jobsPageBlocked?: boolean } = {}) => {
+    if (nibiSettings.connection_mode !== "interactive_mfa") {
+      return true;
+    }
+
+    setIsManualMfaJobActionWorking(true);
+    setManualMfaJobStatus("Testing the FluorCast Manual MFA session.");
+    try {
+      const result = await invoke<ManualMfaSessionResult>("test_manual_mfa_session", {
+        settings: nibiSettings,
+      });
+      const nextSession = applyManualMfaSessionResult(manualMfaSession, result, {
+        canMarkAuthenticated: true,
+        jobsPageBlocked: options.jobsPageBlocked,
+      });
+      setManualMfaSession(nextSession);
+      setManualMfaJobStatus(result.message);
+      if (nextSession.can_run_background_commands) {
+        const nextSettings = {
+          ...nibiSettings,
+          manual_login_verified: true,
+          last_manual_login_check_at: nextSession.last_successful_command_at,
+        };
+        setNibiSettings(nextSettings);
+        void saveNibiSettings(nextSettings);
+      }
+      return nextSession.status === "authenticated" && nextSession.can_run_background_commands;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Manual MFA session test could not run.";
+      setManualMfaJobStatus(message);
+      setManualMfaSession((current) => ({
+        ...current,
+        status: "failed",
+        last_session_probe_at: new Date().toISOString(),
+        last_session_test_result: message,
+        can_run_background_commands: false,
+        jobs_page_login_required_at: options.jobsPageBlocked ? new Date().toISOString() : current.jobs_page_login_required_at,
+      }));
+      return false;
+    } finally {
+      setIsManualMfaJobActionWorking(false);
+    }
+  }, [manualMfaSession, nibiSettings]);
+
+  const startManualMfaLoginFromJobs = useCallback(async () => {
+    if (nibiSettings.connection_mode !== "interactive_mfa") {
+      return;
+    }
+    setIsManualMfaJobActionWorking(true);
+    setManualMfaJobStatus("Starting the FluorCast Manual MFA login.");
+    try {
+      if (nibiSettings.manual_mfa_provider === "persistent_shell") {
+        const result = await invoke<PersistentShellSessionStatus>("persistent_shell_start", {
+          settings: nibiSettings,
+        });
+        setManualMfaSession((current) => ({
+          ...current,
+          status: result.status === "active" ? "authenticated" : "waiting_for_user_mfa",
+          parsed_session_status: result.status === "active" ? "authenticated" : "authentication_required",
+          selected_backend: "persistent_shell",
+          session_started_at: result.started_at || current.session_started_at,
+          can_run_background_commands: result.status === "active",
+          last_session_test_result: result.message,
+          persistent_shell_output: result.output,
+          persistent_shell_process_id: result.process_id,
+        }));
+        setManualMfaJobStatus(result.message);
+        setHashForPage("settings");
+        setCurrentPage("settings");
+        return;
+      }
+      const launch = await invoke<ManualMfaTerminalLaunchResult>("open_manual_mfa_login", {
+        settings: nibiSettings,
+      });
+      setManualMfaSession((current) => applyManualMfaTerminalLaunchResult(current, launch));
+      setManualMfaJobStatus(launch.message);
+    } catch (error) {
+      setManualMfaJobStatus(error instanceof Error ? error.message : "Could not open a terminal automatically. Start manual login from Settings.");
+    } finally {
+      setIsManualMfaJobActionWorking(false);
+    }
+  }, [nibiSettings]);
+
+  const copyManualMfaLoginCommandFromJobs = useCallback(async () => {
+    setManualMfaJobStatus("");
+    try {
+      const commands = await invoke<ManualMfaSessionCommands>("get_manual_mfa_session_commands", {
+        settings: nibiSettings,
+      });
+      await navigator.clipboard.writeText(commands.login_command);
+      setManualMfaSession((current) => ({
+        ...current,
+        control_path: commands.control_path,
+        control_path_exists: commands.control_path_exists,
+        manual_wsl_command: commands.manual_wsl_login_command,
+      }));
+      setManualMfaJobStatus("Manual MFA login command copied.");
+    } catch (error) {
+      setManualMfaJobStatus(error instanceof Error ? error.message : "Could not copy the Manual MFA login command.");
+    }
+  }, [nibiSettings]);
+
+  const refreshRemoteJob = useCallback(async (job: StoredPredictionJob) => {
+    const isTerminalAction = nibiSettings.connection_mode === "interactive_mfa" && nibiSettings.manual_mfa_provider === "terminal_action";
+    if (isTerminalAction) {
+      setIsManualMfaJobActionWorking(true);
+      setManualMfaJobStatus("NIBI action running. Complete password/Duo in the PowerShell window.");
+    }
+    let remoteExecutor = createSelectedRemoteExecutor();
+    try {
+      if (nibiSettings.connection_mode === "interactive_mfa" && !isManualMfaReady()) {
+        const ready = await testManualMfaSessionForJobs({ jobsPageBlocked: true });
+        if (!ready) {
+          await updateJobStatus(job.id, "login_required", {
+            errorMessage: "Manual MFA mode runs each NIBI action in a visible PowerShell window. Complete password and Duo when prompted.",
+          });
+          await addJobEvent(job.id, "manual_mfa_session_required", "Jobs page blocked because the Manual MFA session is not reusable.");
+          await refreshJobsFromDatabase();
+          return {
+            jobId: job.id,
+            slurmJobId: job.remote_slurm_id,
+            status: "login_required" as const,
+            message: "Manual MFA mode runs each NIBI action in a visible PowerShell window. Complete password and Duo when prompted.",
+          };
+        }
+        remoteExecutor = createAuthenticatedManualExecutor();
+      }
+      const result = await pollSlurmJobStatus(
+        job,
+        nibiSettings,
+        remoteExecutor,
+        { updateJobStatus, saveResult, addJobEvent },
+      );
+      setLatestPollingResult(result);
+      if (isTerminalAction) {
+        setManualMfaJobStatus(result.message);
+      }
+      await refreshJobsFromDatabase();
+      if (selectedJobId === job.id) {
+        const persistedJob = await getJobWithResult(job.id);
+        setSelectedJobDetail(persistedJob);
+      }
+      return result;
+    } finally {
+      if (isTerminalAction) {
+        setIsManualMfaJobActionWorking(false);
+      }
+    }
+  }, [createAuthenticatedManualExecutor, createSelectedRemoteExecutor, isManualMfaReady, nibiSettings, refreshJobsFromDatabase, selectedJobId, testManualMfaSessionForJobs]);
+
+  const submitRemoteSlurmJob = useCallback(async (job: StoredPredictionJob) => {
+    const submissionId = job.submission_id ?? job.id;
+    if (activeSlurmSubmissionsRef.current.has(submissionId)) {
+      await addJobEvent(job.id, "slurm_submission_ignored", "duplicate Slurm submission ignored while an existing submission is active");
+      return {
+        jobId: job.id,
+        status: job.remote_slurm_id ? "submitted_to_slurm" as const : "submitting" as const,
+        message: job.remote_slurm_id ? `Slurm job ${job.remote_slurm_id} is already submitted.` : "Submission is already in progress.",
+        remoteSlurmId: job.remote_slurm_id,
+      };
+    }
+    activeSlurmSubmissionsRef.current.add(submissionId);
+    const isTerminalAction = nibiSettings.connection_mode === "interactive_mfa" && nibiSettings.manual_mfa_provider === "terminal_action";
+    if (isTerminalAction) {
+      setIsManualMfaJobActionWorking(true);
+      setManualMfaJobStatus("Slurm submission running. Complete password/Duo in the PowerShell window.");
+    }
+    await addJobEvent(job.id, "retry_slurm_submission_requested", "retry Slurm submission requested");
+    let remoteExecutor = createSelectedRemoteExecutor();
+    try {
+      if (nibiSettings.connection_mode === "interactive_mfa" && !isManualMfaReady()) {
+        const ready = await testManualMfaSessionForJobs({ jobsPageBlocked: true });
+        if (!ready) {
+          await updateJobStatus(job.id, "login_required", {
+            errorMessage: "Manual MFA mode runs each NIBI action in a visible PowerShell window. Complete password and Duo when prompted.",
+          });
+          await addJobEvent(job.id, "manual_mfa_session_required", "Jobs page blocked because the Manual MFA session is not reusable.");
+          await refreshJobsFromDatabase();
+          return {
+            jobId: job.id,
+            status: "login_required" as const,
+            message: "Manual MFA mode runs each NIBI action in a visible PowerShell window. Complete password and Duo when prompted.",
+          };
+        }
+        remoteExecutor = createAuthenticatedManualExecutor();
+      }
+      const result = await submitPredictionSlurmJob(
+        job,
+        nibiSettings,
+        remoteExecutor,
+        { updateJobStatus, addJobEvent },
+      );
+      if (isTerminalAction) {
+        setManualMfaJobStatus(result.message);
+      }
+      await refreshJobsFromDatabase();
+      if (selectedJobId === job.id) {
+        const persistedJob = await getJobWithResult(job.id);
+        setSelectedJobDetail(persistedJob);
+      }
+      return result;
+    } finally {
+      activeSlurmSubmissionsRef.current.delete(submissionId);
+      if (isTerminalAction) {
+        setIsManualMfaJobActionWorking(false);
+      }
+    }
+  }, [createAuthenticatedManualExecutor, createSelectedRemoteExecutor, isManualMfaReady, nibiSettings, refreshJobsFromDatabase, selectedJobId, testManualMfaSessionForJobs]);
+
+  const cancelRemoteSlurmJob = useCallback(async (job: StoredPredictionJob) => {
+    const remoteExecutor = createSelectedRemoteExecutor();
+    const result = await cancelSlurmJob(
+      job,
+      nibiSettings,
+      remoteExecutor,
+      { updateJobStatus, addJobEvent },
+    );
+    setManualMfaJobStatus(result.message);
+    await refreshJobsFromDatabase();
+    return result;
+  }, [createSelectedRemoteExecutor, nibiSettings, refreshJobsFromDatabase]);
+
+  const testManualMfaSessionAndRetryJob = useCallback(async (job: StoredPredictionJob) => {
+    const ready = await testManualMfaSessionForJobs({ jobsPageBlocked: true });
+    if (!ready) {
+      return false;
+    }
+    if (job.status === "uploaded_to_nibi" || job.status === "slurm_submission_failed") {
+      await submitRemoteSlurmJob(job);
+    } else if (job.remote_slurm_id) {
+      await refreshRemoteJob(job);
+    }
+    return true;
+  }, [refreshRemoteJob, submitRemoteSlurmJob, testManualMfaSessionForJobs]);
+
+  useEffect(() => {
+    if (
+      databaseStatus !== "ready"
+      || currentPage !== "jobs"
+      || nibiSettings.connection_mode !== "interactive_mfa"
+      || isManualMfaReady()
+      || !hasManualMfaControlPath(nibiSettings, manualMfaSession)
+      || !jobsState.jobs.some(needsRemoteJobAction)
+    ) {
+      return;
+    }
+
+    const probeKey = `${nibiSettings.wsl_control_socket_path || manualMfaSession.control_path}:${jobsState.jobs.map((job) => `${job.id}:${job.status}`).join(",")}`;
+    if (probeKey === lastJobsSessionProbeKey) {
+      return;
+    }
+    setLastJobsSessionProbeKey(probeKey);
+    void testManualMfaSessionForJobs({ jobsPageBlocked: true }).catch((error: unknown) => {
+      setManualMfaJobStatus(error instanceof Error ? error.message : "Manual MFA session probe failed.");
+    });
+  }, [
+    currentPage,
+    databaseStatus,
+    isManualMfaReady,
+    jobsState.jobs,
+    lastJobsSessionProbeKey,
+    manualMfaSession,
+    nibiSettings,
+    testManualMfaSessionForJobs,
+  ]);
+
+  const refreshActiveRemoteJobs = useCallback(async () => {
+    for (const job of jobsState.jobs.filter(isPollableRemoteJob)) {
+      await refreshRemoteJob(job);
+    }
+  }, [jobsState.jobs, refreshRemoteJob]);
+
+  useEffect(() => {
+    if (databaseStatus !== "ready") {
+      return;
+    }
+    const activeJobs = jobsState.jobs.filter(isPollableRemoteJob);
+    if (activeJobs.length === 0) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void refreshActiveRemoteJobs().catch((error: unknown) => {
+        setDatabaseError(error instanceof Error ? error.message : "Remote job polling failed.");
+      });
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [databaseStatus, jobsState.jobs, refreshActiveRemoteJobs]);
 
   async function persistJobChange(job: StoredPredictionJob) {
     try {
@@ -370,25 +707,94 @@ export function App() {
       );
     }
 
-    if (job.status === "queued_locally" || job.status === "running") {
+    if (
+      job.status === "queued_locally"
+      || job.status === "submitting"
+      || job.status === "running"
+      || job.status === "submitted_to_slurm"
+      || job.status === "uploaded_to_nibi"
+      || job.status === "upload_waiting_for_login"
+      || job.status === "connection_failed"
+    ) {
       return (
         <div className="page narrow-page">
           <section className="empty-state loading-state">
             <span className="empty-icon" aria-hidden="true">...</span>
-            <h2>{job.status === "queued_locally" ? "Queued locally" : "Running"}</h2>
-            <p>This mock prediction is still being prepared.</p>
+            <h2>{job.status === "uploaded_to_nibi" ? "Uploaded to NIBI" : job.status === "slurm_submission_failed" ? "Slurm submission failed" : job.status === "upload_waiting_for_login" ? "Waiting for login" : job.status === "queued_locally" ? "Queued locally" : job.status === "submitted_to_slurm" ? "Submitted to Slurm" : job.status === "output_missing" ? "Waiting for output" : "Running"}</h2>
+            <p>{job.error_message ?? (job.remote_slurm_id ? `Slurm job ${job.remote_slurm_id}` : "This prediction is still being prepared.")}</p>
           </section>
         </div>
       );
     }
 
-    if (job.status === "failed") {
+    if (job.status === "login_required") {
+      return (
+        <div className="page narrow-page">
+          <section className="empty-state failed-state">
+            <span className="empty-icon" aria-hidden="true">!</span>
+            <h2>Reconnect to NIBI</h2>
+            <p>{job.error_message ?? "Your NIBI login session expired. Reconnect to NIBI, then refresh this job."}</p>
+            <button className="primary-button" onClick={() => navigate("settings")} type="button">
+              Go to Settings and reconnect
+            </button>
+          </section>
+        </div>
+      );
+    }
+
+    if (job.status === "robot_access_required" || job.status === "robot_auth_failed") {
+      return (
+        <div className="page narrow-page">
+          <section className="empty-state failed-state">
+            <span className="empty-icon" aria-hidden="true">!</span>
+            <h2>Robot automation not ready</h2>
+            <p>{job.error_message ?? "Robot automation is not ready. Upload the restricted public key to Alliance/CCDB and ask support to enable robot-node access."}</p>
+            <button className="primary-button" onClick={() => navigate("settings")} type="button">
+              Open robot setup instructions
+            </button>
+          </section>
+        </div>
+      );
+    }
+
+    if (job.status === "output_missing") {
+      return (
+        <div className="page narrow-page">
+          <section className="empty-state loading-state">
+            <span className="empty-icon" aria-hidden="true">...</span>
+            <h2>Waiting for output</h2>
+            <p>{job.error_message ?? "The job finished, but output.json is not available yet."}</p>
+            <button
+              className="primary-button"
+              disabled={!job.remote_slurm_id}
+              onClick={() => void refreshRemoteJob(job)}
+              type="button"
+            >
+              Refresh status
+            </button>
+          </section>
+        </div>
+      );
+    }
+
+    if (
+      job.status === "failed"
+      || job.status === "upload_failed"
+      || job.status === "slurm_submission_failed"
+      || job.status === "cancelled"
+      || job.status === "timeout"
+      || job.status === "output_invalid"
+      || job.status === "download_failed"
+    ) {
       return (
         <div className="page narrow-page">
           <section className="empty-state failed-state">
             <span className="empty-icon" aria-hidden="true">!</span>
             <h2>Prediction failed</h2>
             <p>{job.error_message ?? "No error message was recorded."}</p>
+            {latestPollingResult?.jobId === job.id && latestPollingResult.technicalDetails ? (
+              <pre>{latestPollingResult.technicalDetails}</pre>
+            ) : null}
           </section>
         </div>
       );
@@ -444,8 +850,11 @@ export function App() {
       case "prediction":
         return (
           <NewPredictionPage
+            manualMfaSession={manualMfaSession}
+            nibiSettings={nibiSettings}
             onJobChange={persistJobChange}
             onOpenResult={openResult}
+            onOpenSettings={() => navigate("settings")}
           />
         );
       case "jobs":
@@ -460,7 +869,25 @@ export function App() {
             </div>
           );
         }
-        return <JobsPage jobs={jobsState.jobs} onOpenResult={openResult} />;
+        return (
+          <JobsPage
+            jobs={jobsState.jobs}
+            isManualMfaWorking={isManualMfaJobActionWorking}
+            manualMfaSession={manualMfaSession}
+            manualMfaStatus={manualMfaJobStatus}
+            nibiSettings={nibiSettings}
+            onOpenResult={openResult}
+            onOpenManualMfaDiagnostics={() => navigate("settings")}
+            onOpenRobotSetup={() => navigate("settings")}
+            onCopyManualMfaLoginCommand={copyManualMfaLoginCommandFromJobs}
+            onReconnect={() => navigate("settings")}
+            onRefreshJobStatus={refreshRemoteJob}
+            onCancelRemoteJob={cancelRemoteSlurmJob}
+            onStartManualMfaLogin={startManualMfaLoginFromJobs}
+            onSubmitSlurmJob={submitRemoteSlurmJob}
+            onTestManualMfaSession={testManualMfaSessionAndRetryJob}
+          />
+        );
       case "settings":
         return (
           <SettingsPage
@@ -480,6 +907,9 @@ export function App() {
             isDatabaseReady={databaseStatus === "ready"}
             manualMfaSession={manualMfaSession}
             nibiSettings={nibiSettings}
+            activeJobsCount={jobsState.jobs.filter(isPollableRemoteJob).length}
+            jobsPageLoginRequiredCount={jobsState.jobs.filter((job) => job.status === "login_required").length}
+            latestPollingResult={latestPollingResult}
             onJobsRefresh={(jobs) => dispatchJobs({ type: "set_jobs", jobs })}
             onOpenResult={openResult}
           />
@@ -506,4 +936,30 @@ export function App() {
       {renderPage()}
     </AppShell>
   );
+}
+
+function isPollableRemoteJob(job: StoredPredictionJob) {
+  return Boolean(job.remote_slurm_id) && (
+    job.status === "submitted_to_slurm"
+    || job.status === "running"
+    || job.status === "output_missing"
+    || job.status === "login_required"
+    || job.status === "connection_failed"
+  );
+}
+
+function needsRemoteJobAction(job: StoredPredictionJob) {
+  return job.status === "uploaded_to_nibi"
+    || job.status === "submitting"
+    || job.status === "slurm_submission_failed"
+    || job.status === "submitted_to_slurm"
+    || job.status === "running"
+    || job.status === "login_required";
+}
+
+function hasManualMfaControlPath(
+  settings: NibiSettings,
+  session: ManualMfaSessionUiState,
+) {
+  return Boolean(session.control_path || settings.wsl_control_socket_path);
 }

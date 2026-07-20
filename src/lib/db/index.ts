@@ -29,6 +29,15 @@ type JobRow = {
   local_completed_at: string | null;
   remote_slurm_id: string | null;
   remote_job_dir: string | null;
+  remote_input_path: string | null;
+  remote_output_path: string | null;
+  submission_id?: string | null;
+  submitted_at: string | null;
+  slurm_state?: string | null;
+  slurm_exit_code?: string | null;
+  slurm_stdout?: string | null;
+  slurm_stderr?: string | null;
+  submitted_command?: string | null;
   error_message: string | null;
 };
 
@@ -43,6 +52,10 @@ type CountRow = {
 };
 
 type TableExistsRow = {
+  name: string;
+};
+
+type TableColumnRow = {
   name: string;
 };
 
@@ -143,6 +156,17 @@ async function tableExists(db: SqlDatabase, tableName: string): Promise<boolean>
   return rows.length > 0;
 }
 
+async function columnExists(db: SqlDatabase, tableName: string, columnName: string): Promise<boolean> {
+  const rows = await db.select<TableColumnRow[]>(`PRAGMA table_info(${tableName})`);
+  return rows.some((row) => row.name === columnName);
+}
+
+async function addColumnIfMissing(db: SqlDatabase, tableName: string, columnName: string, definition: string) {
+  if (!await columnExists(db, tableName, columnName)) {
+    await db.execute(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
 async function rowCount(db: SqlDatabase, tableName: string): Promise<number> {
   const rows = await db.select<CountRow[]>(`SELECT COUNT(*) AS count FROM ${tableName}`);
   return rows[0]?.count ?? 0;
@@ -174,8 +198,31 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
           local_completed_at TEXT,
           remote_slurm_id TEXT,
           remote_job_dir TEXT,
+          remote_input_path TEXT,
+          remote_output_path TEXT,
+          submission_id TEXT UNIQUE,
+          submitted_at TEXT,
+          slurm_state TEXT,
+          slurm_exit_code TEXT,
+          slurm_stdout TEXT,
+          slurm_stderr TEXT,
+          submitted_command TEXT,
           error_message TEXT
         )
+      `);
+      await addColumnIfMissing(db, "jobs", "remote_input_path", "TEXT");
+      await addColumnIfMissing(db, "jobs", "remote_output_path", "TEXT");
+      await addColumnIfMissing(db, "jobs", "submission_id", "TEXT");
+      await addColumnIfMissing(db, "jobs", "submitted_at", "TEXT");
+      await addColumnIfMissing(db, "jobs", "slurm_state", "TEXT");
+      await addColumnIfMissing(db, "jobs", "slurm_exit_code", "TEXT");
+      await addColumnIfMissing(db, "jobs", "slurm_stdout", "TEXT");
+      await addColumnIfMissing(db, "jobs", "slurm_stderr", "TEXT");
+      await addColumnIfMissing(db, "jobs", "submitted_command", "TEXT");
+      await db.execute(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_submission_id
+        ON jobs(submission_id)
+        WHERE submission_id IS NOT NULL
       `);
       await db.execute(`
         CREATE TABLE IF NOT EXISTS results (
@@ -247,9 +294,18 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
             local_completed_at,
             remote_slurm_id,
             remote_job_dir,
+            remote_input_path,
+            remote_output_path,
+            submission_id,
+            submitted_at,
+            slurm_state,
+            slurm_exit_code,
+            slurm_stdout,
+            slurm_stderr,
+            submitted_command,
             error_message
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
           ON CONFLICT(id) DO UPDATE SET
             molecule_smiles = excluded.molecule_smiles,
             solvent_smiles = excluded.solvent_smiles,
@@ -259,6 +315,15 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
             local_completed_at = excluded.local_completed_at,
             remote_slurm_id = excluded.remote_slurm_id,
             remote_job_dir = excluded.remote_job_dir,
+            remote_input_path = excluded.remote_input_path,
+            remote_output_path = excluded.remote_output_path,
+            submission_id = COALESCE(jobs.submission_id, excluded.submission_id),
+            submitted_at = excluded.submitted_at,
+            slurm_state = excluded.slurm_state,
+            slurm_exit_code = excluded.slurm_exit_code,
+            slurm_stdout = excluded.slurm_stdout,
+            slurm_stderr = excluded.slurm_stderr,
+            submitted_command = excluded.submitted_command,
             error_message = excluded.error_message
         `,
         [
@@ -271,6 +336,15 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
           job.completed_at ?? null,
           job.remote_slurm_id ?? null,
           job.remote_job_dir ?? null,
+          job.remote_input_path ?? null,
+          job.remote_output_path ?? null,
+          job.submission_id ?? job.id,
+          job.submitted_at ?? null,
+          job.slurm_state ?? null,
+          job.slurm_exit_code ?? null,
+          job.slurm_stdout ?? null,
+          job.slurm_stderr ?? null,
+          job.submitted_command ?? null,
           job.error_message ?? null,
         ],
       );
@@ -285,6 +359,15 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
         completedAt?: string;
         remoteSlurmId?: string;
         remoteJobDir?: string;
+        remoteInputPath?: string;
+        remoteOutputPath?: string;
+        submissionId?: string;
+        submittedAt?: string;
+        slurmState?: string;
+        slurmExitCode?: string;
+        slurmStdout?: string;
+        slurmStderr?: string;
+        submittedCommand?: string;
         errorMessage?: string;
       } = {},
     ): Promise<boolean> {
@@ -302,14 +385,32 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
             local_completed_at = COALESCE($2, local_completed_at),
             remote_slurm_id = COALESCE($3, remote_slurm_id),
             remote_job_dir = COALESCE($4, remote_job_dir),
-            error_message = $5
-          WHERE id = $6
+            remote_input_path = COALESCE($5, remote_input_path),
+            remote_output_path = COALESCE($6, remote_output_path),
+            submission_id = COALESCE($7, submission_id),
+            submitted_at = COALESCE($8, submitted_at),
+            slurm_state = COALESCE($9, slurm_state),
+            slurm_exit_code = COALESCE($10, slurm_exit_code),
+            slurm_stdout = COALESCE($11, slurm_stdout),
+            slurm_stderr = COALESCE($12, slurm_stderr),
+            submitted_command = COALESCE($13, submitted_command),
+            error_message = $14
+          WHERE id = $15
         `,
         [
           status,
           options.completedAt ?? null,
           options.remoteSlurmId ?? null,
           options.remoteJobDir ?? null,
+          options.remoteInputPath ?? null,
+          options.remoteOutputPath ?? null,
+          options.submissionId ?? null,
+          options.submittedAt ?? null,
+          options.slurmState ?? null,
+          options.slurmExitCode ?? null,
+          options.slurmStdout ?? null,
+          options.slurmStderr ?? null,
+          options.submittedCommand ?? null,
           options.errorMessage ?? null,
           jobId,
         ],
@@ -361,6 +462,15 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
           local_completed_at,
           remote_slurm_id,
           remote_job_dir,
+          remote_input_path,
+          remote_output_path,
+          submission_id,
+          submitted_at,
+          slurm_state,
+          slurm_exit_code,
+          slurm_stdout,
+          slurm_stderr,
+          submitted_command,
           error_message
         FROM jobs
         ORDER BY local_created_at DESC
@@ -387,6 +497,15 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
             jobs.local_completed_at,
             jobs.remote_slurm_id,
             jobs.remote_job_dir,
+            jobs.remote_input_path,
+            jobs.remote_output_path,
+            jobs.submission_id,
+            jobs.submitted_at,
+            jobs.slurm_state,
+            jobs.slurm_exit_code,
+            jobs.slurm_stdout,
+            jobs.slurm_stderr,
+            jobs.submitted_command,
             jobs.error_message,
             results.job_id,
             results.output_json,
@@ -628,6 +747,15 @@ export function jobRowToStoredJob(row: JobRow): PersistedPredictionJob {
     ...(row.local_completed_at ? { completed_at: row.local_completed_at } : {}),
     ...(row.remote_slurm_id ? { remote_slurm_id: row.remote_slurm_id } : {}),
     ...(row.remote_job_dir ? { remote_job_dir: row.remote_job_dir } : {}),
+    ...(row.remote_input_path ? { remote_input_path: row.remote_input_path } : {}),
+    ...(row.remote_output_path ? { remote_output_path: row.remote_output_path } : {}),
+    ...(row.submission_id ? { submission_id: row.submission_id } : {}),
+    ...(row.submitted_at ? { submitted_at: row.submitted_at } : {}),
+    ...(row.slurm_state ? { slurm_state: row.slurm_state } : {}),
+    ...(row.slurm_exit_code ? { slurm_exit_code: row.slurm_exit_code } : {}),
+    ...(row.slurm_stdout ? { slurm_stdout: row.slurm_stdout } : {}),
+    ...(row.slurm_stderr ? { slurm_stderr: row.slurm_stderr } : {}),
+    ...(row.submitted_command ? { submitted_command: row.submitted_command } : {}),
     ...(row.error_message ? { error_message: row.error_message } : {}),
   };
 }
@@ -663,6 +791,15 @@ export async function updateJobStatus(
     completedAt?: string;
     remoteSlurmId?: string;
     remoteJobDir?: string;
+    remoteInputPath?: string;
+    remoteOutputPath?: string;
+    submissionId?: string;
+    submittedAt?: string;
+    slurmState?: string;
+    slurmExitCode?: string;
+    slurmStdout?: string;
+    slurmStderr?: string;
+    submittedCommand?: string;
     errorMessage?: string;
   } = {},
 ): Promise<boolean> {

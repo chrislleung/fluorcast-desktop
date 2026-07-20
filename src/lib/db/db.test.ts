@@ -21,6 +21,9 @@ describe("database pure helpers", () => {
         local_completed_at: "2026-07-03T14:31:00.000Z",
         remote_slurm_id: null,
         remote_job_dir: "/scratch/job-1",
+        remote_input_path: "/scratch/job-1/input.json",
+        remote_output_path: "/scratch/job-1/output.json",
+        submitted_at: "2026-07-03T14:30:30.000Z",
         error_message: null,
       }),
     ).toEqual({
@@ -32,6 +35,9 @@ describe("database pure helpers", () => {
       created_at: "2026-07-03T14:30:00.000Z",
       completed_at: "2026-07-03T14:31:00.000Z",
       remote_job_dir: "/scratch/job-1",
+      remote_input_path: "/scratch/job-1/input.json",
+      remote_output_path: "/scratch/job-1/output.json",
+      submitted_at: "2026-07-03T14:30:30.000Z",
     });
   });
 
@@ -60,6 +66,9 @@ describe("database pure helpers", () => {
           local_completed_at: "2026-07-03T14:31:00.000Z",
           remote_slurm_id: null,
           remote_job_dir: null,
+          remote_input_path: null,
+          remote_output_path: null,
+          submitted_at: null,
           error_message: null,
           job_id: "job-1",
           output_json: serializePredictionResult(output),
@@ -114,6 +123,9 @@ describe("database pure helpers", () => {
           local_completed_at: "2026-07-03T14:31:00.000Z",
           remote_slurm_id: null,
           remote_job_dir: null,
+          remote_input_path: null,
+          remote_output_path: null,
+          submitted_at: null,
           error_message: null,
           job_id: null,
           output_json: null,

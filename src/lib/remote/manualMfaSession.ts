@@ -3,9 +3,16 @@ import { trimNibiSettings } from "../../features/settings";
 
 export type ManualMfaSessionStatus =
   | "login_required"
+  | "not_started"
+  | "connecting"
   | "waiting_for_user_mfa"
+  | "active"
   | "authenticated"
   | "authentication_required"
+  | "session_not_found"
+  | "session_not_reused"
+  | "controlmaster_unsupported"
+  | "permission_denied"
   | "disconnected"
   | "failed";
 
@@ -49,9 +56,25 @@ export type ManualMfaSessionResult = {
   can_run_background_commands: boolean;
   last_master_check_result: string;
   last_auth_ok_result: string;
-  selected_backend: "wsl";
+  last_session_test_stdout: string;
+  last_session_test_stderr: string;
+  last_session_test_exit_code: number | null;
+  parsed_session_status: ManualMfaSessionStatus;
+  selected_backend: "wsl" | "persistent_shell";
   wsl_available: boolean | null;
   wsl_ssh_available: boolean | null;
+};
+
+export type LocalSshCapabilitiesResult = {
+  ssh_version: string;
+  platform: string;
+  controlmaster_supported: boolean | null;
+  controlpath_supported: boolean | null;
+  attempted_controlmaster: boolean;
+  syntax_stdout: string;
+  syntax_stderr: string;
+  syntax_exit_code: number | null;
+  recommendation: string;
 };
 
 export type ManualMfaTerminalLaunchResult = {
@@ -78,12 +101,17 @@ export type ManualMfaSessionUiState = {
   control_path: string;
   session_started_at: string;
   last_successful_command_at: string;
+  last_session_probe_at: string;
   last_session_test_result: string;
   control_path_exists: boolean | null;
   can_run_background_commands: boolean;
   last_master_check_result: string;
   last_auth_ok_result: string;
-  selected_backend: "wsl";
+  last_session_test_stdout: string;
+  last_session_test_stderr: string;
+  last_session_test_exit_code: number | null;
+  parsed_session_status: ManualMfaSessionStatus;
+  selected_backend: "wsl" | "persistent_shell";
   wsl_available: boolean | null;
   wsl_ssh_available: boolean | null;
   wsl_distro: string;
@@ -99,6 +127,9 @@ export type ManualMfaSessionUiState = {
   last_launch_error_code: string;
   last_script_file_exists: boolean | null;
   manual_wsl_command: string;
+  jobs_page_login_required_at: string;
+  persistent_shell_output: string;
+  persistent_shell_process_id: number | null;
 };
 
 export const defaultManualMfaSessionState: ManualMfaSessionUiState = {
@@ -106,11 +137,16 @@ export const defaultManualMfaSessionState: ManualMfaSessionUiState = {
   control_path: "",
   session_started_at: "",
   last_successful_command_at: "",
+  last_session_probe_at: "",
   last_session_test_result: "Manual login has not been completed yet.",
   control_path_exists: null,
   can_run_background_commands: false,
   last_master_check_result: "",
   last_auth_ok_result: "",
+  last_session_test_stdout: "",
+  last_session_test_stderr: "",
+  last_session_test_exit_code: null,
+  parsed_session_status: "login_required",
   selected_backend: "wsl",
   wsl_available: null,
   wsl_ssh_available: null,
@@ -127,6 +163,9 @@ export const defaultManualMfaSessionState: ManualMfaSessionUiState = {
   last_launch_error_code: "",
   last_script_file_exists: null,
   manual_wsl_command: "",
+  jobs_page_login_required_at: "",
+  persistent_shell_output: "",
+  persistent_shell_process_id: null,
 };
 
 const AUTH_OK = "FLUORCAST_AUTH_OK";
@@ -182,6 +221,8 @@ export function buildManualMfaSessionCommands(
     '    -S "$ctl" \\',
     '    -i "$key" \\',
     "    -o IdentitiesOnly=yes \\",
+    "    -o ControlMaster=yes \\",
+    '    -o ControlPath="$ctl" \\',
     "    -o ControlPersist=4h \\",
     "    -o ServerAliveInterval=60 \\",
     "    -o ServerAliveCountMax=3 \\",
@@ -255,17 +296,31 @@ export function classifyManualMfaSessionTest(
       can_run_background_commands: true,
     };
   }
+  if (isControlMasterUnsupportedOutput(combined)) {
+    return {
+      status: "controlmaster_unsupported",
+      message: "Your SSH client may not support reusable ControlMaster sessions on Windows. Use WSL/manual fallback or robot automation.",
+      can_run_background_commands: false,
+    };
+  }
   if (isInteractiveAuthenticationOutput(combined)) {
     return {
-      status: "authentication_required",
-      message: "NIBI still requested password/Duo, so the app cannot run background commands yet. Start manual login again.",
+      status: "session_not_reused",
+      message: "The app session was not reused. NIBI is asking for login again.",
+      can_run_background_commands: false,
+    };
+  }
+  if (isPermissionDeniedOutput(combined)) {
+    return {
+      status: "permission_denied",
+      message: "Authentication failed. Check username, SSH key, and MFA setup.",
       can_run_background_commands: false,
     };
   }
   if (!output.control_path_exists) {
     return {
-      status: "disconnected",
-      message: "The SSH control session was not found or expired. Start manual login again.",
+      status: "session_not_found",
+      message: "FluorCast did not find the reusable SSH session. Start login from FluorCast and keep the session alive.",
       can_run_background_commands: false,
     };
   }
@@ -276,9 +331,89 @@ export function classifyManualMfaSessionTest(
   };
 }
 
+export function isControlMasterUnsupportedOutput(output: string): boolean {
+  return /Bad configuration option:\s*controlmaster|Unsupported option|ControlMaster|ControlPath|mux/i.test(output);
+}
+
+export function isPermissionDeniedOutput(output: string): boolean {
+  return /Permission denied/i.test(output) && !isInteractiveAuthenticationOutput(output);
+}
+
+export function applyManualMfaSessionResult(
+  current: ManualMfaSessionUiState,
+  result: ManualMfaSessionResult,
+  options: { canMarkAuthenticated?: boolean; jobsPageBlocked?: boolean } = {},
+): ManualMfaSessionUiState {
+  const checkedAt = new Date().toISOString();
+  const canMarkAuthenticated = options.canMarkAuthenticated ?? false;
+  const resultMarksAuthenticated = result.status === "authenticated" || result.can_run_background_commands;
+  const canRunBackgroundCommands = canMarkAuthenticated && result.can_run_background_commands;
+  return {
+    ...current,
+    status: resultMarksAuthenticated && !canMarkAuthenticated ? "login_required" : result.status,
+    control_path: result.control_path,
+    control_path_exists: result.control_path_exists,
+    last_session_probe_at: checkedAt,
+    last_session_test_result: result.message,
+    can_run_background_commands: canRunBackgroundCommands,
+    last_master_check_result: result.last_master_check_result,
+    last_auth_ok_result: result.last_auth_ok_result,
+    last_session_test_stdout: result.last_session_test_stdout ?? "",
+    last_session_test_stderr: result.last_session_test_stderr ?? "",
+    last_session_test_exit_code: result.last_session_test_exit_code ?? null,
+    parsed_session_status: result.parsed_session_status ?? result.status,
+    selected_backend: "wsl",
+    wsl_available: result.wsl_available,
+    wsl_ssh_available: result.wsl_ssh_available,
+    last_successful_command_at: canRunBackgroundCommands
+      ? checkedAt
+      : current.last_successful_command_at,
+    jobs_page_login_required_at: options.jobsPageBlocked ? checkedAt : current.jobs_page_login_required_at,
+  };
+}
+
+export function applyManualMfaTerminalLaunchResult(
+  current: ManualMfaSessionUiState,
+  launch: ManualMfaTerminalLaunchResult,
+): ManualMfaSessionUiState {
+  const startedAt = new Date().toISOString();
+  const commands = launch.commands;
+  return {
+    ...current,
+    status: launch.launched ? "waiting_for_user_mfa" : "login_required",
+    control_path: commands.control_path,
+    session_started_at: startedAt,
+    last_session_test_result: launch.message,
+    control_path_exists: commands.control_path_exists,
+    can_run_background_commands: false,
+    selected_backend: "wsl",
+    wsl_available: launch.wsl_available,
+    wsl_ssh_available: null,
+    wsl_distro: commands.wsl_distro,
+    windows_terminal_available: launch.windows_terminal_available,
+    powershell_available: launch.powershell_available,
+    last_terminal_launch_method: launch.method,
+    last_terminal_launch_command_preview: launch.command_preview,
+    last_terminal_launch_success: launch.launched,
+    last_terminal_launch_error: launch.error_message,
+    last_terminal_launch_at: launch.timestamp,
+    last_generated_script_path: launch.generated_script_path,
+    last_launch_method_attempted: launch.launch_method_attempted,
+    last_launch_error_code: launch.launch_error_code,
+    last_script_file_exists: launch.script_file_exists,
+    manual_wsl_command: launch.manual_wsl_command,
+  };
+}
+
 export function mapManualMfaSessionError(output: string): string {
   if (/getsockname failed: Not a socket/i.test(output)) {
     return "Native Windows SSH session reuse failed. Use WSL Manual MFA mode.";
+  }
+  if (isControlMasterUnsupportedOutput(output)) {
+    return "Your SSH client may not support reusable ControlMaster sessions on Windows. Use WSL/manual fallback or robot automation.";
+  }
+  if (isPermissionDeniedOutput(output)) {
+    return "Authentication failed. Check username, SSH key, and MFA setup.";
   }
   if (/code 15|0x0000000f|exit status:\s*15|signal:\s*15/i.test(output)) {
     return "The login terminal exited before authentication. The start script may have terminated itself. Try again after cleaning stale session.";
@@ -287,7 +422,7 @@ export function mapManualMfaSessionError(output: string): string {
     return "Windows could not find the terminal command to launch. Use the manual WSL command below.";
   }
   if (/Broken pipe|mux_client_request_session|Control socket connect|Connection refused|No such file or directory|Master is not running/i.test(output)) {
-    return "The NIBI login session is not active. Start manual login again.";
+    return "FluorCast did not find the reusable SSH session. Start login from FluorCast and keep the session alive.";
   }
   return output;
 }

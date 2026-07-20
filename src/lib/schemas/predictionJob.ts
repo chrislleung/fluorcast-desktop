@@ -64,6 +64,24 @@ export type PredictionJobOutput =
   | PredictionJobSuccessOutput
   | PredictionJobFailureOutput;
 
+export type DuplicateCheckInput = {
+  job_id: string;
+  user_id: string;
+  molecule_smiles: string;
+  solvent_smiles: string;
+  requested_at: string;
+};
+
+export type DuplicateCheckOutput = {
+  exact_molecule_match: boolean;
+  exact_solvent_pair_match: boolean;
+  scaffold_match: boolean;
+  nearest_training_similarity: number;
+  nearest_training_molecule_smiles: string;
+  warnings: string[];
+  error?: string;
+};
+
 export class PredictionJobValidationError extends Error {
   constructor(message: string) {
     super(message);
@@ -224,6 +242,22 @@ export const predictionJobInputSchema = schema<PredictionJobInput>((value) => {
   };
 });
 
+export const duplicateCheckInputSchema = schema<DuplicateCheckInput>((value) => {
+  const input = record(value, "input");
+  exactKeys(
+    input,
+    ["job_id", "user_id", "molecule_smiles", "solvent_smiles", "requested_at"],
+    "input",
+  );
+  return {
+    job_id: nonEmptyString(input.job_id, "input.job_id"),
+    user_id: nonEmptyString(input.user_id, "input.user_id"),
+    molecule_smiles: nonEmptyString(input.molecule_smiles, "input.molecule_smiles"),
+    solvent_smiles: nonEmptyString(input.solvent_smiles, "input.solvent_smiles"),
+    requested_at: isoDate(input.requested_at, "input.requested_at"),
+  };
+});
+
 export const predictionJobOutputSchema = schema<PredictionJobOutput>((value) => {
   const output = record(value, "output");
   exactKeys(
@@ -298,12 +332,71 @@ export const predictionJobOutputSchema = schema<PredictionJobOutput>((value) => 
   );
 });
 
+export const duplicateCheckOutputSchema = schema<DuplicateCheckOutput>((value) => {
+  const output = record(value, "output");
+  exactKeys(
+    output,
+    [
+      "exact_molecule_match",
+      "exact_solvent_pair_match",
+      "scaffold_match",
+      "nearest_training_similarity",
+      "nearest_training_molecule_smiles",
+      "warnings",
+      "error",
+    ],
+    "output",
+  );
+  for (const key of ["exact_molecule_match", "exact_solvent_pair_match", "scaffold_match"]) {
+    if (typeof output[key] !== "boolean") {
+      throw new PredictionJobValidationError(`output.${key} must be a boolean`);
+    }
+  }
+  if (
+    typeof output.nearest_training_similarity !== "number" ||
+    !Number.isFinite(output.nearest_training_similarity) ||
+    output.nearest_training_similarity < 0 ||
+    output.nearest_training_similarity > 1
+  ) {
+    throw new PredictionJobValidationError(
+      "output.nearest_training_similarity must be between 0 and 1",
+    );
+  }
+  if (!Array.isArray(output.warnings)) {
+    throw new PredictionJobValidationError("output.warnings must be an array");
+  }
+  return {
+    exact_molecule_match: output.exact_molecule_match,
+    exact_solvent_pair_match: output.exact_solvent_pair_match,
+    scaffold_match: output.scaffold_match,
+    nearest_training_similarity: output.nearest_training_similarity,
+    nearest_training_molecule_smiles: nonEmptyString(
+      output.nearest_training_molecule_smiles,
+      "output.nearest_training_molecule_smiles",
+    ),
+    warnings: output.warnings.map((warning, index) =>
+      nonEmptyString(warning, `output.warnings[${index}]`),
+    ),
+    ...(output.error === undefined
+      ? {}
+      : { error: nonEmptyString(output.error, "output.error") }),
+  };
+});
+
 export function validatePredictionJobInput(value: unknown): PredictionJobInput {
   return predictionJobInputSchema.parse(value);
 }
 
 export function validatePredictionJobOutput(value: unknown): PredictionJobOutput {
   return predictionJobOutputSchema.parse(value);
+}
+
+export function validateDuplicateCheckInput(value: unknown): DuplicateCheckInput {
+  return duplicateCheckInputSchema.parse(value);
+}
+
+export function validateDuplicateCheckOutput(value: unknown): DuplicateCheckOutput {
+  return duplicateCheckOutputSchema.parse(value);
 }
 
 export type CreatePredictionJobInputOptions = {
@@ -321,6 +414,23 @@ export function createPredictionJobInput(
     molecule_smiles: options.molecule_smiles,
     solvent_smiles: options.solvent_smiles,
     model_choice: options.model_choice,
+    requested_at: new Date().toISOString(),
+  });
+}
+
+export type CreateDuplicateCheckInputOptions = {
+  molecule_smiles: string;
+  solvent_smiles: string;
+};
+
+export function createDuplicateCheckInput(
+  options: CreateDuplicateCheckInputOptions,
+): DuplicateCheckInput {
+  return validateDuplicateCheckInput({
+    job_id: `duplicate-${crypto.randomUUID()}`,
+    user_id: "local_user",
+    molecule_smiles: options.molecule_smiles,
+    solvent_smiles: options.solvent_smiles,
     requested_at: new Date().toISOString(),
   });
 }

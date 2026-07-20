@@ -12,11 +12,14 @@ export type BackendMode = (typeof backendModes)[number];
 export type NibiSettings = {
   connection_mode: RemoteConnectionMode;
   backend_mode: BackendMode;
+  manual_mfa_provider: "terminal_action" | "persistent_shell" | "controlmaster" | "windows_openssh" | "wsl_openssh";
   manual_mfa_ssh_backend: "wsl";
   manual_mfa_wsl_distro: string;
   nibi_username: string;
   normal_login_host: string;
   robot_login_host: string;
+  robot_key_restriction_from: string;
+  robot_key_forced_command: string;
   nibi_host: string;
   ssh_private_key_path: string;
   wsl_ssh_private_key_path: string;
@@ -38,11 +41,14 @@ export type NibiSettingsWarnings = Partial<Record<keyof NibiSettings, string>>;
 export const defaultNibiSettings: NibiSettings = {
   connection_mode: "mock",
   backend_mode: "mock",
+  manual_mfa_provider: "terminal_action",
   manual_mfa_ssh_backend: "wsl",
   manual_mfa_wsl_distro: "Ubuntu",
   nibi_username: "user",
   normal_login_host: "nibi.alliancecan.ca",
   robot_login_host: "robot.nibi.alliancecan.ca",
+  robot_key_restriction_from: "134.153.150.*",
+  robot_key_forced_command: "/cvmfs/soft.computecanada.ca/custom/bin/computecanada/allowed_commands/allowed_commands.sh",
   nibi_host: "nibi.alliancecan.ca",
   ssh_private_key_path: "",
   wsl_ssh_private_key_path: "$HOME/.ssh/fluorcast_nibi_ed25519",
@@ -79,6 +85,13 @@ function normalizeConnectionMode(value: Record<string, unknown>): RemoteConnecti
     return value.connection_mode as RemoteConnectionMode;
   }
   return value.backend_mode === "nibi" ? "interactive_mfa" : "mock";
+}
+
+function normalizeManualMfaProvider(value: unknown): NibiSettings["manual_mfa_provider"] {
+  if (value === "terminal_action" || value === "persistent_shell" || value === "controlmaster" || value === "windows_openssh" || value === "wsl_openssh") {
+    return value;
+  }
+  return "terminal_action";
 }
 
 export function safeWslControlSocketName(username: string, host: string): string {
@@ -133,6 +146,7 @@ export function normalizeNibiSettings(value: unknown): NibiSettings {
   return {
     connection_mode: connectionMode,
     backend_mode: connectionMode === "mock" ? "mock" : "nibi",
+    manual_mfa_provider: normalizeManualMfaProvider(value.manual_mfa_provider),
     manual_mfa_ssh_backend: "wsl",
     manual_mfa_wsl_distro: stringValue(
       value.manual_mfa_wsl_distro,
@@ -141,6 +155,14 @@ export function normalizeNibiSettings(value: unknown): NibiSettings {
     nibi_username: username,
     normal_login_host: normalLoginHost,
     robot_login_host: stringValue(value.robot_login_host, defaultNibiSettings.robot_login_host),
+    robot_key_restriction_from: stringValue(
+      value.robot_key_restriction_from,
+      defaultNibiSettings.robot_key_restriction_from,
+    ),
+    robot_key_forced_command: stringValue(
+      value.robot_key_forced_command,
+      defaultNibiSettings.robot_key_forced_command,
+    ),
     nibi_host: normalLoginHost,
     ssh_private_key_path: sshPrivateKeyPath,
     wsl_ssh_private_key_path: stringValue(
@@ -202,30 +224,45 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
     }
   }
 
-  for (const field of [
-    "ssh_private_key_path",
-    "remote_project_path",
-    "remote_jobs_path",
-    "python_environment_path",
-  ] as const) {
+  const shellCheckedFields = trimmed.connection_mode === "mock"
+    ? []
+    : trimmed.connection_mode === "interactive_mfa"
+    ? [
+      "ssh_private_key_path",
+      "remote_project_path",
+      "remote_jobs_path",
+      "python_environment_path",
+    ] as const
+    : [
+      "ssh_private_key_path",
+      "robot_key_restriction_from",
+      "robot_key_forced_command",
+      "remote_project_path",
+      "remote_jobs_path",
+      "python_environment_path",
+    ] as const;
+
+  for (const field of shellCheckedFields) {
     if (trimmed[field] && hasShellMetacharacters(trimmed[field])) {
       errors[field] = "Path contains unsupported shell metacharacters.";
     }
   }
 
-  for (const field of [
-    "remote_project_path",
-    "remote_jobs_path",
-    "python_environment_path",
-  ] as const) {
-    if (!trimmed[field]) {
-      errors[field] = "Path is required.";
-    } else if (!isAbsolutePath(trimmed[field])) {
-      errors[field] = "Path must be absolute.";
+  if (trimmed.connection_mode !== "mock") {
+    for (const field of [
+      "remote_project_path",
+      "remote_jobs_path",
+      "python_environment_path",
+    ] as const) {
+      if (!trimmed[field]) {
+        errors[field] = "Path is required.";
+      } else if (!isAbsolutePath(trimmed[field])) {
+        errors[field] = "Path must be absolute.";
+      }
     }
   }
 
-  if (!trimmed.default_model_choice) {
+  if (trimmed.connection_mode === "mock" && !trimmed.default_model_choice) {
     errors.default_model_choice = "Default model choice is required.";
   }
 
@@ -252,11 +289,16 @@ export function trimNibiSettings(settings: NibiSettings): NibiSettings {
   return {
     connection_mode: settings.connection_mode,
     backend_mode: settings.connection_mode === "mock" ? "mock" : "nibi",
+    manual_mfa_provider: normalizeManualMfaProvider(settings.manual_mfa_provider),
     manual_mfa_ssh_backend: "wsl",
     manual_mfa_wsl_distro: settings.manual_mfa_wsl_distro.trim() || defaultNibiSettings.manual_mfa_wsl_distro,
     nibi_username: username,
     normal_login_host: normalLoginHost,
     robot_login_host: settings.robot_login_host.trim(),
+    robot_key_restriction_from: settings.robot_key_restriction_from.trim()
+      || defaultNibiSettings.robot_key_restriction_from,
+    robot_key_forced_command: settings.robot_key_forced_command.trim()
+      || defaultNibiSettings.robot_key_forced_command,
     nibi_host: normalLoginHost,
     ssh_private_key_path: sshPrivateKeyPath,
     wsl_ssh_private_key_path: settings.wsl_ssh_private_key_path.trim(),
@@ -277,6 +319,36 @@ export function trimNibiSettings(settings: NibiSettings): NibiSettings {
 export function buildManualSshCommand(settings: NibiSettings): string {
   const trimmed = trimNibiSettings(settings);
   return `ssh -i "${trimmed.ssh_private_key_path.replaceAll('"', '\\"')}" ${trimmed.nibi_username}@${trimmed.normal_login_host}`;
+}
+
+export function buildRestrictedPublicKey(
+  publicKeyText: string,
+  settings: Pick<NibiSettings, "robot_key_restriction_from" | "robot_key_forced_command">,
+): string {
+  const publicKey = publicKeyText.trim();
+  const restrictionFrom = settings.robot_key_restriction_from.trim();
+  const forcedCommand = settings.robot_key_forced_command.trim();
+  return `restrict,from="${restrictionFrom}",command="${forcedCommand}" ${publicKey}`;
+}
+
+export function buildAllianceSupportRequest(settings: NibiSettings): string {
+  const trimmed = trimNibiSettings(settings);
+  return [
+    "Hello Alliance support,",
+    "",
+    "Please enable robot-node access for FluorCast automation.",
+    "",
+    `Username: ${trimmed.nibi_username || "<Alliance username>"}`,
+    `Robot host: ${trimmed.robot_login_host || defaultNibiSettings.robot_login_host}`,
+    "",
+    "Requested app actions:",
+    "- transfer input files with scp/sftp",
+    "- submit jobs with sbatch",
+    "- check jobs with squeue/sacct",
+    "- download completed output files",
+    "",
+    "The restricted public key uploaded to CCDB will use a forced command and from= network restriction.",
+  ].join("\n");
 }
 
 export async function loadNibiSettings(): Promise<NibiSettings> {

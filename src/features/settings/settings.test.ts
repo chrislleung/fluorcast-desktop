@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildManualSshCommand,
+  buildAllianceSupportRequest,
+  buildRestrictedPublicKey,
   defaultNibiSettings,
   hasShellMetacharacters,
   isAbsolutePath,
@@ -23,10 +25,13 @@ describe("NIBI settings validation", () => {
   it("uses generic NIBI defaults", () => {
     expect(defaultNibiSettings).toMatchObject({
       connection_mode: "mock",
+      manual_mfa_provider: "terminal_action",
       manual_mfa_ssh_backend: "wsl",
       nibi_username: "user",
       normal_login_host: "nibi.alliancecan.ca",
       robot_login_host: "robot.nibi.alliancecan.ca",
+      robot_key_restriction_from: "134.153.150.*",
+      robot_key_forced_command: "/cvmfs/soft.computecanada.ca/custom/bin/computecanada/allowed_commands/allowed_commands.sh",
       wsl_ssh_private_key_path: "$HOME/.ssh/fluorcast_nibi_ed25519",
       wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-user-nibi.sock",
       remote_project_path: "/home/user/scratch/FluorCast",
@@ -97,6 +102,7 @@ describe("NIBI settings validation", () => {
   it("requires absolute remote and Python paths", () => {
     const errors = validateNibiSettings({
       ...defaultNibiSettings,
+      connection_mode: "interactive_mfa",
       remote_project_path: "scratch/ChemFluor_Project",
       remote_jobs_path: "fluorcast-jobs",
       python_environment_path: ".venv/bin/python",
@@ -109,9 +115,21 @@ describe("NIBI settings validation", () => {
     });
   });
 
+  it("does not validate hidden NIBI fields in mock mode", () => {
+    expect(validateNibiSettings({
+      ...defaultNibiSettings,
+      connection_mode: "mock",
+      ssh_private_key_path: "C:\\Users\\CL\\.ssh\\id_ed25519; stale",
+      remote_project_path: "relative/stale",
+      remote_jobs_path: "jobs|stale",
+      python_environment_path: "",
+    })).toEqual({});
+  });
+
   it("rejects shell metacharacters in path fields", () => {
     const errors = validateNibiSettings({
       ...defaultNibiSettings,
+      connection_mode: "interactive_mfa",
       ssh_private_key_path: "C:\\Users\\CL\\.ssh\\id_ed25519; rm",
       remote_project_path: "/home/chrisl/scratch/project$(whoami)",
       remote_jobs_path: "/home/chrisl/scratch/jobs|tee",
@@ -147,6 +165,15 @@ describe("NIBI settings validation", () => {
     });
   });
 
+  it("normalizes legacy and default Manual MFA providers", () => {
+    expect(normalizeNibiSettings({ manual_mfa_provider: "persistent_shell" }).manual_mfa_provider)
+      .toBe("persistent_shell");
+    expect(normalizeNibiSettings({ manual_mfa_provider: "controlmaster" }).manual_mfa_provider)
+      .toBe("controlmaster");
+    expect(normalizeNibiSettings({ manual_mfa_provider: "unexpected" }).manual_mfa_provider)
+      .toBe("terminal_action");
+  });
+
   it("saves and loads the manual SSH login confirmation setting shape", () => {
     const persisted = JSON.stringify(trimNibiSettings({
       ...defaultNibiSettings,
@@ -165,6 +192,44 @@ describe("NIBI settings validation", () => {
       normal_login_host: " nibi.alliancecan.ca ",
       ssh_private_key_path: " C:\\Users\\Alice\\.ssh\\id_ed25519 ",
     })).toBe("ssh -i \"C:\\Users\\Alice\\.ssh\\id_ed25519\" alice@nibi.alliancecan.ca");
+  });
+
+  it("generates a restricted public key from public key text", () => {
+    expect(buildRestrictedPublicKey(
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest alice@laptop\n",
+      defaultNibiSettings,
+    )).toBe(
+      "restrict,from=\"134.153.150.*\",command=\"/cvmfs/soft.computecanada.ca/custom/bin/computecanada/allowed_commands/allowed_commands.sh\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest alice@laptop",
+    );
+  });
+
+  it("does not include private key text in restricted public key generation", () => {
+    const privateKeyText = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    const restricted = buildRestrictedPublicKey(
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest alice@laptop",
+      {
+        ...defaultNibiSettings,
+        ssh_private_key_path: privateKeyText,
+      },
+    );
+
+    expect(restricted).not.toContain("PRIVATE KEY");
+    expect(restricted).not.toContain(privateKeyText);
+  });
+
+  it("builds an Alliance support request with username and robot host", () => {
+    const request = buildAllianceSupportRequest({
+      ...defaultNibiSettings,
+      nibi_username: "alice",
+      robot_login_host: "robot.nibi.alliancecan.ca",
+    });
+
+    expect(request).toContain("Username: alice");
+    expect(request).toContain("Robot host: robot.nibi.alliancecan.ca");
+    expect(request).toContain("transfer input files with scp/sftp");
+    expect(request).toContain("submit jobs with sbatch");
+    expect(request).toContain("check jobs with squeue/sacct");
+    expect(request).toContain("download completed output files");
   });
 
   it("does not expose old user-specific NIBI paths in user-facing docs", () => {

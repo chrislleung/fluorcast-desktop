@@ -1,10 +1,11 @@
 import type { FormEvent } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   defaultNibiSettings,
+  buildAllianceSupportRequest,
   buildManualSshCommand,
   trimNibiSettings,
   validateNibiSettings,
@@ -13,12 +14,27 @@ import {
   type NibiSettings,
   type NibiSettingsErrors,
 } from "../../features/settings";
-import { createRemoteExecutor, defaultManualMfaSessionState } from "../../lib/remote";
+import {
+  buildManualMfaSessionCommands,
+  buildRemoteEnvironmentCheckDefinitions,
+  createInitialRemoteEnvironmentRows,
+  createRemoteExecutor,
+  defaultManualMfaSessionState,
+  getRemoteEnvironmentReadiness,
+  InteractiveMfaRemoteExecutor,
+  resultToRemoteEnvironmentRow,
+  validateRemoteEnvironmentLocalInputs,
+  applyManualMfaSessionResult,
+  applyManualMfaTerminalLaunchResult,
+  type RemoteEnvironmentCheckRow,
+} from "../../lib/remote";
 import type {
   ManualMfaSessionCommands,
   ManualMfaSessionResult,
   ManualMfaTerminalLaunchResult,
   ManualMfaSessionUiState,
+  LocalSshCapabilitiesResult,
+  RemoteCommandResult,
 } from "../../lib/remote";
 
 const accentPresets = [
@@ -56,10 +72,26 @@ type SettingsPageProps = {
   secondaryColor: string;
 };
 
-type NibiConnectionCheck = {
-  id: string;
-  label: string;
-  status: "passed" | "failed" | "interactive_login_required" | "skipped";
+type RobotPublicKeyResult = {
+  restricted_public_key: string;
+  public_key_path: string;
+};
+
+type RobotAutomationTestResult = {
+  status: "passed" | "robot_not_ready" | "failed";
+  message: string;
+  robot_access_verified: boolean;
+  redacted_command_preview: string;
+  stdout: string;
+  stderr: string;
+};
+
+type PersistentShellSessionStatus = {
+  session_id: string;
+  process_id: number | null;
+  started_at: string;
+  status: "not_started" | "connecting" | "waiting_for_login_mfa" | "active" | "failed" | "disconnected";
+  output: string;
   message: string;
 };
 
@@ -78,33 +110,58 @@ export function SettingsPage({
   const [saveStatus, setSaveStatus] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [isBrowsingSshKey, setIsBrowsingSshKey] = useState(false);
-  const [isTestingConnection, setIsTestingConnection] = useState(false);
-  const [connectionChecks, setConnectionChecks] = useState<NibiConnectionCheck[]>([]);
-  const [connectionTestStatus, setConnectionTestStatus] = useState("");
   const [manualCommandStatus, setManualCommandStatus] = useState("");
   const [manualMfaCommands, setManualMfaCommands] = useState<ManualMfaSessionCommands | null>(null);
   const [manualMfaStatus, setManualMfaStatus] = useState("");
+  const [localSshCapabilities, setLocalSshCapabilities] = useState<LocalSshCapabilitiesResult | null>(null);
   const [isManualMfaWorking, setIsManualMfaWorking] = useState(false);
+  const persistentShellInputRef = useRef<HTMLInputElement | null>(null);
+  const [restrictedPublicKey, setRestrictedPublicKey] = useState("");
+  const [restrictedPublicKeyStatus, setRestrictedPublicKeyStatus] = useState("");
+  const [robotTestStatus, setRobotTestStatus] = useState("");
+  const [robotCommandPreview, setRobotCommandPreview] = useState("");
+  const [isTestingRobotAutomation, setIsTestingRobotAutomation] = useState(false);
+  const [remoteEnvironmentRows, setRemoteEnvironmentRows] = useState<RemoteEnvironmentCheckRow[]>(
+    () => createInitialRemoteEnvironmentRows(nibiSettings),
+  );
+  const [remoteEnvironmentStatus, setRemoteEnvironmentStatus] = useState("");
+  const [isRunningRemoteEnvironmentChecks, setIsRunningRemoteEnvironmentChecks] = useState(false);
+  const [isRemoteEnvironmentOpen, setIsRemoteEnvironmentOpen] = useState(false);
 
   const warnings = validateNibiSettingsWarnings(values);
   const manualSshCommand = buildManualSshCommand(values);
+  const displayedManualMfaCommands = values.connection_mode === "interactive_mfa"
+    ? manualMfaCommands ?? buildManualMfaSessionCommands(values)
+    : null;
   const remoteExecutor = createRemoteExecutor(values.connection_mode);
   const connectionStatus = remoteExecutor.getConnectionStatus(values);
+  const isPersistentShellProvider = values.manual_mfa_provider === "persistent_shell";
 
   useEffect(() => {
     setValues(nibiSettings);
   }, [nibiSettings]);
 
   function updateField(field: keyof NibiSettings, value: string) {
+    const typedValue = field === "connection_mode"
+      ? (value as ConnectionMode)
+      : field === "manual_mfa_provider"
+      ? (value as NibiSettings["manual_mfa_provider"])
+      : value;
     setValues((current) => ({
       ...current,
-      [field]: field === "connection_mode" ? (value as ConnectionMode) : value,
+      [field]: typedValue,
     }));
     setErrors((current) => ({ ...current, [field]: undefined }));
     setSaveStatus("");
-    setConnectionTestStatus("");
-    setConnectionChecks([]);
     setManualCommandStatus("");
+    setRestrictedPublicKeyStatus("");
+    setRobotTestStatus("");
+    setRobotCommandPreview("");
+    setRemoteEnvironmentStatus("");
+    setRemoteEnvironmentRows(createInitialRemoteEnvironmentRows({
+      ...values,
+      [field]: typedValue,
+    }));
   }
 
   function updateBooleanField(field: "manual_login_verified" | "robot_access_verified", value: boolean) {
@@ -113,8 +170,9 @@ export function SettingsPage({
       [field]: value,
     }));
     setSaveStatus("");
-    setConnectionTestStatus("");
-    setConnectionChecks([]);
+    setRobotTestStatus("");
+    setRobotCommandPreview("");
+    setRemoteEnvironmentStatus("");
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -146,9 +204,82 @@ export function SettingsPage({
     setValues(defaultNibiSettings);
     setErrors({});
     setSaveStatus("");
-    setConnectionTestStatus("");
-    setConnectionChecks([]);
     setManualCommandStatus("");
+    setRestrictedPublicKey("");
+    setRestrictedPublicKeyStatus("");
+    setRobotTestStatus("");
+    setRobotCommandPreview("");
+    setRemoteEnvironmentStatus("");
+    setRemoteEnvironmentRows(createInitialRemoteEnvironmentRows(defaultNibiSettings));
+  }
+
+  function createFailedRemoteEnvironmentResult(label: string, message: string): RemoteCommandResult {
+    return {
+      exit_code: 1,
+      stdout: "",
+      stderr: message,
+      duration_ms: 0,
+      command_label: label,
+      redacted_command_preview: label,
+    };
+  }
+
+  async function runRemoteEnvironmentChecks() {
+    const trimmed = trimNibiSettings(values);
+    const isConnectionReady = isManualMfaMode
+      ? manualMfaSession.status === "authenticated" || manualMfaSession.can_run_background_commands
+      : isRobotAutomationMode && trimmed.robot_access_verified;
+    const localValidation = validateRemoteEnvironmentLocalInputs(trimmed, isConnectionReady);
+    setRemoteEnvironmentStatus("");
+
+    if (!localValidation.valid) {
+      setRemoteEnvironmentStatus(localValidation.messages.join(" "));
+      return;
+    }
+
+    const executor = createRemoteExecutor(trimmed.connection_mode);
+    if (executor instanceof InteractiveMfaRemoteExecutor) {
+      executor.setAuthenticated(isConnectionReady);
+    }
+    const definitions = buildRemoteEnvironmentCheckDefinitions(trimmed);
+    setRemoteEnvironmentRows(definitions.map((definition) => ({
+      ...definition,
+      status: "not_run",
+      message: "Not run.",
+    })));
+    setIsRunningRemoteEnvironmentChecks(true);
+
+    const completedRows: RemoteEnvironmentCheckRow[] = [];
+    try {
+      for (const definition of definitions) {
+        setRemoteEnvironmentRows((current) => current.map((row) => (
+          row.id === definition.id
+            ? { ...row, status: "running", message: "Running..." }
+            : row
+        )));
+
+        let result: RemoteCommandResult;
+        try {
+          result = await executor.runCommand(definition.commandSpec);
+        } catch (error) {
+          result = createFailedRemoteEnvironmentResult(
+            definition.name,
+            error instanceof Error ? error.message : "Remote environment check could not run.",
+          );
+        }
+
+        const completedRow = resultToRemoteEnvironmentRow(definition, result);
+        completedRows.push(completedRow);
+        setRemoteEnvironmentRows((current) => current.map((row) => (
+          row.id === definition.id ? completedRow : row
+        )));
+      }
+
+      setRemoteEnvironmentStatus(getRemoteEnvironmentReadiness(completedRows).summary);
+    } finally {
+      setIsRunningRemoteEnvironmentChecks(false);
+      void executor.dispose();
+    }
   }
 
   async function getDefaultSshDirectory() {
@@ -180,46 +311,6 @@ export function SettingsPage({
     }
   }
 
-  async function testNibiConnection() {
-    const trimmed = trimNibiSettings(values);
-    const nextErrors = validateNibiSettings({
-      ...trimmed,
-      connection_mode: values.connection_mode === "mock" ? "interactive_mfa" : values.connection_mode,
-    });
-    setErrors(nextErrors);
-    setSaveStatus("");
-    setConnectionTestStatus("");
-    setConnectionChecks([]);
-
-    if (Object.keys(nextErrors).length > 0) {
-      setConnectionTestStatus("Fix the highlighted NIBI settings before testing.");
-      return;
-    }
-
-    setIsTestingConnection(true);
-    try {
-      const checks = await invoke<NibiConnectionCheck[]>("test_nibi_connection", {
-        settings: trimmed,
-      });
-      setConnectionChecks(checks);
-      const failedCount = checks.filter((check) => check.status === "failed").length;
-      const interactiveCount = checks.filter((check) => check.status === "interactive_login_required").length;
-      setConnectionTestStatus(
-        interactiveCount > 0
-          ? "NIBI is asking for interactive login. Manual SSH may work, but app automation is not ready yet."
-          : failedCount === 0
-          ? "NIBI connection checks passed."
-          : `${failedCount} NIBI connection check${failedCount === 1 ? "" : "s"} failed.`,
-      );
-    } catch (error) {
-      setConnectionTestStatus(
-        error instanceof Error ? error.message : "NIBI connection test could not run.",
-      );
-    } finally {
-      setIsTestingConnection(false);
-    }
-  }
-
   async function copyManualSshCommand() {
     setManualCommandStatus("");
     try {
@@ -227,6 +318,81 @@ export function SettingsPage({
       setManualCommandStatus("Manual SSH command copied.");
     } catch {
       setManualCommandStatus("Copy failed. Select the command and copy it manually.");
+    }
+  }
+
+  async function refreshRestrictedPublicKey() {
+    setRestrictedPublicKeyStatus("");
+    try {
+      const result = await invoke<RobotPublicKeyResult>("get_restricted_robot_public_key", {
+        settings: trimNibiSettings(values),
+      });
+      setRestrictedPublicKey(result.restricted_public_key);
+      setRestrictedPublicKeyStatus(`Restricted public key loaded from ${result.public_key_path}.`);
+      return result.restricted_public_key;
+    } catch (error) {
+      setRestrictedPublicKey("");
+      setRestrictedPublicKeyStatus(
+        error instanceof Error ? error.message : "Could not generate the restricted public key.",
+      );
+      return "";
+    }
+  }
+
+  async function copyRestrictedPublicKey() {
+    const key = restrictedPublicKey || await refreshRestrictedPublicKey();
+    if (!key) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(key);
+      setRestrictedPublicKeyStatus("Restricted public key copied. Only upload this restricted public key to CCDB.");
+    } catch {
+      setRestrictedPublicKeyStatus("Copy failed. Select the restricted public key and copy it manually.");
+    }
+  }
+
+  async function copyAllianceSupportRequest() {
+    setRestrictedPublicKeyStatus("");
+    try {
+      await navigator.clipboard.writeText(buildAllianceSupportRequest(values));
+      setRestrictedPublicKeyStatus("Alliance support request copied.");
+    } catch {
+      setRestrictedPublicKeyStatus("Copy failed. Select the support request and copy it manually.");
+    }
+  }
+
+  async function testRobotAutomation() {
+    const trimmed = trimNibiSettings({ ...values, connection_mode: "robot_automation" });
+    const nextErrors = validateNibiSettings(trimmed);
+    setErrors(nextErrors);
+    setRobotTestStatus("");
+    setRobotCommandPreview("");
+
+    if (Object.keys(nextErrors).length > 0) {
+      setRobotTestStatus("Fix the highlighted robot automation settings before testing.");
+      return;
+    }
+
+    setIsTestingRobotAutomation(true);
+    try {
+      const result = await invoke<RobotAutomationTestResult>("test_robot_automation", {
+        settings: trimmed,
+      });
+      setRobotCommandPreview(result.redacted_command_preview);
+      setRobotTestStatus(result.message);
+      if (result.robot_access_verified) {
+        const nextSettings = {
+          ...trimmed,
+          robot_access_verified: true,
+        };
+        setValues(nextSettings);
+        void onNibiSettingsSave(nextSettings);
+      }
+    } catch (error) {
+      setRobotTestStatus(error instanceof Error ? error.message : "Robot automation test could not run.");
+    } finally {
+      setIsTestingRobotAutomation(false);
     }
   }
 
@@ -247,33 +413,47 @@ export function SettingsPage({
   }
 
   function updateManualMfaFromResult(result: ManualMfaSessionResult, canMarkAuthenticated = false) {
-    const checkedAt = new Date().toISOString();
-    const resultMarksAuthenticated = result.status === "authenticated" || result.can_run_background_commands;
-    const status = resultMarksAuthenticated && !canMarkAuthenticated ? "login_required" : result.status;
-    const canRunBackgroundCommands = canMarkAuthenticated && result.can_run_background_commands;
-    const nextSession: ManualMfaSessionUiState = {
-      ...manualMfaSession,
-      status,
-      control_path: result.control_path,
-      control_path_exists: result.control_path_exists,
-      last_session_test_result: result.message,
-      can_run_background_commands: canRunBackgroundCommands,
-      last_master_check_result: result.last_master_check_result,
-      last_auth_ok_result: result.last_auth_ok_result,
-      selected_backend: "wsl",
-      wsl_available: result.wsl_available,
-      wsl_ssh_available: result.wsl_ssh_available,
-      last_successful_command_at: canRunBackgroundCommands
-        ? checkedAt
-        : manualMfaSession.last_successful_command_at,
-    };
+    const nextSession = applyManualMfaSessionResult(manualMfaSession, result, { canMarkAuthenticated });
     onManualMfaSessionChange(nextSession);
     setManualMfaStatus(result.message);
-    if (canRunBackgroundCommands) {
+    if (nextSession.can_run_background_commands) {
       const nextSettings = {
         ...trimNibiSettings(values),
         manual_login_verified: true,
-        last_manual_login_check_at: checkedAt,
+        last_manual_login_check_at: nextSession.last_successful_command_at,
+      };
+      setValues(nextSettings);
+      void onNibiSettingsSave(nextSettings);
+    }
+  }
+
+  function updateManualMfaFromPersistentShell(result: PersistentShellSessionStatus) {
+    const authenticated = result.status === "active";
+    const now = new Date().toISOString();
+    onManualMfaSessionChange({
+      ...manualMfaSession,
+      status: authenticated ? "authenticated" : result.status === "disconnected" ? "disconnected" : "waiting_for_user_mfa",
+      parsed_session_status: authenticated ? "authenticated" : "authentication_required",
+      selected_backend: "persistent_shell",
+      session_started_at: result.started_at || manualMfaSession.session_started_at,
+      last_successful_command_at: authenticated ? now : manualMfaSession.last_successful_command_at,
+      last_session_probe_at: now,
+      last_session_test_result: result.message,
+      can_run_background_commands: authenticated,
+      last_master_check_result: result.output,
+      last_auth_ok_result: result.output,
+      last_session_test_stdout: result.output,
+      last_session_test_stderr: "",
+      last_session_test_exit_code: authenticated ? 0 : null,
+      persistent_shell_output: result.output,
+      persistent_shell_process_id: result.process_id,
+    });
+    setManualMfaStatus(result.message);
+    if (authenticated) {
+      const nextSettings = {
+        ...trimNibiSettings(values),
+        manual_login_verified: true,
+        last_manual_login_check_at: now,
       };
       setValues(nextSettings);
       void onNibiSettingsSave(nextSettings);
@@ -283,7 +463,7 @@ export function SettingsPage({
   async function copyManualMfaLoginCommand() {
     setManualMfaStatus("");
     try {
-      const commands = manualMfaCommands ?? await invoke<ManualMfaSessionCommands>(
+      const commands = displayedManualMfaCommands ?? await invoke<ManualMfaSessionCommands>(
         "get_manual_mfa_session_commands",
         { settings: trimNibiSettings(values) },
       );
@@ -295,41 +475,51 @@ export function SettingsPage({
     }
   }
 
+  async function copyManualMfaSessionTestCommand() {
+    setManualMfaStatus("");
+    try {
+      const commands = displayedManualMfaCommands ?? await invoke<ManualMfaSessionCommands>(
+        "get_manual_mfa_session_commands",
+        { settings: trimNibiSettings(values) },
+      );
+      setManualMfaCommands(commands);
+      await navigator.clipboard.writeText(commands.test_command);
+      setManualMfaStatus("Manual MFA session test command copied.");
+    } catch (error) {
+      setManualMfaStatus(error instanceof Error ? error.message : "Copy failed. Select the command and copy it manually.");
+    }
+  }
+
+  async function checkLocalSshCapabilities() {
+    setIsManualMfaWorking(true);
+    setManualMfaStatus("");
+    try {
+      const result = await invoke<LocalSshCapabilitiesResult>("check_local_ssh_capabilities");
+      setLocalSshCapabilities(result);
+      setManualMfaStatus(result.recommendation);
+    } catch (error) {
+      setManualMfaStatus(error instanceof Error ? error.message : "Could not check local SSH capabilities.");
+    } finally {
+      setIsManualMfaWorking(false);
+    }
+  }
+
   async function startManualMfaLogin() {
     setIsManualMfaWorking(true);
     setManualMfaStatus("");
     try {
+      if (isPersistentShellProvider) {
+        updateManualMfaFromPersistentShell(await invoke<PersistentShellSessionStatus>("persistent_shell_start", {
+          settings: trimNibiSettings(values),
+        }));
+        return;
+      }
       const launch = await invoke<ManualMfaTerminalLaunchResult>("open_manual_mfa_login", {
         settings: trimNibiSettings(values),
       });
       const commands = launch.commands;
-      const startedAt = new Date().toISOString();
       setManualMfaCommands(commands);
-      onManualMfaSessionChange({
-        ...manualMfaSession,
-        status: launch.launched ? "waiting_for_user_mfa" : "login_required",
-        control_path: commands.control_path,
-        session_started_at: startedAt,
-        last_session_test_result: launch.message,
-        control_path_exists: commands.control_path_exists,
-        can_run_background_commands: false,
-        selected_backend: "wsl",
-        wsl_available: launch.wsl_available,
-        wsl_ssh_available: null,
-        wsl_distro: commands.wsl_distro,
-        windows_terminal_available: launch.windows_terminal_available,
-        powershell_available: launch.powershell_available,
-        last_terminal_launch_method: launch.method,
-        last_terminal_launch_command_preview: launch.command_preview,
-        last_terminal_launch_success: launch.launched,
-        last_terminal_launch_error: launch.error_message,
-        last_terminal_launch_at: launch.timestamp,
-        last_generated_script_path: launch.generated_script_path,
-        last_launch_method_attempted: launch.launch_method_attempted,
-        last_launch_error_code: launch.launch_error_code,
-        last_script_file_exists: launch.script_file_exists,
-        manual_wsl_command: launch.manual_wsl_command,
-      });
+      onManualMfaSessionChange(applyManualMfaTerminalLaunchResult(manualMfaSession, launch));
       setManualMfaStatus(launch.message);
     } catch (error) {
       setManualMfaStatus(error instanceof Error ? error.message : "Could not open a terminal automatically. Copy the WSL login command and run it manually.");
@@ -352,10 +542,37 @@ export function SettingsPage({
     }
   }
 
+  async function sendPersistentShellInput() {
+    const input = persistentShellInputRef.current?.value ?? "";
+    if (!input) {
+      return;
+    }
+    if (persistentShellInputRef.current) {
+      persistentShellInputRef.current.value = "";
+    }
+    setIsManualMfaWorking(true);
+    setManualMfaStatus("");
+    try {
+      const result = await invoke<PersistentShellSessionStatus>("persistent_shell_send_input", { input });
+      updateManualMfaFromPersistentShell({
+        ...result,
+        message: "Input sent to persistent NIBI session.",
+      });
+    } catch (error) {
+      setManualMfaStatus(error instanceof Error ? error.message : "Could not send input to the NIBI session.");
+    } finally {
+      setIsManualMfaWorking(false);
+    }
+  }
+
   async function endManualMfaSession() {
     setIsManualMfaWorking(true);
     setManualMfaStatus("");
     try {
+      if (isPersistentShellProvider) {
+        updateManualMfaFromPersistentShell(await invoke<PersistentShellSessionStatus>("persistent_shell_stop"));
+        return;
+      }
       updateManualMfaFromResult(await invoke<ManualMfaSessionResult>("end_manual_mfa_session", {
         settings: trimNibiSettings(values),
       }));
@@ -381,16 +598,62 @@ export function SettingsPage({
     }
   }
 
-  function getCheckClassName(status: NibiConnectionCheck["status"]) {
-    return `check-${status.replaceAll("_", "-")}`;
-  }
-
-  function getCheckBadge(status: NibiConnectionCheck["status"]) {
-    if (status === "interactive_login_required") {
-      return "LOGIN";
-    }
-    return status.toUpperCase();
-  }
+  const isMockMode = values.connection_mode === "mock";
+  const isManualMfaMode = values.connection_mode === "interactive_mfa";
+  const isRobotAutomationMode = values.connection_mode === "robot_automation";
+  const isManualSessionReady = manualMfaSession.status === "authenticated"
+    || manualMfaSession.can_run_background_commands;
+  const isRobotAutomationReady = values.robot_access_verified;
+  const canRunRemoteEnvironmentChecks = isManualMfaMode
+    ? isManualSessionReady
+    : isRobotAutomationMode && isRobotAutomationReady;
+  const remoteEnvironmentDisabledMessage = isManualMfaMode && !isManualSessionReady
+    ? "Log into NIBI first before running remote environment checks."
+    : isRobotAutomationMode && !isRobotAutomationReady
+    ? "Verify robot automation before running remote environment checks."
+    : "";
+  const remoteEnvironmentReadiness = getRemoteEnvironmentReadiness(remoteEnvironmentRows);
+  const requiredRemoteEnvironmentFailures = remoteEnvironmentRows.filter((row) => (
+    !row.optional && row.status === "failed"
+  )).length;
+  const sacctUnavailable = remoteEnvironmentRows.some((row) => (
+    row.id === "sacct" && row.status === "failed"
+  ));
+  const remoteEnvironmentHasRun = remoteEnvironmentRows.some((row) => row.status !== "not_run");
+  const remoteEnvironmentBadge = isRunningRemoteEnvironmentChecks
+    ? "Running"
+    : isManualMfaMode && !isManualSessionReady
+    ? "Login required"
+    : isRobotAutomationMode && !isRobotAutomationReady
+    ? "Robot not verified"
+    : !remoteEnvironmentHasRun
+    ? "Not run"
+    : remoteEnvironmentReadiness.ready
+    ? "Ready"
+    : "Needs attention";
+  const remoteEnvironmentSummary = remoteEnvironmentDisabledMessage
+    || (isRunningRemoteEnvironmentChecks
+      ? "Running remote environment checks"
+      : !remoteEnvironmentHasRun
+      ? "Not run yet"
+      : remoteEnvironmentReadiness.ready && sacctUnavailable
+      ? "Remote environment ready; sacct unavailable, polling will use fallback checks."
+      : remoteEnvironmentReadiness.ready
+      ? "Remote environment ready"
+      : `${requiredRemoteEnvironmentFailures || 1} check${(requiredRemoteEnvironmentFailures || 1) === 1 ? "" : "s"} need attention`);
+  const modeStatusSummary = isMockMode
+    ? "Mock mode is active. Predictions are simulated locally."
+    : isManualMfaMode
+    ? isManualSessionReady
+      ? "Manual NIBI session authenticated"
+      : values.manual_login_verified
+      ? "Session expired or not tested"
+      : "Login required"
+    : values.robot_access_verified
+    ? "Robot automation verified"
+    : robotTestStatus
+    ? "Robot automation test failed"
+    : "Robot access not configured";
 
   return (
     <div className="page narrow-page">
@@ -400,46 +663,65 @@ export function SettingsPage({
         <p>Configure the local workspace appearance and how FluorCast will connect to NIBI.</p>
       </header>
 
-      <form className="form-card settings-section" aria-labelledby="nibi-heading" onSubmit={handleSubmit}>
+      <form className="form-card settings-section" aria-labelledby="connection-mode-heading" onSubmit={handleSubmit}>
         <div className="section-heading">
-          <h2 id="nibi-heading">NIBI settings</h2>
+          <h2 id="connection-mode-heading">Connection Mode</h2>
           <span>Local only</span>
         </div>
 
-        <label>
-          <span>Connection mode</span>
-          <select
-            aria-describedby="connection_mode-help connection_mode-error"
-            aria-invalid={errors.connection_mode ? "true" : "false"}
-            name="connection_mode"
-            onChange={(event) => updateField("connection_mode", event.target.value)}
-            value={values.connection_mode}
-          >
-            <option value="mock">Mock mode</option>
-            <option value="interactive_mfa">Manual MFA login</option>
-            <option value="robot_automation">Robot automation</option>
-          </select>
-          {errors.connection_mode ? (
-            <span className="field-error" id="connection_mode-error">
-              {errors.connection_mode}
-            </span>
-          ) : null}
-          <small className="field-help" id="connection_mode-help">
-            Mock mode: local UI testing only.
-            <br />
-            Manual MFA login: user logs into nibi.alliancecan.ca each app session with password and Duo; app reuses the session where possible.
-            <br />
-            Robot automation: app connects to robot.nibi.alliancecan.ca using a restricted SSH key after Alliance enables robot-node access.
-          </small>
-        </label>
+        <fieldset className="connection-mode-grid" aria-describedby="connection_mode-error">
+          <legend className="sr-only">Connection mode</legend>
+          {[
+            {
+              value: "mock",
+              label: "Mock mode",
+              description: "Use local mock predictions for UI testing. No NIBI connection required.",
+            },
+            {
+              value: "interactive_mfa",
+              label: "Manual MFA login",
+              description:
+                "Log into nibi.alliancecan.ca with password and Duo each app session. Best for development/testing before robot access is enabled.",
+            },
+            {
+              value: "robot_automation",
+              label: "Robot automation",
+              description:
+                "Use robot.nibi.alliancecan.ca with a restricted SSH key after Alliance enables robot-node access. Best for production.",
+            },
+          ].map((mode) => (
+            <label className="connection-mode-card" key={mode.value}>
+              <input
+                checked={values.connection_mode === mode.value}
+                name="connection_mode"
+                onChange={() => updateField("connection_mode", mode.value)}
+                type="radio"
+                value={mode.value}
+              />
+              <span>{mode.label}</span>
+              <small>{mode.description}</small>
+            </label>
+          ))}
+        </fieldset>
+        {errors.connection_mode ? (
+          <span className="field-error" id="connection_mode-error">
+            {errors.connection_mode}
+          </span>
+        ) : null}
 
-        <section className="connection-status-panel" aria-label="Connection status">
+        <section className="connection-status-panel" aria-label="Mode status summary">
           <span>Selected mode: {connectionStatus.mode}</span>
-          <strong>{connectionStatus.label}</strong>
+          <strong>{modeStatusSummary}</strong>
           <p>{connectionStatus.message}</p>
         </section>
 
-        <div className="field-row">
+        {!isMockMode ? (
+          <section className="settings-subsection" aria-labelledby="mode-specific-setup-heading">
+            <div className="section-heading compact-heading">
+              <h3 id="mode-specific-setup-heading">Mode-specific setup</h3>
+              <span>{isManualMfaMode ? "Manual MFA" : "Robot"}</span>
+            </div>
+            <div className="field-row">
           <label>
             <span>NIBI username</span>
             <input
@@ -457,6 +739,7 @@ export function SettingsPage({
             ) : null}
           </label>
 
+          {isManualMfaMode ? (
           <label>
             <span>Normal login host</span>
             <input
@@ -472,8 +755,15 @@ export function SettingsPage({
               </span>
             ) : null}
           </label>
-        </div>
+          ) : null}
+            </div>
+            {isManualMfaMode ? (
+              <p className="settings-note">Password and Duo may be required each app session.</p>
+            ) : null}
+          </section>
+        ) : null}
 
+        {isRobotAutomationMode ? (
         <label>
           <span>Robot login host</span>
           <input
@@ -489,7 +779,50 @@ export function SettingsPage({
             </span>
           ) : null}
         </label>
+        ) : null}
 
+        {isRobotAutomationMode ? (
+        <div className="field-row">
+          <label>
+            <span>Robot key from= restriction</span>
+            <input
+              aria-describedby="robot_key_restriction_from-error"
+              aria-invalid={errors.robot_key_restriction_from ? "true" : "false"}
+              name="robot_key_restriction_from"
+              onChange={(event) => updateField("robot_key_restriction_from", event.target.value)}
+              value={values.robot_key_restriction_from}
+            />
+            {errors.robot_key_restriction_from ? (
+              <span className="field-error" id="robot_key_restriction_from-error">
+                {errors.robot_key_restriction_from}
+              </span>
+            ) : null}
+          </label>
+
+          <label>
+            <span>Robot forced command</span>
+            <input
+              aria-describedby="robot_key_forced_command-error"
+              aria-invalid={errors.robot_key_forced_command ? "true" : "false"}
+              name="robot_key_forced_command"
+              onChange={(event) => updateField("robot_key_forced_command", event.target.value)}
+              value={values.robot_key_forced_command}
+            />
+            {errors.robot_key_forced_command ? (
+              <span className="field-error" id="robot_key_forced_command-error">
+                {errors.robot_key_forced_command}
+              </span>
+            ) : null}
+          </label>
+        </div>
+        ) : null}
+
+        {!isMockMode ? (
+        <section className="settings-subsection" aria-labelledby="ssh-key-heading">
+          <div className="section-heading compact-heading">
+            <h3 id="ssh-key-heading">SSH key</h3>
+            <span>Private key</span>
+          </div>
         <label>
           <span>Private SSH key file</span>
           <div className="field-with-button">
@@ -539,8 +872,48 @@ export function SettingsPage({
             connect to NIBI.
           </small>
         </label>
+        {isRobotAutomationMode ? (
+          <div>
+            <span className="step-label">Expected public key path</span>
+            <code>{values.ssh_private_key_path ? `${values.ssh_private_key_path}.pub` : "Choose a private key first"}</code>
+          </div>
+        ) : null}
+        {isRobotAutomationMode ? (
+          <div>
+            <span className="step-label">Restricted public key preview</span>
+            <pre>{restrictedPublicKey || "Click Generate restricted public key to read <private_key_path>.pub and build the CCDB key text."}</pre>
+          </div>
+        ) : null}
+        {isRobotAutomationMode ? (
+          <div className="button-row manual-login-actions">
+            <button className="secondary-button" onClick={refreshRestrictedPublicKey} type="button">
+              Generate restricted public key
+            </button>
+            <button className="secondary-button" onClick={copyRestrictedPublicKey} type="button">
+              Copy restricted public key
+            </button>
+          </div>
+        ) : null}
+        </section>
+        ) : null}
 
-        <div className="field-row">
+        {isManualMfaMode ? (
+        <details className="help-disclosure">
+          <summary>Manual MFA provider settings</summary>
+          <label>
+            <span>Manual MFA provider</span>
+            <select
+              name="manual_mfa_provider"
+              onChange={(event) => updateField("manual_mfa_provider", event.target.value)}
+              value={values.manual_mfa_provider}
+            >
+              <option value="terminal_action">Terminal action recommended</option>
+              <option value="persistent_shell">Persistent shell legacy</option>
+              <option value="controlmaster">ControlMaster legacy experimental</option>
+            </select>
+            <small>Terminal action opens PowerShell for each NIBI action. Persistent shell and ControlMaster are legacy reusable-session paths.</small>
+          </label>
+          <div className="field-row">
           <label>
             <span>WSL private key path</span>
             <input
@@ -557,7 +930,7 @@ export function SettingsPage({
               value={values.wsl_control_socket_path}
             />
           </label>
-        </div>
+          </div>
 
         <label>
           <span>WSL distro</span>
@@ -569,9 +942,13 @@ export function SettingsPage({
           />
           <small>Use Ubuntu by default. Leave blank to use the default WSL distro.</small>
         </label>
+        </details>
+        ) : null}
 
+        {!isMockMode ? (
+        <>
         <details className="help-disclosure">
-          <summary>How to upload your SSH public key to Alliance/CCDB</summary>
+          <summary>{isRobotAutomationMode ? "How to upload public key to Alliance/CCDB" : "How to set up SSH key"}</summary>
           <div>
             <p>
               FluorCast and Alliance need different parts of the same SSH key pair.
@@ -677,7 +1054,13 @@ export function SettingsPage({
             <pre>ssh -i "$env:USERPROFILE\.ssh\fluorcast_nibi_ed25519" &lt;your_alliance_username&gt;@nibi.alliancecan.ca</pre>
           </div>
         </details>
+        </>
+        ) : null}
 
+        {!isMockMode ? (
+        <details className="help-disclosure remote-paths-section" open>
+          <summary>Remote FluorCast paths</summary>
+          <div>
         <label>
           <span>Remote project path</span>
           <input
@@ -725,7 +1108,84 @@ export function SettingsPage({
             </span>
           ) : null}
         </label>
+          </div>
+        </details>
+        ) : null}
 
+        {!isMockMode ? (
+        <section className="remote-environment-panel" aria-labelledby="remote-environment-heading">
+          <button
+            aria-expanded={isRemoteEnvironmentOpen}
+            className="remote-environment-summary"
+            onClick={() => setIsRemoteEnvironmentOpen((current) => !current)}
+            type="button"
+          >
+            <span id="remote-environment-heading">Remote Environment Checks</span>
+            <span>{remoteEnvironmentSummary}</span>
+            <span className={`remote-environment-badge remote-environment-badge-${remoteEnvironmentBadge.toLowerCase().replaceAll(" ", "-")}`}>
+              {remoteEnvironmentBadge}
+            </span>
+          </button>
+          {isRemoteEnvironmentOpen ? (
+          <div className="remote-environment-content">
+            <p>
+              Verify the remote FluorCast project, jobs folder, Python environment,
+              prediction scripts, and Slurm commands before upload or submission.
+            </p>
+          {remoteEnvironmentDisabledMessage ? (
+            <p className="connection-test-status">{remoteEnvironmentDisabledMessage}</p>
+          ) : null}
+          {remoteEnvironmentStatus ? (
+            <p className="connection-test-status" role="status">{remoteEnvironmentStatus}</p>
+          ) : (
+            <p className="connection-test-status" role="status">{remoteEnvironmentReadiness.summary}</p>
+          )}
+          <button
+            className="secondary-button"
+            disabled={!canRunRemoteEnvironmentChecks || isRunningRemoteEnvironmentChecks}
+            onClick={runRemoteEnvironmentChecks}
+            type="button"
+          >
+            {isRunningRemoteEnvironmentChecks ? "Running remote environment checks" : "Run remote environment checks"}
+          </button>
+          <ol className="remote-checklist" aria-label="Remote environment check results">
+            {remoteEnvironmentRows.map((row) => (
+              <li className={`remote-check-${row.status}`} key={row.id}>
+                <div className="remote-check-row">
+                  <div>
+                    <strong>{row.name}</strong>
+                    <p>{row.message}</p>
+                  </div>
+                  <span>{row.status.replaceAll("_", " ")}</span>
+                </div>
+                <details className="remote-check-details">
+                  <summary>Technical details</summary>
+                  <dl>
+                    <dt>Command</dt>
+                    <dd><code>{row.result?.redacted_command_preview || row.commandSpec.redacted_preview || row.commandSpec.executable}</code></dd>
+                    <dt>Exit code</dt>
+                    <dd>{row.result?.exit_code ?? "Not run"}</dd>
+                    <dt>stdout</dt>
+                    <dd><pre>{row.result?.stdout || "(empty)"}</pre></dd>
+                    <dt>stderr</dt>
+                    <dd><pre>{row.result?.stderr || "(empty)"}</pre></dd>
+                  </dl>
+                </details>
+              </li>
+            ))}
+          </ol>
+          </div>
+          ) : null}
+        </section>
+        ) : null}
+
+        {isMockMode ? (
+        <section className="settings-subsection" aria-labelledby="mock-mode-heading">
+          <div className="section-heading compact-heading">
+            <h3 id="mock-mode-heading">Mode-specific setup</h3>
+            <span>Mock</span>
+          </div>
+          <p className="settings-note">Mock mode uses local mock predictions for UI testing. No NIBI connection is required.</p>
         <label>
           <span>Default model choice</span>
           <select
@@ -748,57 +1208,130 @@ export function SettingsPage({
             </span>
           ) : null}
         </label>
+        </section>
+        ) : null}
 
+        {!isMockMode ? (
         <p className="settings-note">
           FluorCast does not store your NIBI password. SSH keys remain on your computer.
         </p>
+        ) : null}
 
+        {isManualMfaMode ? (
         <section className="manual-login-panel" aria-labelledby="manual-login-heading">
           <div>
             <h3 id="manual-login-heading">Manual MFA Login</h3>
-            <p>
-              Start an interactive NIBI SSH login in PowerShell, enter your password and
-              Duo/MFA there, then test whether FluorCast can reuse the SSH control session for
-              background commands.
-            </p>
-            <p>
-              If no terminal window appears, copy the Raw WSL login command, open PowerShell,
-              run <code>wsl -d {values.manual_mfa_wsl_distro || "Ubuntu"}</code>, paste the command,
-              complete Duo, then return here and click Test authenticated session.
-            </p>
+            {values.manual_mfa_provider === "terminal_action" ? (
+              <p>
+                Manual MFA mode runs each NIBI action in a visible PowerShell window. Complete password and Duo when prompted.
+                It does not reuse login sessions, so each remote action may ask again. This is slower but reliable; robot automation removes repeated MFA once enabled.
+              </p>
+            ) : isPersistentShellProvider ? (
+              <p>
+                Start a live NIBI SSH session, enter your password and Duo response here, then test readiness.
+                FluorCast keeps this session open for upload, submission, and polling.
+              </p>
+            ) : (
+              <p>
+                Start an experimental reusable ControlMaster login, enter your password and Duo/MFA there,
+                then test whether FluorCast can reuse the SSH control session.
+              </p>
+            )}
           </div>
           <div className="diagnostic-grid">
             <div><span className="step-label">Normal login host</span><code>{values.normal_login_host || "Not configured"}</code></div>
             <div><span className="step-label">Username</span><code>{values.nibi_username || "Not configured"}</code></div>
             <div><span className="step-label">Private key path</span><code>{values.ssh_private_key_path || "Not configured"}</code></div>
-            <div><span className="step-label">Manual MFA SSH backend</span><strong>WSL</strong></div>
+            <div><span className="step-label">Manual MFA provider</span><strong>{values.manual_mfa_provider.replaceAll("_", " ")}</strong></div>
             <div><span className="step-label">WSL key path</span><code>{values.wsl_ssh_private_key_path}</code></div>
             <div><span className="step-label">WSL distro</span><code>{values.manual_mfa_wsl_distro || "Default WSL"}</code></div>
             <div><span className="step-label">Login status</span><strong>{manualMfaSession.status.replaceAll("_", " ")}</strong></div>
-            <div><span className="step-label">Control path</span><code>{manualMfaSession.control_path || manualMfaCommands?.control_path || "Created when login starts"}</code></div>
+            <div><span className="step-label">Parsed session status</span><strong>{manualMfaSession.parsed_session_status.replaceAll("_", " ")}</strong></div>
+            <div><span className="step-label">Control path</span><code>{manualMfaSession.control_path || displayedManualMfaCommands?.control_path || "Created when login starts"}</code></div>
+            <div><span className="step-label">Control path exists</span><strong>{manualMfaSession.control_path_exists === null ? "Unknown" : manualMfaSession.control_path_exists ? "Yes" : "No"}</strong></div>
             <div><span className="step-label">Background commands</span><strong>{manualMfaSession.can_run_background_commands ? "Ready" : "Blocked"}</strong></div>
+            <div><span className="step-label">Last login launch</span><code>{manualMfaSession.last_terminal_launch_at || "None"}</code></div>
+            <div><span className="step-label">Last session test</span><code>{manualMfaSession.last_session_probe_at || "None"}</code></div>
+            <div><span className="step-label">Last test exit code</span><strong>{manualMfaSession.last_session_test_exit_code ?? "None"}</strong></div>
           </div>
-          {manualMfaCommands ? (
-            <pre>{manualMfaCommands.redacted_login_command_preview}</pre>
-          ) : (
-            <pre>{manualSshCommand}</pre>
-          )}
+          {isPersistentShellProvider ? (
+            <section className="remote-environment-panel" aria-label="Persistent NIBI session console">
+              <div className="section-heading compact-heading">
+                <h3>NIBI Session</h3>
+                <span>{manualMfaSession.status.replaceAll("_", " ")}</span>
+              </div>
+              <pre className="terminal-output">{manualMfaSession.persistent_shell_output || "Start the NIBI session to see SSH output."}</pre>
+              <div className="field-with-button">
+                <input
+                  aria-label="NIBI session input"
+                  autoComplete="off"
+                  ref={persistentShellInputRef}
+                  type="password"
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void sendPersistentShellInput();
+                    }
+                  }}
+                />
+                <button className="secondary-button" disabled={isManualMfaWorking} onClick={sendPersistentShellInput} type="button">
+                  Send
+                </button>
+              </div>
+            </section>
+          ) : null}
+          {!isPersistentShellProvider && displayedManualMfaCommands ? (
+            <section className="remote-environment-panel" aria-label="Manual MFA session diagnostics">
+              <div className="section-heading compact-heading">
+                <h3>Manual MFA session diagnostics</h3>
+                <span>{manualMfaSession.parsed_session_status.replaceAll("_", " ")}</span>
+              </div>
+              <p className="settings-note">Generated reusable login command</p>
+              <pre>{displayedManualMfaCommands.login_command}</pre>
+              <p className="settings-note">Generated session test command</p>
+              <pre>{displayedManualMfaCommands.test_command}</pre>
+              <div className="diagnostic-grid">
+                <div><span className="step-label">Session test stdout</span><pre>{manualMfaSession.last_session_test_stdout || "(empty)"}</pre></div>
+                <div><span className="step-label">Session test stderr</span><pre>{manualMfaSession.last_session_test_stderr || "(empty)"}</pre></div>
+                <div><span className="step-label">Master check output</span><pre>{manualMfaSession.last_master_check_result || "(empty)"}</pre></div>
+                <div><span className="step-label">FLUORCAST_AUTH_OK output</span><pre>{manualMfaSession.last_auth_ok_result || "(empty)"}</pre></div>
+              </div>
+            </section>
+          ) : null}
           <div className="button-row manual-login-actions">
-            <button className="secondary-button" onClick={copyManualMfaLoginCommand} type="button">
-              Copy login command
-            </button>
-            <button className="secondary-button" disabled={isManualMfaWorking} onClick={startManualMfaLogin} type="button">
-              Start manual NIBI login
-            </button>
-            <button className="secondary-button" disabled={isManualMfaWorking} onClick={cleanStaleManualMfaSession} type="button">
-              Clean stale WSL session
-            </button>
-            <button className="secondary-button" disabled={isManualMfaWorking} onClick={testManualMfaSession} type="button">
-              Test authenticated session
-            </button>
-            <button className="secondary-button" disabled={isManualMfaWorking} onClick={endManualMfaSession} type="button">
-              End NIBI session
-            </button>
+            {!isPersistentShellProvider ? (
+              <>
+                <button className="secondary-button" onClick={copyManualMfaLoginCommand} type="button">
+                  Copy login command
+                </button>
+                <button className="secondary-button" onClick={copyManualMfaSessionTestCommand} type="button">
+                  Copy session test command
+                </button>
+                <button className="secondary-button" disabled={isManualMfaWorking} onClick={checkLocalSshCapabilities} type="button">
+                  Check local SSH capabilities
+                </button>
+              </>
+            ) : null}
+            {values.manual_mfa_provider !== "terminal_action" ? (
+              <button className="secondary-button" disabled={isManualMfaWorking} onClick={startManualMfaLogin} type="button">
+                Start NIBI session
+              </button>
+            ) : null}
+            {!isPersistentShellProvider && values.manual_mfa_provider !== "terminal_action" ? (
+              <button className="secondary-button" disabled={isManualMfaWorking} onClick={cleanStaleManualMfaSession} type="button">
+                Clean stale WSL session
+              </button>
+            ) : null}
+            {values.manual_mfa_provider !== "terminal_action" ? (
+              <>
+                <button className="secondary-button" disabled={isManualMfaWorking} onClick={testManualMfaSession} type="button">
+                  Test session readiness
+                </button>
+                <button className="secondary-button" disabled={isManualMfaWorking} onClick={endManualMfaSession} type="button">
+                  End NIBI session
+                </button>
+              </>
+            ) : null}
           </div>
           <div className="button-row manual-login-actions">
             <button className="secondary-button" onClick={copyManualSshCommand} type="button">
@@ -827,91 +1360,113 @@ export function SettingsPage({
               {manualMfaStatus || manualMfaSession.last_session_test_result}
             </p>
           ) : null}
-          {manualMfaCommands ? (
+          {localSshCapabilities ? (
+            <details className="help-disclosure" open>
+              <summary>Local SSH capabilities</summary>
+              <div>
+                <p>ssh version:</p>
+                <pre>{localSshCapabilities.ssh_version || "(empty)"}</pre>
+                <p>Platform:</p>
+                <pre>{localSshCapabilities.platform}</pre>
+                <p>ControlMaster attempted: {localSshCapabilities.attempted_controlmaster ? "yes" : "no"}</p>
+                <p>ControlMaster supported: {localSshCapabilities.controlmaster_supported === null ? "unknown" : localSshCapabilities.controlmaster_supported ? "yes" : "no"}</p>
+                <p>Syntax exit code: {localSshCapabilities.syntax_exit_code ?? "None"}</p>
+                <p>stdout:</p>
+                <pre>{localSshCapabilities.syntax_stdout || "(empty)"}</pre>
+                <p>stderr:</p>
+                <pre>{localSshCapabilities.syntax_stderr || "(empty)"}</pre>
+                <p>{localSshCapabilities.recommendation}</p>
+              </div>
+            </details>
+          ) : null}
+          {displayedManualMfaCommands ? (
             <details className="help-disclosure">
               <summary>WSL Manual MFA debug commands</summary>
               <div>
                 <p>WSL setup key commands:</p>
-                <pre>{manualMfaCommands.wsl_setup_key_commands}</pre>
+                <pre>{displayedManualMfaCommands.wsl_setup_key_commands}</pre>
                 <p>Clean stale session command:</p>
-                <pre>{manualMfaCommands.clean_stale_session_command}</pre>
+                <pre>{displayedManualMfaCommands.clean_stale_session_command}</pre>
                 <p>Start login script path:</p>
-                <pre>{manualMfaCommands.start_script_path}</pre>
+                <pre>{displayedManualMfaCommands.start_script_path}</pre>
                 <p>Manual WSL login command:</p>
-                <pre>{manualMfaCommands.manual_wsl_login_command}</pre>
+                <pre>{displayedManualMfaCommands.manual_wsl_login_command}</pre>
                 <p>Start master login script content:</p>
-                <pre>{manualMfaCommands.login_command}</pre>
+                <pre>{displayedManualMfaCommands.login_command}</pre>
                 <p>Open with Windows Terminal command:</p>
-                <pre>{manualMfaCommands.windows_terminal_command}</pre>
+                <pre>{displayedManualMfaCommands.windows_terminal_command}</pre>
                 <p>Open with PowerShell command:</p>
-                <pre>{manualMfaCommands.powershell_launch_command}</pre>
+                <pre>{displayedManualMfaCommands.powershell_launch_command}</pre>
                 <p>Raw WSL login command:</p>
-                <pre>{manualMfaCommands.login_command}</pre>
+                <pre>{displayedManualMfaCommands.login_command}</pre>
                 <p>Check master command:</p>
-                <pre>{manualMfaCommands.check_command}</pre>
+                <pre>{displayedManualMfaCommands.check_command}</pre>
                 <p>Check master script content:</p>
-                <pre>{manualMfaCommands.check_script_content}</pre>
+                <pre>{displayedManualMfaCommands.check_script_content}</pre>
                 <p>Test FLUORCAST_AUTH_OK command:</p>
-                <pre>{manualMfaCommands.test_command}</pre>
+                <pre>{displayedManualMfaCommands.test_command}</pre>
                 <p>End session command:</p>
-                <pre>{manualMfaCommands.end_command}</pre>
+                <pre>{displayedManualMfaCommands.end_command}</pre>
                 <p>End session script content:</p>
-                <pre>{manualMfaCommands.end_script_content}</pre>
+                <pre>{displayedManualMfaCommands.end_script_content}</pre>
                 <p>Clean stale session script content:</p>
-                <pre>{manualMfaCommands.clean_script_content}</pre>
+                <pre>{displayedManualMfaCommands.clean_script_content}</pre>
                 <p>Background command template:</p>
-                <pre>{manualMfaCommands.background_command_template}</pre>
+                <pre>{displayedManualMfaCommands.background_command_template}</pre>
               </div>
             </details>
           ) : null}
         </section>
+        ) : null}
 
-        <label className="checkbox-label">
-          <input
-            checked={values.robot_access_verified}
-            name="robot_access_verified"
-            onChange={(event) => updateBooleanField("robot_access_verified", event.target.checked)}
-            type="checkbox"
-          />
-          <span>Robot automation access has been verified</span>
-        </label>
-
-        <section className="connection-test-panel" aria-labelledby="nibi-test-heading">
+        {isRobotAutomationMode ? (
+        <section className="robot-automation-panel" aria-labelledby="robot-automation-heading">
           <div>
-            <h3 id="nibi-test-heading">Non-interactive automation test</h3>
+            <h3 id="robot-automation-heading">Robot Automation</h3>
             <p>
-              This test checks whether FluorCast can run remote commands without asking for a
-              password or Duo prompt. Manual SSH login may work even if this automation test fails.
-              No prediction jobs are submitted.
+              Configure the future production path independently of manual MFA login. FluorCast
+              tests only robot-node SSH access here; no files are uploaded and no jobs are submitted.
             </p>
           </div>
-          <button
-            className="secondary-button"
-            disabled={isTestingConnection}
-            onClick={testNibiConnection}
-            type="button"
-          >
-            {isTestingConnection ? "Testing..." : "Test NIBI Connection"}
-          </button>
-          {connectionTestStatus ? (
+          <div className="diagnostic-grid">
+            <div><span className="step-label">Robot host</span><code>{values.robot_login_host || "robot.nibi.alliancecan.ca"}</code></div>
+            <div><span className="step-label">Username</span><code>{values.nibi_username || "Not configured"}</code></div>
+            <div><span className="step-label">Private key path</span><code>{values.ssh_private_key_path || "Not configured"}</code></div>
+            <div><span className="step-label">Access status</span><strong>{values.robot_access_verified ? "Verified" : "Not verified"}</strong></div>
+          </div>
+          <ul className="warning-list">
+            <li>Only upload the restricted public key to CCDB.</li>
+            <li>Never upload or paste the private key.</li>
+            <li>The from= restriction may require an approved network or VPN.</li>
+            <li>Robot-node access must be enabled by Alliance support.</li>
+          </ul>
+          <div className="button-row manual-login-actions">
+            <button className="secondary-button" onClick={copyAllianceSupportRequest} type="button">
+              Copy Alliance support request
+            </button>
+            <button className="secondary-button" disabled={isTestingRobotAutomation} onClick={testRobotAutomation} type="button">
+              {isTestingRobotAutomation ? "Testing..." : "Test robot automation"}
+            </button>
+          </div>
+          <label className="checkbox-label">
+            <input
+              checked={values.robot_access_verified}
+              name="robot_access_verified"
+              onChange={(event) => updateBooleanField("robot_access_verified", event.target.checked)}
+              type="checkbox"
+            />
+            <span>Robot automation access has been verified</span>
+          </label>
+          {robotCommandPreview ? (
+            <pre>{robotCommandPreview}</pre>
+          ) : null}
+          {restrictedPublicKeyStatus || robotTestStatus ? (
             <p className="connection-test-status" role="status">
-              {connectionTestStatus}
+              {robotTestStatus || restrictedPublicKeyStatus}
             </p>
           ) : null}
-          {connectionChecks.length > 0 ? (
-            <ol className="connection-checklist" aria-label="NIBI connection test results">
-              {connectionChecks.map((check) => (
-                <li className={getCheckClassName(check.status)} key={check.id}>
-                  <span aria-hidden="true">{getCheckBadge(check.status)}</span>
-                  <div>
-                    <strong>{check.label}</strong>
-                    <p>{check.message}</p>
-                  </div>
-                </li>
-              ))}
-            </ol>
-          ) : null}
         </section>
+        ) : null}
 
         <div className="form-actions">
           <span>{saveStatus || "Settings are stored locally on this device."}</span>
