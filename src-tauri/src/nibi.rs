@@ -521,6 +521,10 @@ pub fn run_nibi_remote_command(
     settings: NibiSettings,
     command_spec: RemoteCommandSpecInput,
 ) -> Result<RemoteCommandResult, String> {
+    if mode == "interactive_mfa" && command_spec.executable == "fluorcast-upload-smoke-test" {
+        return run_manual_mfa_upload_smoke_test_result(&settings, &command_spec);
+    }
+
     validate_remote_command_spec(&command_spec)?;
     let remote_command = structured_remote_command_to_shell(&command_spec)?;
     if mode == "interactive_mfa" {
@@ -1901,7 +1905,7 @@ fn validate_remote_command_spec(command_spec: &RemoteCommandSpecInput) -> Result
             validate_remote_path(&command_spec.args[0], "Python executable path")
         }
         "fluorcast-upload-smoke-test" if command_spec.args.len() == 1 => {
-            validate_remote_path(&command_spec.args[0], "Remote jobs path")
+            validate_remote_smoke_path_argument(&command_spec.args[0], "Remote jobs path")
         }
         "cat" if command_spec.args.len() == 1 => {
             validate_remote_path(&command_spec.args[0], "Remote log path")
@@ -1988,10 +1992,9 @@ fn structured_remote_command_to_shell(
             "{} --version",
             shell_quote(&command_spec.args[0])
         )),
-        "fluorcast-upload-smoke-test" => Ok(format!(
-            "smoke_dir={} && mkdir -p \"$smoke_dir\" && smoke_file=\"$smoke_dir/.fluorcast-smoke-$$.txt\" && printf '%s\\n' FLUORCAST_SMOKE_OK > \"$smoke_file\" && test \"$(cat \"$smoke_file\")\" = FLUORCAST_SMOKE_OK && rm -f \"$smoke_file\"",
-            shell_quote(&command_spec.args[0])
-        )),
+        "fluorcast-upload-smoke-test" => {
+            Ok(upload_smoke_remote_shell_command(&command_spec.args[0]))
+        }
         "cat" => Ok(format!("cat {}", shell_quote(&command_spec.args[0]))),
         "fluorcast-record-slurm-submission" => Ok(format!(
             "tmp={dir}/slurm_job_id.txt.tmp.$$ && printf '%s\\n' {slurm_id} > \"$tmp\" && mv \"$tmp\" {dir}/slurm_job_id.txt && printf '%s\\n' {submission_json} > {dir}/submission.json && printf '%s\\n' {status_json} > {dir}/status.json",
@@ -2210,6 +2213,191 @@ fn build_manual_mfa_remote_command_invocation(
         &manual_mfa_remote_command_script(),
         &args,
     )
+}
+
+fn run_manual_mfa_upload_smoke_test_result(
+    settings: &NibiSettings,
+    command_spec: &RemoteCommandSpecInput,
+) -> Result<RemoteCommandResult, String> {
+    validate_upload_smoke_command_shape(command_spec)?;
+    let started = Instant::now();
+    let preview = command_spec
+        .redacted_preview
+        .clone()
+        .unwrap_or_else(|| command_spec.label.clone());
+    let remote_jobs_path = &command_spec.args[0];
+
+    if remote_jobs_path.trim().is_empty() {
+        return Ok(RemoteCommandResult {
+            exit_code: 30,
+            stdout: "SMOKE_ERROR=REMOTE_JOBS_PATH_EMPTY".to_string(),
+            stderr: String::new(),
+            duration_ms: started.elapsed().as_millis(),
+            command_label: command_spec.label.clone(),
+            redacted_command_preview: preview,
+            timed_out: false,
+        });
+    }
+
+    validate_remote_smoke_path_argument(remote_jobs_path, "Remote jobs path")?;
+    validate_manual_login_settings(settings)?;
+    let commands = build_manual_mfa_session_commands(settings)?;
+    let readiness = run_manual_mfa_session_readiness(&commands);
+    if !readiness.can_run_background_commands {
+        return Ok(RemoteCommandResult {
+            exit_code: readiness.last_session_test_exit_code.unwrap_or(1),
+            stdout: readiness.last_session_test_stdout,
+            stderr: readiness.message,
+            duration_ms: started.elapsed().as_millis(),
+            command_label: command_spec.label.clone(),
+            redacted_command_preview: preview,
+            timed_out: matches!(readiness.status, ManualMfaSessionStatus::Timeout),
+        });
+    }
+
+    let invocation = build_manual_mfa_upload_smoke_test_invocation(&commands, remote_jobs_path);
+    let output = run_program_with_stdin_timeout(
+        &invocation.program,
+        &invocation.args,
+        &invocation.stdin,
+        WSL_SCRIPT_TIMEOUT,
+    )?;
+
+    Ok(RemoteCommandResult {
+        exit_code: output.status,
+        stdout: output.stdout,
+        stderr: sanitize_session_stderr(&output.stderr, &commands),
+        duration_ms: started.elapsed().as_millis(),
+        command_label: command_spec.label.clone(),
+        redacted_command_preview: preview,
+        timed_out: output.timed_out,
+    })
+}
+
+fn validate_upload_smoke_command_shape(
+    command_spec: &RemoteCommandSpecInput,
+) -> Result<(), String> {
+    if command_spec.executable == "fluorcast-upload-smoke-test" && command_spec.args.len() == 1 {
+        Ok(())
+    } else {
+        Err("Unsupported structured remote command.".to_string())
+    }
+}
+
+fn build_manual_mfa_upload_smoke_test_invocation(
+    commands: &ManualMfaSessionCommands,
+    remote_jobs_path: &str,
+) -> WslBashScriptInvocation {
+    let args = vec![commands.host.clone(), remote_jobs_path.to_string()];
+    build_wsl_bash_script_invocation(
+        &commands.wsl_distro,
+        &manual_mfa_upload_smoke_test_script(),
+        &args,
+    )
+}
+
+fn manual_mfa_upload_smoke_test_script() -> String {
+    let remote_script = upload_smoke_remote_script();
+    vec![
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        "",
+        "HOST=\"$1\"",
+        "REMOTE_JOBS_PATH=\"$2\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "",
+        "if [[ -z \"$REMOTE_JOBS_PATH\" ]]; then",
+        "    printf 'SMOKE_ERROR=REMOTE_JOBS_PATH_EMPTY\\n'",
+        "    exit 30",
+        "fi",
+        "",
+        "remote_shell_quote() {",
+        "    local value=\"$1\"",
+        "    local quoted=\"'\"",
+        "    local index character",
+        "    for ((index = 0; index < ${#value}; index++)); do",
+        "        character=\"${value:index:1}\"",
+        "        if [[ \"$character\" == \"'\" ]]; then",
+        "            quoted+=\"'\\\\''\"",
+        "        else",
+        "            quoted+=\"$character\"",
+        "        fi",
+        "    done",
+        "    quoted+=\"'\"",
+        "    printf '%s' \"$quoted\"",
+        "}",
+        "",
+        "REMOTE_SCRIPT=$(cat <<'FLUORCAST_REMOTE_SMOKE_SCRIPT'",
+        remote_script.as_str(),
+        "FLUORCAST_REMOTE_SMOKE_SCRIPT",
+        ")",
+        "REMOTE_SCRIPT_ARG=\"$(remote_shell_quote \"$REMOTE_SCRIPT\")\"",
+        "REMOTE_JOBS_ARG=\"$(remote_shell_quote \"$REMOTE_JOBS_PATH\")\"",
+        "REMOTE_COMMAND=\"bash -lc ${REMOTE_SCRIPT_ARG} -- ${REMOTE_JOBS_ARG}\"",
+        "",
+        "ssh \\",
+        "  -n \\",
+        "  -S \"$CTL\" \\",
+        "  -o ControlMaster=no \\",
+        "  -o BatchMode=yes \\",
+        "  -o PasswordAuthentication=no \\",
+        "  -o KbdInteractiveAuthentication=no \\",
+        "  \"$HOST\" \\",
+        "  \"$REMOTE_COMMAND\"",
+    ]
+    .join("\n")
+}
+
+fn upload_smoke_remote_shell_command(remote_jobs_path: &str) -> String {
+    format!(
+        "bash -lc {} -- {}",
+        shell_quote(&upload_smoke_remote_script()),
+        shell_quote(remote_jobs_path)
+    )
+}
+
+fn upload_smoke_remote_script() -> String {
+    [
+        "set -eu",
+        "",
+        "REMOTE_JOBS_PATH=\"$1\"",
+        "",
+        "if [[ -z \"$REMOTE_JOBS_PATH\" ]]; then",
+        "    printf 'SMOKE_ERROR=REMOTE_JOBS_PATH_EMPTY\\n'",
+        "    exit 30",
+        "fi",
+        "",
+        "printf 'SMOKE_PATH=%s\\n' \"$REMOTE_JOBS_PATH\"",
+        "",
+        "mkdir -p \"$REMOTE_JOBS_PATH\"",
+        "",
+        "SMOKE_FILE=\"$REMOTE_JOBS_PATH/.fluorcast-smoke-$(date +%s)-$$.txt\"",
+        "EXPECTED=\"FLUORCAST_SMOKE_OK\"",
+        "",
+        "printf '%s\\n' \"$EXPECTED\" > \"$SMOKE_FILE\"",
+        "printf 'SMOKE_CREATE=1\\n'",
+        "",
+        "ACTUAL=\"$(cat \"$SMOKE_FILE\")\"",
+        "",
+        "if [[ \"$ACTUAL\" != \"$EXPECTED\" ]]; then",
+        "    rm -f \"$SMOKE_FILE\"",
+        "    printf 'SMOKE_ERROR=CONTENT_MISMATCH\\n'",
+        "    exit 31",
+        "fi",
+        "",
+        "printf 'SMOKE_READ=1\\n'",
+        "",
+        "rm -f \"$SMOKE_FILE\"",
+        "",
+        "if [[ -e \"$SMOKE_FILE\" ]]; then",
+        "    printf 'SMOKE_ERROR=DELETE_FAILED\\n'",
+        "    exit 32",
+        "fi",
+        "",
+        "printf 'SMOKE_DELETE=1\\n'",
+        "printf 'FLUORCAST_REMOTE_SMOKE_OK\\n'",
+    ]
+    .join("\n")
 }
 
 fn manual_mfa_remote_command_script() -> String {
@@ -3567,6 +3755,23 @@ fn validate_remote_path(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_remote_smoke_path_argument(value: &str, label: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if !trimmed.starts_with('/') {
+        return Err(format!("{label} must be an absolute Linux path."));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(format!("{label} contains unsupported control characters."));
+    }
+    if trimmed.split('/').any(|part| part == "..") {
+        return Err(format!("{label} cannot contain path traversal."));
+    }
+    Ok(())
+}
+
 fn validate_remote_path_under_jobs(
     remote_path: &str,
     remote_jobs_path: &str,
@@ -3955,6 +4160,17 @@ mod tests {
         let commands = build_manual_mfa_session_commands(&settings()).unwrap();
         let remote_command = structured_remote_command_to_shell(&command_spec).unwrap();
         build_manual_mfa_remote_command_invocation(&commands, &remote_command)
+    }
+
+    fn upload_smoke_command_spec(remote_jobs_path: &str) -> RemoteCommandSpecInput {
+        RemoteCommandSpecInput {
+            label: "Upload/read/delete smoke test".to_string(),
+            executable: "fluorcast-upload-smoke-test".to_string(),
+            args: vec![remote_jobs_path.to_string()],
+            redacted_preview: Some(
+                "create/read/delete <remote_jobs_path>/.fluorcast-smoke-*.txt".to_string(),
+            ),
+        }
     }
 
     fn assert_manual_remote_invocation_uses_ssh_n(
@@ -4458,6 +4674,143 @@ mod tests {
         assert!(invocation.stdin.contains("ssh \\\n  -n \\\n"));
         assert!(!invocation.stdin.contains("ssh.exe"));
         assert!(!invocation.stdin.contains("-i \"$KEY\""));
+    }
+
+    #[test]
+    fn upload_smoke_invocation_passes_host_and_jobs_path_after_bash_sentinel() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let remote_jobs_path = "/home/alice/scratch/fluorcast-jobs";
+        let invocation = build_manual_mfa_upload_smoke_test_invocation(&commands, remote_jobs_path);
+
+        assert_eq!(invocation.program, "wsl.exe");
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-d",
+                "Ubuntu",
+                "--",
+                "bash",
+                "-s",
+                "--",
+                "alice@nibi.alliancecan.ca",
+                remote_jobs_path,
+            ]
+        );
+        assert!(invocation.stdin.contains("HOST=\"$1\""));
+        assert!(invocation.stdin.contains("REMOTE_JOBS_PATH=\"$2\""));
+        assert!(!invocation.stdin.contains(remote_jobs_path));
+    }
+
+    #[test]
+    fn upload_smoke_empty_jobs_path_returns_exit_30_and_is_not_quoted_empty_string() {
+        let result =
+            run_manual_mfa_upload_smoke_test_result(&settings(), &upload_smoke_command_spec(""))
+                .unwrap();
+
+        assert_eq!(result.exit_code, 30);
+        assert_eq!(result.stdout, "SMOKE_ERROR=REMOTE_JOBS_PATH_EMPTY");
+        assert!(result.stderr.is_empty());
+
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let invocation = build_manual_mfa_upload_smoke_test_invocation(&commands, "");
+        assert_eq!(invocation.args[7], "");
+        assert_ne!(invocation.args[7], "\"\"");
+        assert!(
+            invocation
+                .stdin
+                .find("if [[ -z \"$REMOTE_JOBS_PATH\" ]]")
+                .unwrap()
+                < invocation.stdin.find("ssh \\").unwrap()
+        );
+    }
+
+    #[test]
+    fn upload_smoke_remote_script_creates_reads_deletes_and_reports_markers() {
+        let script = upload_smoke_remote_script();
+
+        assert!(script.contains("set -eu"));
+        assert!(script.contains("REMOTE_JOBS_PATH=\"$1\""));
+        assert!(script.contains("mkdir -p \"$REMOTE_JOBS_PATH\""));
+        assert!(
+            script.contains("SMOKE_FILE=\"$REMOTE_JOBS_PATH/.fluorcast-smoke-$(date +%s)-$$.txt\"")
+        );
+        assert!(script.contains("printf '%s\\n' \"$EXPECTED\" > \"$SMOKE_FILE\""));
+        assert!(script.contains("ACTUAL=\"$(cat \"$SMOKE_FILE\")\""));
+        assert!(script.contains("rm -f \"$SMOKE_FILE\""));
+        assert!(script.contains("SMOKE_ERROR=CONTENT_MISMATCH"));
+        assert!(script.contains("exit 31"));
+        assert!(script.contains("SMOKE_ERROR=DELETE_FAILED"));
+        assert!(script.contains("exit 32"));
+        assert!(script.contains("SMOKE_PATH=%s"));
+        assert!(script.contains("SMOKE_CREATE=1"));
+        assert!(script.contains("SMOKE_READ=1"));
+        assert!(script.contains("SMOKE_DELETE=1"));
+        assert!(script.contains("FLUORCAST_REMOTE_SMOKE_OK"));
+    }
+
+    #[test]
+    fn upload_smoke_paths_with_spaces_and_shell_sensitive_chars_stay_data() {
+        let remote_jobs_path =
+            "/home/alice/scratch/fluorcast jobs/$(touch nope);`date`\"quote\"'single'";
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let invocation = build_manual_mfa_upload_smoke_test_invocation(&commands, remote_jobs_path);
+
+        assert_eq!(
+            validate_remote_smoke_path_argument(remote_jobs_path, "Remote jobs path"),
+            Ok(())
+        );
+        assert_eq!(invocation.args[7], remote_jobs_path);
+        assert!(!invocation.stdin.contains("$(touch nope)"));
+        assert!(!invocation.stdin.contains("`date`"));
+        assert!(!upload_smoke_remote_script().contains("$(touch nope)"));
+
+        let remote_command = upload_smoke_remote_shell_command(remote_jobs_path);
+        assert!(remote_command.starts_with("bash -lc 'set -eu"));
+        assert!(remote_command.contains("REMOTE_JOBS_PATH=\"$1\""));
+        assert!(remote_command.contains(" -- '/home/alice/scratch/fluorcast jobs/$(touch nope);"));
+        assert!(remote_command.contains("'\\''single'\\'''"));
+    }
+
+    #[test]
+    fn upload_smoke_uses_authenticated_controlpath_without_windows_ssh_or_prompts() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let invocation = build_manual_mfa_upload_smoke_test_invocation(
+            &commands,
+            "/home/alice/scratch/fluorcast jobs",
+        );
+
+        assert!(invocation
+            .stdin
+            .contains("CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\""));
+        assert!(invocation.stdin.contains("ssh \\\n  -n \\"));
+        assert!(invocation.stdin.contains("-S \"$CTL\""));
+        assert!(invocation.stdin.contains("-o ControlMaster=no"));
+        assert!(invocation.stdin.contains("-o BatchMode=yes"));
+        assert!(invocation.stdin.contains("-o PasswordAuthentication=no"));
+        assert!(invocation
+            .stdin
+            .contains("-o KbdInteractiveAuthentication=no"));
+        assert!(!invocation.stdin.contains("ssh.exe"));
+        assert!(!invocation.stdin.contains("ControlMaster=yes"));
+        assert!(!invocation.stdin.contains("ssh -fMN"));
+        assert!(!invocation.stdin.contains("read -r"));
+    }
+
+    #[test]
+    fn upload_smoke_structured_command_uses_remote_bash_positional_path() {
+        let command = structured_remote_command_to_shell(&upload_smoke_command_spec(
+            "/home/alice/scratch/fluorcast jobs",
+        ))
+        .unwrap();
+
+        assert!(command.starts_with("bash -lc 'set -eu"));
+        assert!(command.contains("REMOTE_JOBS_PATH=\"$1\""));
+        assert!(command.contains(" -- '/home/alice/scratch/fluorcast jobs'"));
+        assert!(!command.contains("smoke_dir="));
+
+        let empty = structured_remote_command_to_shell(&upload_smoke_command_spec("")).unwrap();
+        assert!(empty.ends_with(" -- ''"));
+        assert!(!empty.ends_with(" -- '\"\"'"));
     }
 
     #[test]

@@ -360,6 +360,56 @@ describe("SettingsPage", () => {
     expect(coreMock.invoke).toHaveBeenNthCalledWith(1, "test_manual_mfa_session", expect.any(Object));
   });
 
+  it("marks the upload/read/delete smoke test passed when the smoke marker returns", async () => {
+    coreMock.invoke.mockImplementation(async (command, payload) => {
+      if (command === "test_manual_mfa_session") {
+        return buildAuthenticatedSessionResult();
+      }
+      return {
+        exit_code: 0,
+        stdout: payload.commandSpec.executable === "fluorcast-upload-smoke-test"
+          ? [
+            "SMOKE_PATH=/home/alice/scratch/fluorcast-jobs",
+            "SMOKE_CREATE=1",
+            "SMOKE_READ=1",
+            "SMOKE_DELETE=1",
+            "FLUORCAST_REMOTE_SMOKE_OK",
+          ].join("\n")
+          : "ok",
+        stderr: "",
+        duration_ms: 10,
+        command_label: payload.commandSpec.label,
+        redacted_command_preview: payload.commandSpec.redacted_preview,
+      };
+    });
+
+    renderSettings({
+      connection_mode: "interactive_mfa",
+      nibi_username: "alice",
+      remote_jobs_path: "/home/alice/scratch/fluorcast-jobs",
+    }, {
+      manualMfaSession: {
+        ...defaultManualMfaSessionState,
+        status: "authenticated",
+        can_run_background_commands: true,
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Run remote environment checks" }));
+
+    expect(await screen.findByText("Remote environment ready")).toBeInTheDocument();
+    const smokeRow = screen.getByText("Upload/read/delete smoke test").closest("li")!;
+    expect(within(smokeRow).getByText("Remote jobs path passed the create/read/delete smoke test."))
+      .toBeInTheDocument();
+    expect(within(smokeRow).getByText("passed")).toBeInTheDocument();
+    expect(coreMock.invoke).toHaveBeenCalledWith("run_nibi_remote_command", expect.objectContaining({
+      commandSpec: expect.objectContaining({
+        executable: "fluorcast-upload-smoke-test",
+        args: ["/home/alice/scratch/fluorcast-jobs"],
+      }),
+    }));
+  });
+
   it("interactive_mfa shows manual login controls and hides robot-only controls", () => {
     renderMode("interactive_mfa");
 
@@ -709,6 +759,47 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run remote environment checks" }));
 
     expect(await screen.findByText("Remote project path is not readable.")).toBeInTheDocument();
+    expect(onManualMfaSessionChange).toHaveBeenCalledWith(expect.objectContaining({
+      status: "authenticated",
+      can_run_background_commands: true,
+    }));
+    expect(screen.getByText("authenticated")).toBeInTheDocument();
+  });
+
+  it("a failed upload/read/delete smoke test preserves authenticated status", async () => {
+    const onManualMfaSessionChange = vi.fn();
+    coreMock.invoke.mockImplementation(async (command, payload) => {
+      if (command === "test_manual_mfa_session") {
+        return buildAuthenticatedSessionResult();
+      }
+      return {
+        exit_code: payload.commandSpec.executable === "fluorcast-upload-smoke-test" ? 31 : 0,
+        stdout: payload.commandSpec.executable === "fluorcast-upload-smoke-test"
+          ? "SMOKE_ERROR=CONTENT_MISMATCH"
+          : "ok",
+        stderr: "",
+        duration_ms: 10,
+        command_label: payload.commandSpec.label,
+        redacted_command_preview: payload.commandSpec.redacted_preview,
+      };
+    });
+
+    renderSettings({
+      connection_mode: "interactive_mfa",
+      nibi_username: "alice",
+      wsl_ssh_private_key_path: "/home/alice/.ssh/fluorcast_nibi_ed25519",
+    }, {
+      manualMfaSession: {
+        ...defaultManualMfaSessionState,
+        status: "authenticated",
+        can_run_background_commands: true,
+      },
+      onManualMfaSessionChange,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Run remote environment checks" }));
+
+    expect(await screen.findByText("The smoke-test file contents did not match.")).toBeInTheDocument();
     expect(onManualMfaSessionChange).toHaveBeenCalledWith(expect.objectContaining({
       status: "authenticated",
       can_run_background_commands: true,

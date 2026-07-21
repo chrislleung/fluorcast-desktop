@@ -137,6 +137,28 @@ describe("remote environment checks", () => {
     });
   });
 
+  it("maps upload/read/delete smoke test failures to specific messages", () => {
+    const check = buildRemoteEnvironmentCheckDefinitions(settings)
+      .find((item) => item.id === "upload_read_delete_smoke")!;
+
+    expect(resultToRemoteEnvironmentRow(check, {
+      ...result(30, check.id),
+      stdout: "SMOKE_ERROR=REMOTE_JOBS_PATH_EMPTY",
+    }).message).toBe("Remote jobs path was empty before the smoke test ran.");
+    expect(resultToRemoteEnvironmentRow(check, {
+      ...result(31, check.id),
+      stdout: "SMOKE_ERROR=CONTENT_MISMATCH",
+    }).message).toBe("The smoke-test file contents did not match.");
+    expect(resultToRemoteEnvironmentRow(check, {
+      ...result(32, check.id),
+      stdout: "SMOKE_ERROR=DELETE_FAILED",
+    }).message).toBe("The smoke-test file could not be deleted.");
+    expect(resultToRemoteEnvironmentRow(check, {
+      ...result(1, check.id),
+      stderr: "ssh failed",
+    }).message).toBe("The authenticated remote smoke-test command failed.");
+  });
+
   it("sacct failure is a required Stage 1 failure", () => {
     const rows = buildRemoteEnvironmentCheckDefinitions(settings).map((definition) =>
       resultToRemoteEnvironmentRow(definition, result(definition.id === "sacct" ? 1 : 0, definition.id)),

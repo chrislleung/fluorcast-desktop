@@ -57,6 +57,31 @@ function withSettings(commandSpec: Omit<RemoteCommandSpec, "settings">, settings
   };
 }
 
+function resultMarker(stdout: string, marker: string): string | undefined {
+  const prefix = `${marker}=`;
+  return stdout
+    .split(/\r?\n/)
+    .find((line) => line.trim().startsWith(prefix))
+    ?.trim()
+    .slice(prefix.length);
+}
+
+function smokeFailureMessage(result: RemoteCommandResult): string {
+  const failureCode = resultMarker(result.stdout, "SMOKE_ERROR");
+
+  if (result.exit_code === 30 || failureCode === "REMOTE_JOBS_PATH_EMPTY") {
+    return "Remote jobs path was empty before the smoke test ran.";
+  }
+  if (result.exit_code === 31 || failureCode === "CONTENT_MISMATCH") {
+    return "The smoke-test file contents did not match.";
+  }
+  if (result.exit_code === 32 || failureCode === "DELETE_FAILED") {
+    return "The smoke-test file could not be deleted.";
+  }
+
+  return "The authenticated remote smoke-test command failed.";
+}
+
 export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): RemoteEnvironmentCheckDefinition[] {
   const trimmed = trimNibiSettings(settings);
   const predictionScriptPath = `${trimmed.remote_project_path}/scripts/run_prediction_job.py`;
@@ -241,10 +266,15 @@ export function resultToRemoteEnvironmentRow(
   result: RemoteCommandResult,
 ): RemoteEnvironmentCheckRow {
   const passed = result.exit_code === 0;
+  const message = passed
+    ? definition.successMessage
+    : definition.id === "upload_read_delete_smoke"
+    ? smokeFailureMessage(result)
+    : definition.failureMessage;
   return {
     ...definition,
     status: passed ? "passed" : "failed",
-    message: passed ? definition.successMessage : definition.failureMessage,
+    message,
     result,
   };
 }
