@@ -39,6 +39,7 @@ describe("manual MFA session helpers", () => {
     expect(commands.login_command).toContain("-o ControlPersist=4h");
     expect(commands.login_command).not.toContain("pkill -f");
     expect(commands.login_command).toContain('ssh -S "$CTL" -O check "$HOST" >/dev/null 2>&1');
+    expect(commands.login_command).not.toContain("ssh -n");
     expect(commands.login_command).toContain("An active FluorCast NIBI session already exists.");
     expect(commands.login_command.indexOf('ssh -S "$CTL" -O check "$HOST"'))
       .toBeLessThan(commands.login_command.indexOf('rm -f "$CTL"'));
@@ -48,11 +49,18 @@ describe("manual MFA session helpers", () => {
     const commands = buildManualMfaSessionCommands(settings);
 
     expect(commands.check_command).toBe('wsl.exe -d "Ubuntu" -- bash -s -- "alice@nibi.alliancecan.ca"');
-    expect(commands.check_script_content).toContain('ssh -S "$CTL" -O check "$HOST"');
+    expect(commands.check_script_content).toContain('ssh -n -S "$CTL" -O check "$HOST"');
     expect(commands.test_command).toContain('printf \'FLUORCAST_AUTH_OK\\n\'');
+    expect(commands.test_command).toContain('ssh -n -S "$CTL" -O check "$HOST"');
+    expect(commands.test_command).toContain("    -n \\");
+    expect(commands.test_command).toContain("printf 'SESSION_TEST_VERSION=4\\n'");
+    expect(commands.test_command).toContain("printf 'BATCH_REUSE_BEGIN=1\\n'");
+    expect(commands.test_command).toContain('printf \'BATCH_EXIT=%s\\n\' "$BATCH_EXIT"');
+    expect(commands.test_command).toContain('printf \'REMOTE_RESULT=%s\\n\' "$RESULT"');
+    expect(commands.test_command).toContain("printf 'AUTHENTICATION_MARKER_RECEIVED=1\\n'");
     expect(commands.test_command).not.toContain("KEY=");
     expect(commands.end_command).toBe("bash $HOME/.fluorcast/scripts/end-nibi-session.sh");
-    expect(commands.end_script_content).toContain('ssh -S "$CTL" -O exit "$HOST"');
+    expect(commands.end_script_content).toContain('ssh -n -S "$CTL" -O exit "$HOST"');
   });
 
   it("generates terminal launch commands with configured distro", () => {
@@ -77,7 +85,8 @@ describe("manual MFA session helpers", () => {
 
     expect(commands.clean_script_content).not.toContain("pkill -f");
     expect(commands.clean_stale_session_command).toBe("bash $HOME/.fluorcast/scripts/clean-nibi-session.sh");
-    expect(commands.clean_script_content).toContain('ssh -S "$CTL" -O exit "$HOST" >/dev/null 2>&1 || true');
+    expect(commands.clean_script_content).toContain('ssh -n -S "$CTL" -O check "$HOST" >/dev/null 2>&1');
+    expect(commands.clean_script_content).toContain('ssh -n -S "$CTL" -O exit "$HOST" >/dev/null 2>&1 || true');
     expect(commands.clean_script_content).toContain('rm -f "$CTL"');
     expect(commands.clean_script_content).toContain('mkdir -p "$HOME/.fluorcast/ssh"');
     expect(commands.clean_script_content).toContain('CLEAN_RESULT=HEALTHY_SESSION_CLOSED');
@@ -95,10 +104,24 @@ describe("manual MFA session helpers", () => {
     expect(commands.test_command).not.toContain("/home/alice/.ssh/fluorcast_nibi_ed25519");
   });
 
-  it("background remote command uses BatchMode=yes", () => {
+  it("background remote command uses ssh -n with BatchMode=yes", () => {
     expect(buildWslBackgroundCommand(settings, "hostname")).toContain(
-      'ssh -S "$CTL" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "$HOST" "$REMOTE_COMMAND"',
+      'ssh -n -S "$CTL" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "$HOST" "$REMOTE_COMMAND"',
     );
+  });
+
+  it("keeps stdin-fed session scripts moving after nested ssh commands", () => {
+    const commands = buildManualMfaSessionCommands(settings);
+    const script = commands.check_script_content;
+
+    expect(script.indexOf('ssh -n -S "$CTL" -O check "$HOST"'))
+      .toBeLessThan(script.indexOf("printf 'MASTER_EXIT=%s\\n'"));
+    expect(script.indexOf("printf 'BATCH_REUSE_BEGIN=1\\n'"))
+      .toBeLessThan(script.indexOf("printf 'BATCH_EXIT=%s\\n'"));
+    expect(script.indexOf("printf 'BATCH_EXIT=%s\\n'"))
+      .toBeLessThan(script.indexOf("printf 'FLUORCAST_AUTH_OK\\n'"));
+    expect(script).not.toContain("-i \"$KEY\"");
+    expect(script).not.toContain(settings.wsl_ssh_private_key_path);
   });
 
   it("maps password and Duo prompts to authentication required", () => {
@@ -126,6 +149,102 @@ describe("manual MFA session helpers", () => {
     })).toMatchObject({
       status: "authenticated",
       can_run_background_commands: true,
+    });
+  });
+
+  it("maps diagnostic stdout followed by FLUORCAST_AUTH_OK to authenticated", () => {
+    expect(classifyManualMfaSessionTest({
+      exit_code: 0,
+      stdout: [
+        "SESSION_TEST_VERSION=4",
+        "WSL_DISTRO=Ubuntu",
+        "WSL_USER=alice",
+        "WSL_HOME=/home/alice",
+        "CONTROL_PATH=/home/alice/.fluorcast/ssh/cm-nibi.sock",
+        "SOCKET_EXISTS=1",
+        "MASTER_EXIT=0",
+        "MASTER_RUNNING=1",
+        "BATCH_REUSE_BEGIN=1",
+        "BATCH_EXIT=0",
+        "REMOTE_RESULT=FLUORCAST_AUTH_OK",
+        "AUTHENTICATION_MARKER_RECEIVED=1",
+        "FLUORCAST_AUTH_OK",
+      ].join("\n"),
+      stderr: "",
+      control_path_exists: true,
+    })).toMatchObject({
+      status: "authenticated",
+      can_run_background_commands: true,
+    });
+  });
+
+  it("rejects auth marker substrings, stderr-only markers, and nonzero exits", () => {
+    for (const stdout of ["NOT_FLUORCAST_AUTH_OK", "FLUORCAST_AUTH_OK_FAILED"]) {
+      expect(classifyManualMfaSessionTest({
+        exit_code: 0,
+        stdout,
+        stderr: "",
+        control_path_exists: true,
+      })).not.toMatchObject({
+        status: "authenticated",
+      });
+    }
+
+    expect(classifyManualMfaSessionTest({
+      exit_code: 0,
+      stdout: "MASTER_RUNNING=1",
+      stderr: "FLUORCAST_AUTH_OK",
+      control_path_exists: true,
+    })).not.toMatchObject({
+      status: "authenticated",
+    });
+
+    expect(classifyManualMfaSessionTest({
+      exit_code: 255,
+      stdout: "MASTER_RUNNING=1\nFLUORCAST_AUTH_OK",
+      stderr: "",
+      control_path_exists: true,
+    })).not.toMatchObject({
+      status: "authenticated",
+    });
+  });
+
+  it("maps session-test exit codes to specific user messages", () => {
+    expect(classifyManualMfaSessionTest({
+      exit_code: 10,
+      stdout: "SESSION_ERROR=CONTROL_PATH_MISSING",
+      stderr: "",
+      control_path_exists: false,
+    })).toMatchObject({
+      status: "session_not_found",
+      message: "No FluorCast WSL session socket was found.",
+    });
+    expect(classifyManualMfaSessionTest({
+      exit_code: 11,
+      stdout: "SESSION_ERROR=CONTROL_PATH_NOT_SOCKET",
+      stderr: "",
+      control_path_exists: true,
+    })).toMatchObject({
+      status: "control_path_not_socket",
+      message: "The FluorCast ControlPath exists but is not a Unix socket.",
+    });
+    expect(classifyManualMfaSessionTest({
+      exit_code: 12,
+      stdout: "SESSION_ERROR=CONTROL_MASTER_CHECK_FAILED",
+      stderr: "",
+      control_path_exists: true,
+    })).toMatchObject({
+      status: "stale_controlmaster",
+      message: "The FluorCast SSH ControlMaster is no longer running.",
+    });
+    expect(classifyManualMfaSessionTest({
+      exit_code: 13,
+      stdout: "SESSION_ERROR=AUTH_MARKER_MISSING",
+      stderr: "",
+      control_path_exists: true,
+    })).toMatchObject({
+      status: "auth_marker_missing",
+      message: "The SSH master was found, but the authentication marker was not returned.",
     });
   });
 

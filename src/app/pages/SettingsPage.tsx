@@ -106,6 +106,7 @@ export function SettingsPage({
   const [manualMfaStatus, setManualMfaStatus] = useState("");
   const [localSshCapabilities, setLocalSshCapabilities] = useState<LocalSshCapabilitiesResult | null>(null);
   const [isManualMfaWorking, setIsManualMfaWorking] = useState(false);
+  const manualMfaOperationIdRef = useRef(0);
   const startManualMfaLaunchInFlightRef = useRef(false);
   const [restrictedPublicKey, setRestrictedPublicKey] = useState("");
   const [restrictedPublicKeyStatus, setRestrictedPublicKeyStatus] = useState("");
@@ -446,6 +447,15 @@ export function SettingsPage({
     }
   }
 
+  function beginManualMfaOperation() {
+    manualMfaOperationIdRef.current += 1;
+    return manualMfaOperationIdRef.current;
+  }
+
+  function isCurrentManualMfaOperation(operationId: number) {
+    return manualMfaOperationIdRef.current === operationId;
+  }
+
   async function copyManualMfaLoginCommand() {
     setManualMfaStatus("");
     try {
@@ -495,50 +505,73 @@ export function SettingsPage({
       return;
     }
     startManualMfaLaunchInFlightRef.current = true;
+    const operationId = beginManualMfaOperation();
     setIsManualMfaWorking(true);
     setManualMfaStatus("Opening NIBI login terminal...");
     try {
       const launch = await invoke<ManualMfaTerminalLaunchResult>("open_manual_mfa_login", {
         settings: trimNibiSettings(values),
       });
+      if (!isCurrentManualMfaOperation(operationId)) {
+        return;
+      }
       const commands = launch.commands;
       setManualMfaCommands(commands);
       onManualMfaSessionChange(applyManualMfaTerminalLaunchResult(manualMfaSession, launch));
       setManualMfaStatus(launch.message);
     } catch (error) {
-      setManualMfaStatus(error instanceof Error ? error.message : "Could not open a terminal automatically. Copy the WSL login command and run it manually.");
+      if (isCurrentManualMfaOperation(operationId)) {
+        setManualMfaStatus(error instanceof Error ? error.message : "Could not open a terminal automatically. Copy the WSL login command and run it manually.");
+      }
     } finally {
-      setIsManualMfaWorking(false);
+      if (isCurrentManualMfaOperation(operationId)) {
+        setIsManualMfaWorking(false);
+      }
       startManualMfaLaunchInFlightRef.current = false;
     }
   }
 
   async function testManualMfaSession() {
+    const operationId = beginManualMfaOperation();
     setIsManualMfaWorking(true);
     setManualMfaStatus("");
     try {
-      updateManualMfaFromResult(await invoke<ManualMfaSessionResult>("test_manual_mfa_session", {
+      const result = await invoke<ManualMfaSessionResult>("test_manual_mfa_session", {
         settings: trimNibiSettings(values),
-      }), true);
+      });
+      if (isCurrentManualMfaOperation(operationId)) {
+        updateManualMfaFromResult(result, true);
+      }
     } catch (error) {
-      setManualMfaStatus(error instanceof Error ? error.message : "Manual MFA session test could not run.");
+      if (isCurrentManualMfaOperation(operationId)) {
+        setManualMfaStatus(error instanceof Error ? error.message : "Manual MFA session test could not run.");
+      }
     } finally {
-      setIsManualMfaWorking(false);
+      if (isCurrentManualMfaOperation(operationId)) {
+        setIsManualMfaWorking(false);
+      }
     }
   }
 
   async function cleanStaleManualMfaSession() {
+    const operationId = beginManualMfaOperation();
     setIsManualMfaWorking(true);
     setManualMfaStatus("");
     try {
       const result = await invoke<ManualMfaSessionResult>("clean_stale_manual_mfa_session", {
         settings: trimNibiSettings(values),
       });
-      updateManualMfaFromResult(result);
+      if (isCurrentManualMfaOperation(operationId)) {
+        updateManualMfaFromResult(result);
+      }
     } catch (error) {
-      setManualMfaStatus(error instanceof Error ? error.message : "Stale WSL session cleanup could not run.");
+      if (isCurrentManualMfaOperation(operationId)) {
+        setManualMfaStatus(error instanceof Error ? error.message : "Stale WSL session cleanup could not run.");
+      }
     } finally {
-      setIsManualMfaWorking(false);
+      if (isCurrentManualMfaOperation(operationId)) {
+        setIsManualMfaWorking(false);
+      }
     }
   }
 

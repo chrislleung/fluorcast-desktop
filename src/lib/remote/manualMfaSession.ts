@@ -60,6 +60,19 @@ export type ManualMfaSessionCommands = {
 export type ManualMfaSessionResult = {
   status: ManualMfaSessionStatus;
   message: string;
+  success: boolean;
+  authenticated: boolean;
+  failure_code: string;
+  exit_code: number | null;
+  wsl_distro: string;
+  wsl_user: string;
+  wsl_home: string;
+  resolved_control_path: string;
+  socket_exists: boolean;
+  master_running: boolean;
+  authentication_marker_received: boolean;
+  stdout: string;
+  stderr: string;
   control_path: string;
   control_path_exists: boolean;
   redacted_command_preview: string;
@@ -184,6 +197,13 @@ export const defaultManualMfaSessionState: ManualMfaSessionUiState = {
 
 const AUTH_OK = "FLUORCAST_AUTH_OK";
 
+function hasCompleteTrimmedLine(output: string, expected: string): boolean {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .some((line) => line === expected);
+}
+
 export function quotePowerShellArg(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;
 }
@@ -223,8 +243,8 @@ export function buildManualMfaSessionCommands(
     "  exit 0",
     "fi",
     "",
-    'if [[ -S "$CTL" ]] && ssh -S "$CTL" -O check "$HOST" >/dev/null 2>&1; then',
-    '  ssh -S "$CTL" -O exit "$HOST" >/dev/null 2>&1 || true',
+    'if [[ -S "$CTL" ]] && ssh -n -S "$CTL" -O check "$HOST" >/dev/null 2>&1; then',
+    '  ssh -n -S "$CTL" -O exit "$HOST" >/dev/null 2>&1 || true',
     '  rm -f "$CTL"',
     "  printf 'CLEAN_RESULT=HEALTHY_SESSION_CLOSED\\n'",
     "  exit 0",
@@ -307,6 +327,7 @@ export function buildManualMfaSessionCommands(
     'HOST="$1"',
     'CTL="$HOME/.fluorcast/ssh/cm-nibi.sock"',
     "",
+    "printf 'SESSION_TEST_VERSION=4\\n'",
     'printf \'WSL_DISTRO=%s\\n\' "${WSL_DISTRO_NAME:-unknown}"',
     'printf \'WSL_USER=%s\\n\' "$(whoami)"',
     'printf \'WSL_HOME=%s\\n\' "$HOME"',
@@ -324,15 +345,23 @@ export function buildManualMfaSessionCommands(
     "",
     "printf 'SOCKET_EXISTS=1\\n'",
     "",
-    'if ! ssh -S "$CTL" -O check "$HOST"; then',
+    "set +e",
+    'ssh -n -S "$CTL" -O check "$HOST"',
+    "MASTER_EXIT=$?",
+    "set -e",
+    'printf \'MASTER_EXIT=%s\\n\' "$MASTER_EXIT"',
+    'if [[ "$MASTER_EXIT" -ne 0 ]]; then',
     "  printf 'SESSION_ERROR=CONTROL_MASTER_CHECK_FAILED\\n'",
     "  exit 12",
     "fi",
     "",
     "printf 'MASTER_RUNNING=1\\n'",
     "",
+    "printf 'BATCH_REUSE_BEGIN=1\\n'",
+    "set +e",
     'RESULT="$(',
     "  ssh \\",
+    "    -n \\",
     '    -S "$CTL" \\',
     "    -o ControlMaster=no \\",
     "    -o BatchMode=yes \\",
@@ -342,6 +371,13 @@ export function buildManualMfaSessionCommands(
     '    "$HOST" \\',
     "    'printf \"FLUORCAST_AUTH_OK\\n\"'",
     ')"',
+    "BATCH_EXIT=$?",
+    "set -e",
+    'printf \'BATCH_EXIT=%s\\n\' "$BATCH_EXIT"',
+    'printf \'REMOTE_RESULT=%s\\n\' "$RESULT"',
+    'if [[ "$BATCH_EXIT" -ne 0 ]]; then',
+    '  exit "$BATCH_EXIT"',
+    "fi",
     "",
     'if [[ "$RESULT" != "FLUORCAST_AUTH_OK" ]]; then',
     "  printf 'SESSION_ERROR=AUTH_MARKER_MISSING\\n'",
@@ -349,6 +385,7 @@ export function buildManualMfaSessionCommands(
     "  exit 13",
     "fi",
     "",
+    "printf 'AUTHENTICATION_MARKER_RECEIVED=1\\n'",
     "printf 'FLUORCAST_AUTH_OK\\n'",
   ].join("\n");
   const endScript = [
@@ -358,7 +395,7 @@ export function buildManualMfaSessionCommands(
     'HOST="$1"',
     'CTL="$HOME/.fluorcast/ssh/cm-nibi.sock"',
     "",
-    'ssh -S "$CTL" -O exit "$HOST"',
+    'ssh -n -S "$CTL" -O exit "$HOST"',
   ].join("\n");
   const check = `wsl.exe -d ${quoteWindowsArg(distro)} -- bash -s -- ${quoteWindowsArg(target)}`;
   const test = checkScript;
@@ -367,7 +404,7 @@ export function buildManualMfaSessionCommands(
     'HOST="$1"',
     'REMOTE_COMMAND="$2"',
     'CTL="$HOME/.fluorcast/ssh/cm-nibi.sock"',
-    'ssh -S "$CTL" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "$HOST" "$REMOTE_COMMAND"',
+    'ssh -n -S "$CTL" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "$HOST" "$REMOTE_COMMAND"',
   ].join("\n");
 
   return {
@@ -417,7 +454,7 @@ export function classifyManualMfaSessionTest(
   output: { exit_code: number; stdout: string; stderr: string; control_path_exists: boolean },
 ): Pick<ManualMfaSessionResult, "status" | "message" | "can_run_background_commands"> {
   const combined = `${output.stdout}\n${output.stderr}`;
-  if (output.exit_code === 0 && output.stdout.includes(AUTH_OK)) {
+  if (output.exit_code === 0 && hasCompleteTrimmedLine(output.stdout, AUTH_OK)) {
     return {
       status: "authenticated",
       message: `Authenticated WSL NIBI session is ready.\n${AUTH_OK}`,
@@ -427,35 +464,35 @@ export function classifyManualMfaSessionTest(
   if (output.exit_code === 10 || combined.includes("SESSION_ERROR=CONTROL_PATH_MISSING")) {
     return {
       status: "session_not_found",
-      message: "ControlPath is missing. Start the NIBI session, then test again.",
+      message: "No FluorCast WSL session socket was found.",
       can_run_background_commands: false,
     };
   }
   if (output.exit_code === 11 || combined.includes("SESSION_ERROR=CONTROL_PATH_NOT_SOCKET")) {
     return {
       status: "control_path_not_socket",
-      message: "ControlPath exists but is not a socket. Clean stale WSL session, then start again.",
+      message: "The FluorCast ControlPath exists but is not a Unix socket.",
       can_run_background_commands: false,
     };
   }
   if (output.exit_code === 12 || combined.includes("SESSION_ERROR=CONTROL_MASTER_CHECK_FAILED")) {
     return {
       status: "stale_controlmaster",
-      message: "The ControlMaster socket is stale or not running. Clean stale WSL session, then start again.",
+      message: "The FluorCast SSH ControlMaster is no longer running.",
       can_run_background_commands: false,
     };
   }
   if (output.exit_code === 13 || combined.includes("SESSION_ERROR=AUTH_MARKER_MISSING")) {
     return {
       status: "auth_marker_missing",
-      message: "Authenticated session reuse did not return FLUORCAST_AUTH_OK.",
+      message: "The SSH master was found, but the authentication marker was not returned.",
       can_run_background_commands: false,
     };
   }
   if (output.exit_code === 124) {
     return {
       status: "timeout",
-      message: "The WSL NIBI session test timed out.",
+      message: "The authenticated-session test timed out.",
       can_run_background_commands: false,
     };
   }
@@ -512,6 +549,8 @@ export function applyManualMfaSessionResult(
   const resultMarksAuthenticated = result.status === "authenticated" || result.can_run_background_commands;
   const canRunBackgroundCommands = canMarkAuthenticated && result.can_run_background_commands;
   const markers = parseSessionMarkers([
+    result.stdout,
+    result.stderr,
     result.last_session_test_stdout,
     result.last_session_test_stderr,
     result.last_master_check_result,
@@ -520,7 +559,7 @@ export function applyManualMfaSessionResult(
   return {
     ...current,
     status: resultMarksAuthenticated && !canMarkAuthenticated ? "login_required" : result.status,
-    control_path: markers.CONTROL_PATH ?? result.control_path,
+    control_path: result.resolved_control_path || markers.CONTROL_PATH || result.control_path,
     control_path_exists: result.control_path_exists,
     last_session_probe_at: checkedAt,
     last_session_test_result: result.message,
@@ -534,9 +573,9 @@ export function applyManualMfaSessionResult(
     selected_backend: "wsl",
     wsl_available: result.wsl_available,
     wsl_ssh_available: result.wsl_ssh_available,
-    wsl_distro: markers.WSL_DISTRO ?? current.wsl_distro,
-    wsl_user: markers.WSL_USER ?? current.wsl_user,
-    wsl_home: markers.WSL_HOME ?? current.wsl_home,
+    wsl_distro: result.wsl_distro || markers.WSL_DISTRO || current.wsl_distro,
+    wsl_user: result.wsl_user || markers.WSL_USER || current.wsl_user,
+    wsl_home: result.wsl_home || markers.WSL_HOME || current.wsl_home,
     last_successful_command_at: canRunBackgroundCommands
       ? checkedAt
       : current.last_successful_command_at,
@@ -616,7 +655,7 @@ export function buildWslBackgroundCommand(settings: NibiSettings, remoteCommand:
     `HOST=${shellQuote(commands.host)}`,
     `REMOTE_COMMAND=${shellQuote(remoteCommand)}`,
     'CTL="$HOME/.fluorcast/ssh/cm-nibi.sock"',
-    'ssh -S "$CTL" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "$HOST" "$REMOTE_COMMAND"',
+    'ssh -n -S "$CTL" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "$HOST" "$REMOTE_COMMAND"',
   ].join("\n");
 }
 

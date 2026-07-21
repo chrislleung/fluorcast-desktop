@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import { useState, type ComponentProps } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { defaultNibiSettings, type ConnectionMode, type NibiSettings } from "../../features/settings";
-import { defaultManualMfaSessionState } from "../../lib/remote";
+import { defaultManualMfaSessionState, type ManualMfaSessionResult } from "../../lib/remote";
 import { SettingsPage } from "./SettingsPage";
 
 const dialogMock = vi.hoisted(() => ({
@@ -83,6 +83,49 @@ function buildLaunchCommandsFixture() {
   };
 }
 
+function buildAuthenticatedSessionResult(overrides: Partial<ManualMfaSessionResult> = {}): ManualMfaSessionResult {
+  const stdout = [
+    "WSL_DISTRO=Ubuntu",
+    "WSL_USER=alice",
+    "WSL_HOME=/home/alice",
+    "CONTROL_PATH=/home/alice/.fluorcast/ssh/cm-nibi.sock",
+    "SOCKET_EXISTS=1",
+    "MASTER_RUNNING=1",
+    "FLUORCAST_AUTH_OK",
+  ].join("\n");
+  return {
+    status: "authenticated",
+    message: "Authenticated WSL NIBI session is ready.\nFLUORCAST_AUTH_OK",
+    success: true,
+    authenticated: true,
+    failure_code: "none",
+    exit_code: 0,
+    wsl_distro: "Ubuntu",
+    wsl_user: "alice",
+    wsl_home: "/home/alice",
+    resolved_control_path: "/home/alice/.fluorcast/ssh/cm-nibi.sock",
+    socket_exists: true,
+    master_running: true,
+    authentication_marker_received: true,
+    stdout,
+    stderr: "",
+    control_path: "/home/alice/.fluorcast/ssh/cm-nibi.sock",
+    control_path_exists: true,
+    redacted_command_preview: "wsl.exe -d <distribution> -- bash -s -- <host>",
+    can_run_background_commands: true,
+    last_master_check_result: "MASTER_RUNNING=1",
+    last_auth_ok_result: "FLUORCAST_AUTH_OK",
+    last_session_test_stdout: stdout,
+    last_session_test_stderr: "",
+    last_session_test_exit_code: 0,
+    parsed_session_status: "authenticated",
+    selected_backend: "wsl",
+    wsl_available: true,
+    wsl_ssh_available: true,
+    ...overrides,
+  };
+}
+
 describe("SettingsPage", () => {
   beforeEach(() => {
     dialogMock.open.mockReset();
@@ -136,6 +179,79 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Log into NIBI first before running remote environment checks."))
       .toBeInTheDocument();
     expect(screen.queryByText("Remote Environment Checks")).not.toBeInTheDocument();
+  });
+
+  it("marks a successful authenticated-session test ready and enables environment checks", async () => {
+    const save = vi.fn().mockResolvedValue(true);
+    coreMock.invoke.mockResolvedValue(buildAuthenticatedSessionResult());
+
+    function Harness() {
+      const [session, setSession] = useState(defaultManualMfaSessionState);
+      return (
+        <SettingsPage
+          accentColor="#8ab4ff"
+          nibiSettings={{
+            ...defaultNibiSettings,
+            connection_mode: "interactive_mfa",
+            nibi_username: "alice",
+          }}
+          secondaryColor="#8ee6c8"
+          manualMfaSession={session}
+          onAccentColorChange={vi.fn()}
+          onManualMfaSessionChange={setSession}
+          onNibiSettingsSave={save}
+          onSecondaryColorChange={vi.fn()}
+        />
+      );
+    }
+
+    render(<Harness />);
+
+    expect(screen.getByRole("button", { name: "Run remote environment checks" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Test authenticated session" }));
+
+    expect((await screen.findAllByText(/Authenticated WSL NIBI session is ready/)).length)
+      .toBeGreaterThan(0);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Run remote environment checks" })).toBeEnabled();
+    });
+    expect(screen.getByText("authenticated")).toBeInTheDocument();
+    expect(screen.getByText("alice")).toBeInTheDocument();
+    expect(screen.getByText("/home/alice")).toBeInTheDocument();
+    expect(screen.getByText("/home/alice/.fluorcast/ssh/cm-nibi.sock")).toBeInTheDocument();
+  });
+
+  it("uses the current session-test result instead of previous clean-session output", async () => {
+    const onManualMfaSessionChange = vi.fn();
+    coreMock.invoke.mockResolvedValue(buildAuthenticatedSessionResult());
+
+    renderSettings({
+      connection_mode: "interactive_mfa",
+      nibi_username: "alice",
+    }, {
+      manualMfaSession: {
+        ...defaultManualMfaSessionState,
+        status: "disconnected",
+        last_session_test_result: "Healthy WSL NIBI session closed.",
+        last_session_test_stdout: "CLEAN_RESULT=HEALTHY_SESSION_CLOSED",
+      },
+      onManualMfaSessionChange,
+    });
+
+    expect(screen.getAllByText("Healthy WSL NIBI session closed.").length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Test authenticated session" }));
+
+    expect((await screen.findAllByText(/Authenticated WSL NIBI session is ready/)).length)
+      .toBeGreaterThan(0);
+    expect(screen.queryByText("Healthy WSL NIBI session closed.")).not.toBeInTheDocument();
+    expect(onManualMfaSessionChange).toHaveBeenCalledWith(expect.objectContaining({
+      status: "authenticated",
+      can_run_background_commands: true,
+      last_auth_ok_result: "FLUORCAST_AUTH_OK",
+      last_session_test_stdout: expect.stringContaining("FLUORCAST_AUTH_OK"),
+    }));
   });
 
   it("keeps generated scripts hidden in collapsed diagnostics by default", () => {

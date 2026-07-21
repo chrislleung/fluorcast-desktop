@@ -231,6 +231,8 @@ pub enum TerminalLaunchMethod {
 pub struct ManualMfaSessionResult {
     status: ManualMfaSessionStatus,
     message: String,
+    #[serde(flatten)]
+    diagnostics: ManualMfaSessionDiagnostics,
     control_path: String,
     control_path_exists: bool,
     redacted_command_preview: String,
@@ -244,6 +246,43 @@ pub struct ManualMfaSessionResult {
     selected_backend: &'static str,
     wsl_available: bool,
     wsl_ssh_available: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ManualMfaSessionDiagnostics {
+    success: bool,
+    authenticated: bool,
+    failure_code: String,
+    exit_code: Option<i32>,
+    wsl_distro: String,
+    wsl_user: String,
+    wsl_home: String,
+    resolved_control_path: String,
+    socket_exists: bool,
+    master_running: bool,
+    authentication_marker_received: bool,
+    stdout: String,
+    stderr: String,
+}
+
+impl Default for ManualMfaSessionDiagnostics {
+    fn default() -> Self {
+        Self {
+            success: false,
+            authenticated: false,
+            failure_code: "none".to_string(),
+            exit_code: None,
+            wsl_distro: String::new(),
+            wsl_user: String::new(),
+            wsl_home: String::new(),
+            resolved_control_path: String::new(),
+            socket_exists: false,
+            master_running: false,
+            authentication_marker_received: false,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -639,6 +678,7 @@ pub fn clean_stale_manual_mfa_session(
             Ok(ManualMfaSessionResult {
                 status,
                 message,
+                diagnostics: ManualMfaSessionDiagnostics::default(),
                 control_path: resolved_control_path_from_output(&output)
                     .unwrap_or_else(|| commands.control_path.clone()),
                 control_path_exists: false,
@@ -923,6 +963,7 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
         return Ok(ManualMfaSessionResult {
             status: ManualMfaSessionStatus::Failed,
             message,
+            diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
             control_path_exists: wsl_path_exists(&commands.control_path),
             redacted_command_preview: commands.redacted_end_command_preview.clone(),
@@ -946,6 +987,7 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
                 Ok(ManualMfaSessionResult {
                     status: ManualMfaSessionStatus::Disconnected,
                     message: "Manual NIBI session ended.".to_string(),
+                    diagnostics: ManualMfaSessionDiagnostics::default(),
                     control_path: commands.control_path.clone(),
                     control_path_exists,
                     redacted_command_preview: commands.redacted_end_command_preview.clone(),
@@ -964,6 +1006,7 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
                 Ok(ManualMfaSessionResult {
                     status: ManualMfaSessionStatus::AuthenticationRequired,
                     message: "NIBI still requested password/Duo, so the app cannot run background commands yet. Start manual login again.".to_string(),
+                    diagnostics: ManualMfaSessionDiagnostics::default(),
                     control_path: commands.control_path.clone(),
                     control_path_exists,
                     redacted_command_preview: commands.redacted_end_command_preview.clone(),
@@ -982,6 +1025,7 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
                 Ok(ManualMfaSessionResult {
                     status: ManualMfaSessionStatus::Failed,
                     message: "Could not end the manual NIBI session.".to_string(),
+                    diagnostics: ManualMfaSessionDiagnostics::default(),
                     control_path: commands.control_path.clone(),
                     control_path_exists,
                     redacted_command_preview: commands.redacted_end_command_preview.clone(),
@@ -1001,6 +1045,7 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
         Err(message) => Ok(ManualMfaSessionResult {
             status: ManualMfaSessionStatus::Disconnected,
             message: map_manual_mfa_error(&message),
+            diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
             control_path_exists: wsl_path_exists(&commands.control_path),
             redacted_command_preview: commands.redacted_end_command_preview,
@@ -1243,8 +1288,8 @@ fn build_manual_mfa_session_commands(
         "    exit 0",
         "fi",
         "",
-        "if [[ -S \"$CTL\" ]] && ssh -S \"$CTL\" -O check \"$HOST\" >/dev/null 2>&1; then",
-        "    ssh -S \"$CTL\" -O exit \"$HOST\" >/dev/null 2>&1 || true",
+        "if [[ -S \"$CTL\" ]] && ssh -n -S \"$CTL\" -O check \"$HOST\" >/dev/null 2>&1; then",
+        "    ssh -n -S \"$CTL\" -O exit \"$HOST\" >/dev/null 2>&1 || true",
         "    rm -f \"$CTL\"",
         "    printf 'CLEAN_RESULT=HEALTHY_SESSION_CLOSED\\n'",
         "    exit 0",
@@ -1330,7 +1375,7 @@ fn build_manual_mfa_session_commands(
         "HOST=\"$1\"",
         "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
         "",
-        "ssh -S \"$CTL\" -O exit \"$HOST\"",
+        "ssh -n -S \"$CTL\" -O exit \"$HOST\"",
     ]
     .join("\n");
     let check = format!(
@@ -1344,7 +1389,7 @@ fn build_manual_mfa_session_commands(
         "HOST=\"$1\"",
         "REMOTE_COMMAND=\"$2\"",
         "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
-        "ssh -S \"$CTL\" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \"$HOST\" \"$REMOTE_COMMAND\"",
+        "ssh -n -S \"$CTL\" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \"$HOST\" \"$REMOTE_COMMAND\"",
     ]
     .join("\n");
 
@@ -1543,13 +1588,15 @@ fn manual_mfa_scp_upload_script() -> String {
         "test -S \"$CTL\"",
         "test -f \"$LOCAL_WSL_PATH\"",
         "scp \\",
+        "  -B \\",
         "  -o ControlPath=\"$CTL\" \\",
         "  -o ControlMaster=no \\",
         "  -o BatchMode=yes \\",
         "  -o PasswordAuthentication=no \\",
         "  -o KbdInteractiveAuthentication=no \\",
         "  \"$LOCAL_WSL_PATH\" \\",
-        "  \"$HOST:$REMOTE_PATH\"",
+        "  \"$HOST:$REMOTE_PATH\" \\",
+        "  < /dev/null",
     ]
     .join("\n")
 }
@@ -1568,13 +1615,15 @@ fn manual_mfa_scp_download_script() -> String {
         "test -S \"$CTL\"",
         "mkdir -p \"$(dirname \"$LOCAL_WSL_PATH\")\"",
         "scp \\",
+        "  -B \\",
         "  -o ControlPath=\"$CTL\" \\",
         "  -o ControlMaster=no \\",
         "  -o BatchMode=yes \\",
         "  -o PasswordAuthentication=no \\",
         "  -o KbdInteractiveAuthentication=no \\",
         "  \"$HOST:$REMOTE_PATH\" \\",
-        "  \"$LOCAL_WSL_PATH\"",
+        "  \"$LOCAL_WSL_PATH\" \\",
+        "  < /dev/null",
     ]
     .join("\n")
 }
@@ -2173,6 +2222,7 @@ fn manual_mfa_remote_command_script() -> String {
         "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
         "",
         "ssh \\",
+        "  -n \\",
         "  -S \"$CTL\" \\",
         "  -o ControlMaster=no \\",
         "  -o BatchMode=yes \\",
@@ -2196,6 +2246,7 @@ fn manual_mfa_session_test_script() -> String {
         "HOST=\"$1\"",
         "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
         "",
+        "printf 'SESSION_TEST_VERSION=4\\n'",
         "printf 'WSL_DISTRO=%s\\n' \"${WSL_DISTRO_NAME:-unknown}\"",
         "printf 'WSL_USER=%s\\n' \"$(whoami)\"",
         "printf 'WSL_HOME=%s\\n' \"$HOME\"",
@@ -2213,15 +2264,23 @@ fn manual_mfa_session_test_script() -> String {
         "",
         "printf 'SOCKET_EXISTS=1\\n'",
         "",
-        "if ! ssh -S \"$CTL\" -O check \"$HOST\"; then",
+        "set +e",
+        "ssh -n -S \"$CTL\" -O check \"$HOST\"",
+        "MASTER_EXIT=$?",
+        "set -e",
+        "printf 'MASTER_EXIT=%s\\n' \"$MASTER_EXIT\"",
+        "if [[ \"$MASTER_EXIT\" -ne 0 ]]; then",
         "    printf 'SESSION_ERROR=CONTROL_MASTER_CHECK_FAILED\\n'",
         "    exit 12",
         "fi",
         "",
         "printf 'MASTER_RUNNING=1\\n'",
         "",
+        "printf 'BATCH_REUSE_BEGIN=1\\n'",
+        "set +e",
         "RESULT=\"$(",
         "    ssh \\",
+        "      -n \\",
         "      -S \"$CTL\" \\",
         "      -o ControlMaster=no \\",
         "      -o BatchMode=yes \\",
@@ -2231,6 +2290,13 @@ fn manual_mfa_session_test_script() -> String {
         "      \"$HOST\" \\",
         "      'printf \"FLUORCAST_AUTH_OK\\n\"'",
         ")\"",
+        "BATCH_EXIT=$?",
+        "set -e",
+        "printf 'BATCH_EXIT=%s\\n' \"$BATCH_EXIT\"",
+        "printf 'REMOTE_RESULT=%s\\n' \"$RESULT\"",
+        "if [[ \"$BATCH_EXIT\" -ne 0 ]]; then",
+        "    exit \"$BATCH_EXIT\"",
+        "fi",
         "",
         "if [[ \"$RESULT\" != \"FLUORCAST_AUTH_OK\" ]]; then",
         "    printf 'SESSION_ERROR=AUTH_MARKER_MISSING\\n'",
@@ -2238,6 +2304,7 @@ fn manual_mfa_session_test_script() -> String {
         "    exit 13",
         "fi",
         "",
+        "printf 'AUTHENTICATION_MARKER_RECEIVED=1\\n'",
         "printf 'FLUORCAST_AUTH_OK\\n'",
     ]
     .join("\n")
@@ -2260,95 +2327,117 @@ fn classify_manual_mfa_session_probe_output(
     commands: &ManualMfaSessionCommands,
     output: &CommandOutput,
 ) -> ManualMfaSessionResult {
-    let combined = output.combined();
+    let authentication_marker_received = output_has_trimmed_line(&output.stdout, MANUAL_MFA_OK);
+    let master_running = output_has_trimmed_line(&output.stdout, "MASTER_RUNNING=1")
+        || (output.status == 0 && authentication_marker_received);
+    let sanitized_stderr = sanitize_session_stderr(&output.stderr, commands);
+    let combined = format!("{}\n{}", output.stdout, sanitized_stderr);
     let control_path =
         resolved_control_path_from_output(output).unwrap_or_else(|| commands.control_path.clone());
-    let (status, message, can_run_background_commands, control_path_exists) = if output.status == 0
-        && output.stdout.contains(MANUAL_MFA_OK)
-    {
-        (
-            ManualMfaSessionStatus::Authenticated,
-            format!("Authenticated WSL NIBI session is ready.\n{MANUAL_MFA_OK}"),
-            true,
-            true,
-        )
-    } else if output.timed_out || output.status == 124 {
-        (
-            ManualMfaSessionStatus::Timeout,
-            "The WSL NIBI session test timed out.".to_string(),
-            false,
-            output.stdout.contains("SOCKET_EXISTS=1"),
-        )
-    } else if output.status == 10 || combined.contains("SESSION_ERROR=CONTROL_PATH_MISSING") {
-        (
-            ManualMfaSessionStatus::SessionNotFound,
-            "ControlPath is missing. Start the NIBI session, then test again.".to_string(),
-            false,
-            false,
-        )
-    } else if output.status == 11 || combined.contains("SESSION_ERROR=CONTROL_PATH_NOT_SOCKET") {
-        (
-            ManualMfaSessionStatus::ControlPathNotSocket,
-            "ControlPath exists but is not a socket. Clean stale WSL session, then start again."
-                .to_string(),
-            false,
-            true,
-        )
-    } else if output.status == 12 || combined.contains("SESSION_ERROR=CONTROL_MASTER_CHECK_FAILED")
-    {
-        (
-            ManualMfaSessionStatus::StaleControlmaster,
-            "The ControlMaster socket is stale or not running. Clean stale WSL session, then start again."
-                .to_string(),
-            false,
-            true,
-        )
-    } else if output.status == 13 || combined.contains("SESSION_ERROR=AUTH_MARKER_MISSING") {
-        (
-            ManualMfaSessionStatus::AuthMarkerMissing,
-            "Authenticated session reuse did not return FLUORCAST_AUTH_OK.".to_string(),
-            false,
-            output.stdout.contains("SOCKET_EXISTS=1"),
-        )
-    } else if is_interactive_login_required_output(&combined) {
-        (
-            ManualMfaSessionStatus::SessionNotReused,
-            "BatchMode reuse failed and NIBI attempted interactive authentication.".to_string(),
-            false,
-            output.stdout.contains("SOCKET_EXISTS=1"),
-        )
-    } else if output.status == 126 || output.status == 127 {
-        (
-            ManualMfaSessionStatus::BashTransportFailed,
-            "WSL bash transport failed before the session test could complete.".to_string(),
-            false,
-            output.stdout.contains("SOCKET_EXISTS=1"),
-        )
-    } else {
-        (
-            ManualMfaSessionStatus::BatchModeReuseFailed,
-            "BatchMode session reuse failed; no fresh password or Duo prompt was attempted."
-                .to_string(),
-            false,
-            output.stdout.contains("SOCKET_EXISTS=1"),
-        )
-    };
+    let (status, message, can_run_background_commands, control_path_exists, failure_code) =
+        if output.status == 0 && authentication_marker_received && master_running {
+            (
+                ManualMfaSessionStatus::Authenticated,
+                format!("Authenticated WSL NIBI session is ready.\n{MANUAL_MFA_OK}"),
+                true,
+                true,
+                "none",
+            )
+        } else if output.timed_out || output.status == 124 {
+            (
+                ManualMfaSessionStatus::Timeout,
+                "The authenticated-session test timed out.".to_string(),
+                false,
+                session_socket_exists(&output.stdout),
+                "timeout",
+            )
+        } else if output.status == 10 || combined.contains("SESSION_ERROR=CONTROL_PATH_MISSING") {
+            (
+                ManualMfaSessionStatus::SessionNotFound,
+                "No FluorCast WSL session socket was found.".to_string(),
+                false,
+                false,
+                "missing_control_path",
+            )
+        } else if output.status == 11 || combined.contains("SESSION_ERROR=CONTROL_PATH_NOT_SOCKET")
+        {
+            (
+                ManualMfaSessionStatus::ControlPathNotSocket,
+                "The FluorCast ControlPath exists but is not a Unix socket.".to_string(),
+                false,
+                true,
+                "control_path_not_socket",
+            )
+        } else if output.status == 12
+            || combined.contains("SESSION_ERROR=CONTROL_MASTER_CHECK_FAILED")
+        {
+            (
+                ManualMfaSessionStatus::StaleControlmaster,
+                "The FluorCast SSH ControlMaster is no longer running.".to_string(),
+                false,
+                true,
+                "control_master_check_failed",
+            )
+        } else if output.status == 13 || combined.contains("SESSION_ERROR=AUTH_MARKER_MISSING") {
+            (
+                ManualMfaSessionStatus::AuthMarkerMissing,
+                "The SSH master was found, but the authentication marker was not returned."
+                    .to_string(),
+                false,
+                session_socket_exists(&output.stdout),
+                "auth_marker_missing",
+            )
+        } else if is_interactive_login_required_output(&combined) {
+            (
+                ManualMfaSessionStatus::SessionNotReused,
+                "BatchMode reuse failed and NIBI attempted interactive authentication.".to_string(),
+                false,
+                session_socket_exists(&output.stdout),
+                "interactive_authentication_requested",
+            )
+        } else if output.status == 126 || output.status == 127 {
+            (
+                ManualMfaSessionStatus::BashTransportFailed,
+                "FluorCast could not execute the WSL session test.".to_string(),
+                false,
+                session_socket_exists(&output.stdout),
+                "wsl_runner_failed",
+            )
+        } else {
+            (
+                ManualMfaSessionStatus::BatchModeReuseFailed,
+                "BatchMode session reuse failed; no fresh password or Duo prompt was attempted."
+                    .to_string(),
+                false,
+                session_socket_exists(&output.stdout),
+                "batch_mode_reuse_failed",
+            )
+        };
+    let diagnostics = manual_mfa_session_diagnostics(
+        commands,
+        output,
+        status,
+        failure_code,
+        &control_path,
+        &sanitized_stderr,
+    );
 
     ManualMfaSessionResult {
         status,
         message,
+        diagnostics,
         control_path,
         control_path_exists,
         redacted_command_preview: commands.redacted_test_command_preview.clone(),
         can_run_background_commands,
         last_master_check_result: combined.clone(),
-        last_auth_ok_result: if output.stdout.contains(MANUAL_MFA_OK) {
+        last_auth_ok_result: if authentication_marker_received {
             MANUAL_MFA_OK.to_string()
         } else {
             combined.clone()
         },
         last_session_test_stdout: output.stdout.clone(),
-        last_session_test_stderr: output.stderr.clone(),
+        last_session_test_stderr: sanitized_stderr,
         last_session_test_exit_code: Some(output.status),
         parsed_session_status: status,
         selected_backend: "wsl",
@@ -2366,9 +2455,17 @@ fn manual_mfa_transport_error_result(
     } else {
         ManualMfaSessionStatus::BashTransportFailed
     };
+    let sanitized_stderr = sanitize_session_stderr(&message, commands);
     ManualMfaSessionResult {
         status,
-        message,
+        message: "FluorCast could not execute the WSL session test.".to_string(),
+        diagnostics: ManualMfaSessionDiagnostics {
+            failure_code: "wsl_runner_failed".to_string(),
+            wsl_distro: commands.wsl_distro.clone(),
+            resolved_control_path: commands.control_path.clone(),
+            stderr: sanitized_stderr.clone(),
+            ..ManualMfaSessionDiagnostics::default()
+        },
         control_path: commands.control_path.clone(),
         control_path_exists: false,
         redacted_command_preview: commands.redacted_test_command_preview.clone(),
@@ -2376,7 +2473,7 @@ fn manual_mfa_transport_error_result(
         last_master_check_result: String::new(),
         last_auth_ok_result: String::new(),
         last_session_test_stdout: String::new(),
-        last_session_test_stderr: String::new(),
+        last_session_test_stderr: sanitized_stderr,
         last_session_test_exit_code: None,
         parsed_session_status: status,
         selected_backend: "wsl",
@@ -2385,11 +2482,64 @@ fn manual_mfa_transport_error_result(
     }
 }
 
+fn manual_mfa_session_diagnostics(
+    commands: &ManualMfaSessionCommands,
+    output: &CommandOutput,
+    status: ManualMfaSessionStatus,
+    failure_code: &str,
+    control_path: &str,
+    sanitized_stderr: &str,
+) -> ManualMfaSessionDiagnostics {
+    let authentication_marker_received = output_has_trimmed_line(&output.stdout, MANUAL_MFA_OK);
+    let authenticated = matches!(status, ManualMfaSessionStatus::Authenticated);
+    ManualMfaSessionDiagnostics {
+        success: authenticated,
+        authenticated,
+        failure_code: failure_code.to_string(),
+        exit_code: Some(output.status),
+        wsl_distro: session_marker_value(&output.stdout, "WSL_DISTRO")
+            .unwrap_or_else(|| commands.wsl_distro.clone()),
+        wsl_user: session_marker_value(&output.stdout, "WSL_USER").unwrap_or_default(),
+        wsl_home: session_marker_value(&output.stdout, "WSL_HOME").unwrap_or_default(),
+        resolved_control_path: control_path.to_string(),
+        socket_exists: session_socket_exists(&output.stdout),
+        master_running: output_has_trimmed_line(&output.stdout, "MASTER_RUNNING=1")
+            || (output.status == 0 && authentication_marker_received),
+        authentication_marker_received,
+        stdout: output.stdout.clone(),
+        stderr: sanitized_stderr.to_string(),
+    }
+}
+
+fn output_has_trimmed_line(output: &str, expected: &str) -> bool {
+    output.lines().map(str::trim).any(|line| line == expected)
+}
+
+fn session_socket_exists(stdout: &str) -> bool {
+    output_has_trimmed_line(stdout, "SOCKET_EXISTS=1")
+        || output_has_trimmed_line(stdout, "SOCKET_EXISTS")
+}
+
+fn session_marker_value(stdout: &str, marker: &str) -> Option<String> {
+    let prefix = format!("{marker}=");
+    stdout.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(&prefix)
+            .map(|value| value.to_string())
+    })
+}
+
+fn sanitize_session_stderr(stderr: &str, commands: &ManualMfaSessionCommands) -> String {
+    let key = commands.wsl_key_path.trim();
+    if key.is_empty() {
+        stderr.to_string()
+    } else {
+        stderr.replace(key, "<wsl_private_key_path>")
+    }
+}
+
 fn resolved_control_path_from_output(output: &CommandOutput) -> Option<String> {
-    output
-        .stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("CONTROL_PATH=").map(str::to_string))
+    session_marker_value(&output.stdout, "CONTROL_PATH")
 }
 
 fn normalize_bash_source(script: &str) -> String {
@@ -3048,6 +3198,7 @@ fn classify_manual_mfa_session_output(
             message:
                 "Manual NIBI login is authenticated and background commands can reuse the session."
                     .to_string(),
+            diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
             control_path_exists,
             redacted_command_preview: commands.redacted_test_command_preview.clone(),
@@ -3066,6 +3217,7 @@ fn classify_manual_mfa_session_output(
         ManualMfaSessionResult {
             status: ManualMfaSessionStatus::SessionNotReused,
             message: "The app session was not reused. NIBI is asking for login again.".to_string(),
+            diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
             control_path_exists,
             redacted_command_preview: commands.redacted_test_command_preview.clone(),
@@ -3084,6 +3236,7 @@ fn classify_manual_mfa_session_output(
         ManualMfaSessionResult {
             status: ManualMfaSessionStatus::ControlmasterUnsupported,
             message: "Your SSH client may not support reusable ControlMaster sessions on Windows. Use WSL/manual fallback or robot automation.".to_string(),
+            diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
             control_path_exists,
             redacted_command_preview: commands.redacted_test_command_preview.clone(),
@@ -3102,6 +3255,7 @@ fn classify_manual_mfa_session_output(
         ManualMfaSessionResult {
             status: ManualMfaSessionStatus::PermissionDenied,
             message: "Authentication failed. Check username, SSH key, and MFA setup.".to_string(),
+            diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
             control_path_exists,
             redacted_command_preview: commands.redacted_test_command_preview.clone(),
@@ -3120,6 +3274,7 @@ fn classify_manual_mfa_session_output(
         ManualMfaSessionResult {
             status: ManualMfaSessionStatus::SessionNotFound,
             message: "FluorCast did not find the reusable SSH session. Start login from FluorCast and keep the session alive.".to_string(),
+            diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
             control_path_exists,
             redacted_command_preview: commands.redacted_test_command_preview.clone(),
@@ -3138,6 +3293,7 @@ fn classify_manual_mfa_session_output(
         ManualMfaSessionResult {
             status: ManualMfaSessionStatus::Failed,
             message: "Manual login has not been completed yet.".to_string(),
+            diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
             control_path_exists,
             redacted_command_preview: commands.redacted_test_command_preview.clone(),
@@ -3171,6 +3327,7 @@ fn classify_manual_mfa_session_error(
         ManualMfaSessionResult {
             status: ManualMfaSessionStatus::SessionNotReused,
             message: "The app session was not reused. NIBI is asking for login again.".to_string(),
+            diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
             control_path_exists,
             redacted_command_preview: commands.redacted_test_command_preview.clone(),
@@ -3196,6 +3353,7 @@ fn classify_manual_mfa_session_error(
         ManualMfaSessionResult {
             status,
             message: friendly_message,
+            diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
             control_path_exists,
             redacted_command_preview: commands.redacted_test_command_preview.clone(),
@@ -3784,6 +3942,37 @@ mod tests {
         }
     }
 
+    fn session_probe(status: i32, stdout: &str, stderr: &str) -> CommandOutput {
+        CommandOutput {
+            status,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            timed_out: status == 124,
+        }
+    }
+
+    fn manual_mfa_invocation_for(command_spec: RemoteCommandSpecInput) -> WslBashScriptInvocation {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let remote_command = structured_remote_command_to_shell(&command_spec).unwrap();
+        build_manual_mfa_remote_command_invocation(&commands, &remote_command)
+    }
+
+    fn assert_manual_remote_invocation_uses_ssh_n(
+        invocation: &WslBashScriptInvocation,
+        remote_command: &str,
+    ) {
+        assert_eq!(invocation.program, "wsl.exe");
+        assert_eq!(invocation.args[6], "alice@nibi.alliancecan.ca");
+        assert_eq!(invocation.args[7], remote_command);
+        assert!(invocation.stdin.contains("ssh \\\n  -n \\\n"));
+        assert!(invocation.stdin.contains("-o ControlMaster=no"));
+        assert!(invocation.stdin.contains("-o BatchMode=yes"));
+        assert!(!invocation.stdin.contains("-i \"$KEY\""));
+        assert!(!invocation
+            .stdin
+            .contains("/home/alice/.ssh/fluorcast_nibi_ed25519"));
+    }
+
     #[test]
     fn persistent_shell_wrapper_uses_unique_markers() {
         let wrapped = build_persistent_shell_command("hostname", "abc123");
@@ -4024,16 +4213,28 @@ mod tests {
         );
         assert!(commands
             .clean_script_content
-            .contains("ssh -S \"$CTL\" -O exit \"$HOST\" >/dev/null 2>&1 || true"));
+            .contains("ssh -n -S \"$CTL\" -O exit \"$HOST\" >/dev/null 2>&1 || true"));
         assert_eq!(
             commands.check_command,
             "wsl.exe -d 'Ubuntu' -- bash -s -- 'alice@nibi.alliancecan.ca'"
         );
         assert!(commands
             .check_script_content
-            .contains("ssh -S \"$CTL\" -O check \"$HOST\""));
+            .contains("ssh -n -S \"$CTL\" -O check \"$HOST\""));
         assert!(commands.check_script_content.contains("HOST=\"$1\""));
         assert!(commands.check_script_content.contains("CONTROL_PATH=%s"));
+        assert!(commands.test_command.contains("SESSION_TEST_VERSION=4"));
+        assert!(commands.test_command.contains("MASTER_EXIT=%s"));
+        assert!(commands.test_command.contains("BATCH_REUSE_BEGIN=1"));
+        assert!(commands.test_command.contains("BATCH_EXIT=%s"));
+        assert!(commands.test_command.contains("REMOTE_RESULT=%s"));
+        assert!(commands
+            .test_command
+            .contains("AUTHENTICATION_MARKER_RECEIVED=1"));
+        assert!(commands
+            .test_command
+            .contains("ssh -n -S \"$CTL\" -O check \"$HOST\""));
+        assert!(commands.test_command.contains("      -n \\"));
         assert!(commands.test_command.contains("-o ControlMaster=no"));
         assert!(commands.test_command.contains("-o BatchMode=yes"));
         assert!(commands
@@ -4053,7 +4254,7 @@ mod tests {
         );
         assert!(commands
             .end_script_content
-            .contains("ssh -S \"$CTL\" -O exit \"$HOST\""));
+            .contains("ssh -n -S \"$CTL\" -O exit \"$HOST\""));
         assert!(commands
             .clean_script_content
             .contains("CLEAN_RESULT=HEALTHY_SESSION_CLOSED"));
@@ -4064,7 +4265,7 @@ mod tests {
         assert!(!commands.clean_script_content.contains("cm-alice-nibi.sock"));
         assert!(commands
             .background_command_template
-            .contains("ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no"));
+            .contains("ssh -n -S \"$CTL\" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no"));
     }
 
     #[test]
@@ -4119,8 +4320,11 @@ mod tests {
             assert!(script.contains("-o ControlPath=\"$CTL\""));
             assert!(script.contains("-o ControlMaster=no"));
             assert!(script.contains("-o BatchMode=yes"));
+            assert!(script.contains("scp \\\n  -B \\"));
+            assert!(script.contains("< /dev/null"));
             assert!(script.contains("-o PasswordAuthentication=no"));
             assert!(script.contains("-o KbdInteractiveAuthentication=no"));
+            assert!(script.contains("\"$HOST:$REMOTE_PATH\""));
             assert!(!script.contains("-i \"$KEY\""));
             assert!(!script.contains("ssh.exe"));
             assert!(!script.contains("scp.exe"));
@@ -4157,6 +4361,38 @@ mod tests {
             .args
             .iter()
             .any(|arg| arg.contains("printf 'one'")));
+    }
+
+    #[test]
+    fn manual_mfa_session_test_invocation_passes_host_after_bash_sentinel() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let invocation = build_wsl_bash_script_invocation(
+            &commands.wsl_distro,
+            &commands.check_script_content,
+            &[commands.host.clone()],
+        );
+
+        assert_eq!(invocation.program, "wsl.exe");
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-d",
+                "Ubuntu",
+                "--",
+                "bash",
+                "-s",
+                "--",
+                "alice@nibi.alliancecan.ca",
+            ]
+        );
+        assert!(!invocation
+            .args
+            .contains(&"/home/alice/.ssh/fluorcast_nibi_ed25519".to_string()));
+        assert!(!invocation.stdin.contains("KEY="));
+        assert!(!invocation
+            .stdin
+            .contains("/home/alice/.ssh/fluorcast_nibi_ed25519"));
+        assert!(!invocation.stdin.contains("-i \"$KEY\""));
     }
 
     #[cfg(windows)]
@@ -4219,96 +4455,303 @@ mod tests {
             .contains("CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\""));
         assert!(invocation.stdin.contains("-o ControlMaster=no"));
         assert!(invocation.stdin.contains("-o BatchMode=yes"));
+        assert!(invocation.stdin.contains("ssh \\\n  -n \\\n"));
         assert!(!invocation.stdin.contains("ssh.exe"));
         assert!(!invocation.stdin.contains("-i \"$KEY\""));
+    }
+
+    #[test]
+    fn stdin_fed_remote_environment_and_file_probes_use_ssh_n() {
+        for (command_spec, remote_command) in [
+            (
+                RemoteCommandSpecInput {
+                    label: "sbatch is available".to_string(),
+                    executable: "command".to_string(),
+                    args: vec!["-v".to_string(), "sbatch".to_string()],
+                    redacted_preview: None,
+                },
+                "command -v sbatch",
+            ),
+            (
+                RemoteCommandSpecInput {
+                    label: "Project path exists".to_string(),
+                    executable: "test".to_string(),
+                    args: vec![
+                        "-d".to_string(),
+                        "/home/alice/scratch/FluorCast Project".to_string(),
+                    ],
+                    redacted_preview: None,
+                },
+                "test -d '/home/alice/scratch/FluorCast Project'",
+            ),
+            (
+                RemoteCommandSpecInput {
+                    label: "Jobs path exists or create".to_string(),
+                    executable: "mkdir".to_string(),
+                    args: vec![
+                        "-p".to_string(),
+                        "/home/alice/scratch/fluorcast jobs/job 1".to_string(),
+                    ],
+                    redacted_preview: None,
+                },
+                "mkdir -p '/home/alice/scratch/fluorcast jobs/job 1'",
+            ),
+            (
+                RemoteCommandSpecInput {
+                    label: "Read remote stdout log".to_string(),
+                    executable: "cat".to_string(),
+                    args: vec!["/home/alice/scratch/fluorcast jobs/job 1/stdout.log".to_string()],
+                    redacted_preview: None,
+                },
+                "cat '/home/alice/scratch/fluorcast jobs/job 1/stdout.log'",
+            ),
+            (
+                RemoteCommandSpecInput {
+                    label: "Validate output JSON".to_string(),
+                    executable: "python3".to_string(),
+                    args: vec![
+                        "-m".to_string(),
+                        "json.tool".to_string(),
+                        "/home/alice/scratch/fluorcast jobs/job 1/output.json".to_string(),
+                    ],
+                    redacted_preview: None,
+                },
+                "python3 -m json.tool '/home/alice/scratch/fluorcast jobs/job 1/output.json' >/dev/null",
+            ),
+        ] {
+            let invocation = manual_mfa_invocation_for(command_spec);
+            assert_manual_remote_invocation_uses_ssh_n(&invocation, remote_command);
+        }
+    }
+
+    #[test]
+    fn stdin_fed_slurm_submission_polling_and_cancellation_use_ssh_n() {
+        for (command_spec, remote_command) in [
+            (
+                RemoteCommandSpecInput {
+                    label: "Submit prediction Slurm job".to_string(),
+                    executable: "sbatch".to_string(),
+                    args: vec![
+                        "--parsable".to_string(),
+                        "--chdir".to_string(),
+                        "/home/alice/scratch/FluorCast Project".to_string(),
+                        "--output".to_string(),
+                        "/home/alice/scratch/fluorcast jobs/job 1/stdout.log".to_string(),
+                        "--error".to_string(),
+                        "/home/alice/scratch/fluorcast jobs/job 1/stderr.log".to_string(),
+                        "/home/alice/scratch/FluorCast/slurm/run_prediction_job.sbatch"
+                            .to_string(),
+                        "/home/alice/scratch/fluorcast jobs/job 1/input.json".to_string(),
+                        "/home/alice/scratch/fluorcast jobs/job 1/output.json".to_string(),
+                    ],
+                    redacted_preview: None,
+                },
+                "sbatch --parsable --chdir='/home/alice/scratch/FluorCast Project' --output='/home/alice/scratch/fluorcast jobs/job 1/stdout.log' --error='/home/alice/scratch/fluorcast jobs/job 1/stderr.log' '/home/alice/scratch/FluorCast/slurm/run_prediction_job.sbatch' '/home/alice/scratch/fluorcast jobs/job 1/input.json' '/home/alice/scratch/fluorcast jobs/job 1/output.json'",
+            ),
+            (
+                RemoteCommandSpecInput {
+                    label: "Poll squeue".to_string(),
+                    executable: "squeue".to_string(),
+                    args: vec![
+                        "-j".to_string(),
+                        "12345".to_string(),
+                        "--noheader".to_string(),
+                        "--format=%i|%T|%M|%R".to_string(),
+                    ],
+                    redacted_preview: None,
+                },
+                "squeue -j '12345' --noheader --format=\"%i|%T|%M|%R\"",
+            ),
+            (
+                RemoteCommandSpecInput {
+                    label: "Poll sacct".to_string(),
+                    executable: "sacct".to_string(),
+                    args: vec![
+                        "-j".to_string(),
+                        "12345".to_string(),
+                        "--format=JobID,State,ExitCode".to_string(),
+                        "--parsable2".to_string(),
+                        "--noheader".to_string(),
+                    ],
+                    redacted_preview: None,
+                },
+                "sacct -j '12345' --format=JobID,State,ExitCode --parsable2 --noheader",
+            ),
+            (
+                RemoteCommandSpecInput {
+                    label: "Cancel Slurm job".to_string(),
+                    executable: "scancel".to_string(),
+                    args: vec!["12345".to_string()],
+                    redacted_preview: None,
+                },
+                "scancel '12345'",
+            ),
+        ] {
+            let invocation = manual_mfa_invocation_for(command_spec);
+            assert_manual_remote_invocation_uses_ssh_n(&invocation, remote_command);
+        }
+    }
+
+    #[test]
+    fn interactive_start_nibi_script_keeps_ssh_stdin_available() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+
+        assert!(commands.login_command.contains("ssh -fMN"));
+        assert!(commands.login_command.contains("-i \"$KEY\""));
+        assert!(commands
+            .login_command
+            .contains("read -r -p \"Press Enter to close this window...\""));
+        assert!(!commands.login_command.contains("ssh -n"));
+        assert!(!commands.login_command.contains("< /dev/null"));
     }
 
     #[test]
     fn manual_mfa_session_probe_resolves_control_path_inside_wsl() {
         let script = manual_mfa_session_test_script();
 
+        assert!(script.contains("HOST=\"$1\""));
         assert!(script.contains("CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\""));
         assert!(script.contains("printf 'WSL_USER=%s\\n' \"$(whoami)\""));
         assert!(script.contains("printf 'WSL_HOME=%s\\n' \"$HOME\""));
         assert!(script.contains("printf 'CONTROL_PATH=%s\\n' \"$CTL\""));
         assert!(!script.contains("KEY="));
         assert!(!script.contains("-i \"$KEY\""));
+        assert!(!script.contains("ControlMaster=yes"));
+        assert!(!script.contains("ssh -fMN"));
+        assert!(!script.contains("bash -lc"));
+        assert!(!script.contains("ssh.exe"));
+        assert!(script.contains("SESSION_TEST_VERSION=4"));
+        assert!(script.contains("ssh -n -S \"$CTL\" -O check \"$HOST\""));
+        assert!(script.contains("BATCH_REUSE_BEGIN=1"));
+        assert!(script.contains("      -n \\"));
+        assert!(script.contains("BATCH_EXIT=%s"));
+        assert!(script.contains("REMOTE_RESULT=%s"));
+        assert!(script.contains("AUTHENTICATION_MARKER_RECEIVED=1"));
         assert!(script.contains("-o ControlMaster=no"));
         assert!(script.contains("-o BatchMode=yes"));
+        assert!(script.contains("-o ConnectTimeout=10"));
         assert!(script.contains("-o PasswordAuthentication=no"));
         assert!(script.contains("-o KbdInteractiveAuthentication=no"));
+    }
+
+    #[test]
+    fn session_test_script_continues_after_nested_ssh_commands() {
+        let script = manual_mfa_session_test_script();
+
+        assert!(
+            script
+                .find("ssh -n -S \"$CTL\" -O check \"$HOST\"")
+                .unwrap()
+                < script.find("printf 'MASTER_EXIT=%s\\n'").unwrap()
+        );
+        assert!(
+            script.find("printf 'BATCH_REUSE_BEGIN=1\\n'").unwrap()
+                < script.find("printf 'BATCH_EXIT=%s\\n'").unwrap()
+        );
+        assert!(
+            script.find("printf 'BATCH_EXIT=%s\\n'").unwrap()
+                < script.find("printf 'FLUORCAST_AUTH_OK\\n'").unwrap()
+        );
     }
 
     #[test]
     fn manual_mfa_probe_exit_codes_map_to_specific_statuses() {
         let commands = build_manual_mfa_session_commands(&settings()).unwrap();
 
-        let missing = CommandOutput {
-            status: 10,
-            stdout: "CONTROL_PATH=/home/alice/.fluorcast/ssh/cm-nibi.sock\nSESSION_ERROR=CONTROL_PATH_MISSING".to_string(),
-            stderr: String::new(),
-            timed_out: false,
-        };
+        let missing = classify_manual_mfa_session_probe_output(
+            &commands,
+            &session_probe(
+                10,
+                "CONTROL_PATH=/home/alice/.fluorcast/ssh/cm-nibi.sock\nSESSION_ERROR=CONTROL_PATH_MISSING",
+                "",
+            ),
+        );
         assert!(matches!(
-            classify_manual_mfa_session_probe_output(&commands, &missing).status,
+            missing.status,
             ManualMfaSessionStatus::SessionNotFound
         ));
+        assert_eq!(
+            missing.message,
+            "No FluorCast WSL session socket was found."
+        );
+        assert_eq!(missing.diagnostics.failure_code, "missing_control_path");
+        assert_eq!(missing.diagnostics.exit_code, Some(10));
 
-        let not_socket = CommandOutput {
-            status: 11,
-            stdout: "SOCKET_EXISTS=0\nSESSION_ERROR=CONTROL_PATH_NOT_SOCKET".to_string(),
-            stderr: String::new(),
-            timed_out: false,
-        };
+        let not_socket = classify_manual_mfa_session_probe_output(
+            &commands,
+            &session_probe(11, "SESSION_ERROR=CONTROL_PATH_NOT_SOCKET", ""),
+        );
         assert!(matches!(
-            classify_manual_mfa_session_probe_output(&commands, &not_socket).status,
+            not_socket.status,
             ManualMfaSessionStatus::ControlPathNotSocket
         ));
+        assert_eq!(
+            not_socket.message,
+            "The FluorCast ControlPath exists but is not a Unix socket."
+        );
+        assert_eq!(
+            not_socket.diagnostics.failure_code,
+            "control_path_not_socket"
+        );
+        assert_eq!(not_socket.diagnostics.exit_code, Some(11));
 
-        let stale = CommandOutput {
-            status: 12,
-            stdout: "SOCKET_EXISTS=1\nSESSION_ERROR=CONTROL_MASTER_CHECK_FAILED".to_string(),
-            stderr: String::new(),
-            timed_out: false,
-        };
+        let stale = classify_manual_mfa_session_probe_output(
+            &commands,
+            &session_probe(
+                12,
+                "SOCKET_EXISTS=1\nSESSION_ERROR=CONTROL_MASTER_CHECK_FAILED",
+                "",
+            ),
+        );
         assert!(matches!(
-            classify_manual_mfa_session_probe_output(&commands, &stale).status,
+            stale.status,
             ManualMfaSessionStatus::StaleControlmaster
         ));
+        assert_eq!(
+            stale.message,
+            "The FluorCast SSH ControlMaster is no longer running."
+        );
+        assert_eq!(
+            stale.diagnostics.failure_code,
+            "control_master_check_failed"
+        );
+        assert_eq!(stale.diagnostics.exit_code, Some(12));
 
-        let marker_missing = CommandOutput {
-            status: 13,
-            stdout: "SOCKET_EXISTS=1\nMASTER_RUNNING=1\nSESSION_ERROR=AUTH_MARKER_MISSING"
-                .to_string(),
-            stderr: String::new(),
-            timed_out: false,
-        };
+        let marker_missing = classify_manual_mfa_session_probe_output(
+            &commands,
+            &session_probe(
+                13,
+                "SOCKET_EXISTS=1\nMASTER_RUNNING=1\nSESSION_ERROR=AUTH_MARKER_MISSING",
+                "",
+            ),
+        );
         assert!(matches!(
-            classify_manual_mfa_session_probe_output(&commands, &marker_missing).status,
+            marker_missing.status,
             ManualMfaSessionStatus::AuthMarkerMissing
         ));
+        assert_eq!(
+            marker_missing.message,
+            "The SSH master was found, but the authentication marker was not returned."
+        );
+        assert_eq!(
+            marker_missing.diagnostics.failure_code,
+            "auth_marker_missing"
+        );
+        assert_eq!(marker_missing.diagnostics.exit_code, Some(13));
 
-        let timeout = CommandOutput {
-            status: 124,
-            stdout: "SOCKET_EXISTS=1".to_string(),
-            stderr: String::new(),
-            timed_out: true,
-        };
-        assert!(matches!(
-            classify_manual_mfa_session_probe_output(&commands, &timeout).status,
-            ManualMfaSessionStatus::Timeout
-        ));
+        let timeout = classify_manual_mfa_session_probe_output(
+            &commands,
+            &session_probe(124, "SOCKET_EXISTS=1", ""),
+        );
+        assert!(matches!(timeout.status, ManualMfaSessionStatus::Timeout));
+        assert_eq!(timeout.message, "The authenticated-session test timed out.");
+        assert_eq!(timeout.diagnostics.failure_code, "timeout");
     }
 
     #[test]
-    fn manual_mfa_probe_success_requires_auth_marker() {
+    fn manual_mfa_probe_success_accepts_exact_auth_marker_line() {
         let commands = build_manual_mfa_session_commands(&settings()).unwrap();
-        let output = CommandOutput {
-            status: 0,
-            stdout: "WSL_DISTRO=Ubuntu\nWSL_USER=alice\nWSL_HOME=/home/alice\nCONTROL_PATH=/home/alice/.fluorcast/ssh/cm-nibi.sock\nSOCKET_EXISTS=1\nMASTER_RUNNING=1\nFLUORCAST_AUTH_OK".to_string(),
-            stderr: String::new(),
-            timed_out: false,
-        };
+        let output = session_probe(0, "FLUORCAST_AUTH_OK", "");
         let result = classify_manual_mfa_session_probe_output(&commands, &output);
 
         assert!(matches!(
@@ -4319,11 +4762,88 @@ mod tests {
             result.message,
             "Authenticated WSL NIBI session is ready.\nFLUORCAST_AUTH_OK"
         );
+        assert!(result.diagnostics.success);
+        assert!(result.diagnostics.authenticated);
+        assert_eq!(result.diagnostics.failure_code, "none");
+        assert_eq!(result.diagnostics.exit_code, Some(0));
+        assert!(result.diagnostics.authentication_marker_received);
+        assert!(result.diagnostics.master_running);
+        assert!(result.can_run_background_commands);
+    }
+
+    #[test]
+    fn manual_mfa_probe_success_accepts_diagnostics_before_auth_marker_line() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let output = session_probe(
+            0,
+            "SESSION_TEST_VERSION=4\nWSL_DISTRO=Ubuntu\nWSL_USER=alice\nWSL_HOME=/home/alice\nCONTROL_PATH=/home/alice/.fluorcast/ssh/cm-nibi.sock\nSOCKET_EXISTS=1\nMASTER_EXIT=0\nMASTER_RUNNING=1\nBATCH_REUSE_BEGIN=1\nBATCH_EXIT=0\nREMOTE_RESULT=FLUORCAST_AUTH_OK\nAUTHENTICATION_MARKER_RECEIVED=1\nFLUORCAST_AUTH_OK",
+            "",
+        );
+        let result = classify_manual_mfa_session_probe_output(&commands, &output);
+
+        assert!(matches!(
+            result.status,
+            ManualMfaSessionStatus::Authenticated
+        ));
         assert_eq!(
             result.control_path,
             "/home/alice/.fluorcast/ssh/cm-nibi.sock"
         );
+        assert_eq!(result.diagnostics.wsl_distro, "Ubuntu");
+        assert_eq!(result.diagnostics.wsl_user, "alice");
+        assert_eq!(result.diagnostics.wsl_home, "/home/alice");
+        assert_eq!(
+            result.diagnostics.resolved_control_path,
+            "/home/alice/.fluorcast/ssh/cm-nibi.sock"
+        );
+        assert!(result.diagnostics.socket_exists);
+        assert!(result.diagnostics.master_running);
+        assert!(result.diagnostics.authentication_marker_received);
+        assert_eq!(result.diagnostics.stdout, output.stdout);
+        assert_eq!(result.diagnostics.stderr, "");
         assert!(result.can_run_background_commands);
+    }
+
+    #[test]
+    fn manual_mfa_probe_rejects_auth_marker_substrings_or_stderr_only() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+
+        for stdout in ["NOT_FLUORCAST_AUTH_OK", "FLUORCAST_AUTH_OK_FAILED"] {
+            let result =
+                classify_manual_mfa_session_probe_output(&commands, &session_probe(0, stdout, ""));
+            assert!(!matches!(
+                result.status,
+                ManualMfaSessionStatus::Authenticated
+            ));
+            assert!(!result.can_run_background_commands);
+            assert!(!result.diagnostics.authentication_marker_received);
+        }
+
+        let stderr_only = classify_manual_mfa_session_probe_output(
+            &commands,
+            &session_probe(0, "MASTER_RUNNING=1", "FLUORCAST_AUTH_OK"),
+        );
+        assert!(!matches!(
+            stderr_only.status,
+            ManualMfaSessionStatus::Authenticated
+        ));
+        assert!(!stderr_only.can_run_background_commands);
+        assert!(!stderr_only.diagnostics.authentication_marker_received);
+
+        let nonzero_with_marker = classify_manual_mfa_session_probe_output(
+            &commands,
+            &session_probe(255, "MASTER_RUNNING=1\nFLUORCAST_AUTH_OK", ""),
+        );
+        assert!(!matches!(
+            nonzero_with_marker.status,
+            ManualMfaSessionStatus::Authenticated
+        ));
+        assert!(!nonzero_with_marker.can_run_background_commands);
+        assert!(
+            nonzero_with_marker
+                .diagnostics
+                .authentication_marker_received
+        );
     }
 
     #[test]
