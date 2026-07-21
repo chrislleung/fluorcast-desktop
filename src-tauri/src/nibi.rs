@@ -9,13 +9,16 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SSH_TIMEOUT: Duration = Duration::from_secs(20);
+const WSL_SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const MANUAL_MFA_OK: &str = "FLUORCAST_AUTH_OK";
+const CANONICAL_WSL_CONTROL_SOCKET_PATH: &str = "$HOME/.fluorcast/ssh/cm-nibi.sock";
 const ROBOT_AUTOMATION_OK: &str = "FLUORCAST_ROBOT_OK";
 const ROBOT_NOT_READY_MESSAGE: &str = "Robot automation is not ready. Manual login may work, but automatic FluorCast job submission requires robot-node access with a restricted public key.";
 const PERSISTENT_SHELL_TIMEOUT: Duration = Duration::from_secs(60);
 const PERSISTENT_SHELL_LOG_LIMIT: usize = 128_000;
 
 static PERSISTENT_SHELL: OnceLock<Mutex<Option<PersistentShell>>> = OnceLock::new();
+static MANUAL_MFA_TERMINAL_LAUNCH: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 pub struct NibiSettings {
@@ -266,6 +269,13 @@ pub enum ManualMfaSessionStatus {
     AuthenticationRequired,
     SessionNotFound,
     SessionNotReused,
+    ControlPathNotSocket,
+    StaleControlmaster,
+    BatchModeReuseFailed,
+    AuthMarkerMissing,
+    Timeout,
+    WslUnavailable,
+    BashTransportFailed,
     ControlmasterUnsupported,
     PermissionDenied,
     Disconnected,
@@ -490,26 +500,15 @@ pub fn run_nibi_remote_command(
 ) -> Result<RemoteCommandResult, String> {
     validate_remote_command_spec(&command_spec)?;
     let remote_command = structured_remote_command_to_shell(&command_spec)?;
-    if mode == "interactive_mfa" && settings.uses_terminal_action() {
-        return run_remote_command_via_terminal(
+    if mode == "interactive_mfa" {
+        return run_manual_mfa_remote_command_result(
             &settings,
             &remote_command,
             command_spec.label,
             command_spec.redacted_preview,
         );
     }
-    if mode == "interactive_mfa" && settings.uses_persistent_shell() {
-        return run_command_in_persistent_shell(
-            &settings,
-            &remote_command,
-            command_spec.label,
-            command_spec.redacted_preview,
-            PERSISTENT_SHELL_TIMEOUT,
-        );
-    }
-    let invocation = if mode == "interactive_mfa" {
-        build_manual_mfa_remote_invocation(&settings, &remote_command)?
-    } else if mode == "robot_automation" {
+    let invocation = if mode == "robot_automation" {
         build_robot_remote_invocation(&settings, &remote_command)?
     } else {
         return Err("Unsupported NIBI connection mode.".to_string());
@@ -609,7 +608,11 @@ pub fn get_manual_mfa_session_commands(
 pub fn open_manual_mfa_login(
     settings: NibiSettings,
 ) -> Result<ManualMfaTerminalLaunchResult, String> {
-    validate_manual_login_settings(&settings)?;
+    validate_manual_login_start_settings(&settings)?;
+    let _guard = MANUAL_MFA_TERMINAL_LAUNCH
+        .get_or_init(|| Mutex::new(()))
+        .try_lock()
+        .map_err(|_| "A NIBI session launch is already in progress.".to_string())?;
     let commands = build_manual_mfa_session_commands(&settings)?;
     Ok(launch_manual_mfa_terminal(commands))
 }
@@ -620,139 +623,56 @@ pub fn clean_stale_manual_mfa_session(
 ) -> Result<ManualMfaSessionResult, String> {
     validate_manual_login_settings(&settings)?;
     let commands = build_manual_mfa_session_commands(&settings)?;
-    if let Err(message) = write_manual_mfa_scripts(&commands) {
-        return Ok(ManualMfaSessionResult {
-            status: ManualMfaSessionStatus::Failed,
-            message,
-            control_path: commands.control_path.clone(),
-            control_path_exists: false,
-            redacted_command_preview: commands.redacted_login_command_preview.clone(),
-            can_run_background_commands: false,
-            last_master_check_result: String::new(),
-            last_auth_ok_result: String::new(),
-            last_session_test_stdout: String::new(),
-            last_session_test_stderr: String::new(),
-            last_session_test_exit_code: None,
-            parsed_session_status: ManualMfaSessionStatus::Failed,
-            selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
-        });
-    }
-    match run_wsl_script(&commands.clean_stale_session_command) {
-        Ok(output) => Ok(ManualMfaSessionResult {
-            status: ManualMfaSessionStatus::Disconnected,
-            message: "Stale WSL NIBI session cleaned.".to_string(),
-            control_path: commands.control_path.clone(),
-            control_path_exists: false,
-            redacted_command_preview: redact_session_command(
-                &commands.clean_stale_session_command,
-                &commands.control_path,
-                &commands.wsl_key_path,
-            ),
-            can_run_background_commands: false,
-            last_master_check_result: output.combined(),
-            last_auth_ok_result: String::new(),
-            last_session_test_stdout: output.stdout,
-            last_session_test_stderr: output.stderr,
-            last_session_test_exit_code: Some(output.status),
-            parsed_session_status: ManualMfaSessionStatus::Disconnected,
-            selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
-        }),
-        Err(message) => Ok(ManualMfaSessionResult {
-            status: ManualMfaSessionStatus::Failed,
-            message: message.clone(),
-            control_path: commands.control_path.clone(),
-            control_path_exists: false,
-            redacted_command_preview: redact_session_command(
-                &commands.clean_stale_session_command,
-                &commands.control_path,
-                &commands.wsl_key_path,
-            ),
-            can_run_background_commands: false,
-            last_master_check_result: String::new(),
-            last_auth_ok_result: String::new(),
-            last_session_test_stdout: String::new(),
-            last_session_test_stderr: message.clone(),
-            last_session_test_exit_code: None,
-            parsed_session_status: ManualMfaSessionStatus::Failed,
-            selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
-        }),
+    let args = vec![commands.host.clone()];
+    match run_wsl_bash_script(
+        &commands.wsl_distro,
+        &commands.clean_script_content,
+        &args,
+        WSL_SCRIPT_TIMEOUT,
+    ) {
+        Ok(output) => {
+            let status = if output.status == 0 {
+                ManualMfaSessionStatus::Disconnected
+            } else if output.timed_out {
+                ManualMfaSessionStatus::Timeout
+            } else {
+                ManualMfaSessionStatus::Failed
+            };
+            Ok(ManualMfaSessionResult {
+                status,
+                message: if output.status == 0 {
+                    "Stale WSL NIBI session cleaned.".to_string()
+                } else if output.timed_out {
+                    "WSL stale-session cleanup timed out.".to_string()
+                } else {
+                    "WSL stale-session cleanup failed.".to_string()
+                },
+                control_path: resolved_control_path_from_output(&output)
+                    .unwrap_or_else(|| commands.control_path.clone()),
+                control_path_exists: false,
+                redacted_command_preview: "wsl.exe -d <distribution> -- bash -s -- <host>"
+                    .to_string(),
+                can_run_background_commands: false,
+                last_master_check_result: output.combined(),
+                last_auth_ok_result: String::new(),
+                last_session_test_stdout: output.stdout,
+                last_session_test_stderr: output.stderr,
+                last_session_test_exit_code: Some(output.status),
+                parsed_session_status: status,
+                selected_backend: "wsl",
+                wsl_available: wsl_available_for_distro(&commands.wsl_distro),
+                wsl_ssh_available: wsl_ssh_available_for_distro(&commands.wsl_distro),
+            })
+        }
+        Err(message) => Ok(manual_mfa_transport_error_result(&commands, message)),
     }
 }
 
 #[tauri::command]
 pub fn test_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSessionResult, String> {
-    if settings.uses_persistent_shell() {
-        validate_manual_login_settings(&settings)?;
-        let status = persistent_shell_test_readiness(settings)?;
-        let authenticated = status.status == PersistentShellStatus::Active;
-        return Ok(ManualMfaSessionResult {
-            status: if authenticated {
-                ManualMfaSessionStatus::Authenticated
-            } else {
-                ManualMfaSessionStatus::AuthenticationRequired
-            },
-            message: status.message,
-            control_path: String::new(),
-            control_path_exists: false,
-            redacted_command_preview: "persistent shell readiness test".to_string(),
-            can_run_background_commands: authenticated,
-            last_master_check_result: status.output.clone(),
-            last_auth_ok_result: status.output.clone(),
-            last_session_test_stdout: status.output,
-            last_session_test_stderr: String::new(),
-            last_session_test_exit_code: if authenticated { Some(0) } else { Some(1) },
-            parsed_session_status: if authenticated {
-                ManualMfaSessionStatus::Authenticated
-            } else {
-                ManualMfaSessionStatus::AuthenticationRequired
-            },
-            selected_backend: "persistent_shell",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
-        });
-    }
     validate_manual_login_settings(&settings)?;
     let commands = build_manual_mfa_session_commands(&settings)?;
-    if let Err(message) = write_manual_mfa_scripts(&commands) {
-        return Ok(ManualMfaSessionResult {
-            status: ManualMfaSessionStatus::Failed,
-            message,
-            control_path: commands.control_path.clone(),
-            control_path_exists: false,
-            redacted_command_preview: commands.redacted_test_command_preview.clone(),
-            can_run_background_commands: false,
-            last_master_check_result: String::new(),
-            last_auth_ok_result: String::new(),
-            last_session_test_stdout: String::new(),
-            last_session_test_stderr: String::new(),
-            last_session_test_exit_code: None,
-            parsed_session_status: ManualMfaSessionStatus::Failed,
-            selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
-        });
-    }
-    match run_wsl_script(&commands.check_command) {
-        Ok(check_output) => match run_wsl_script(&commands.test_command) {
-            Ok(auth_output) => Ok(classify_manual_mfa_session_output(
-                &commands,
-                &check_output,
-                &auth_output,
-            )),
-            Err(message) => Ok(classify_manual_mfa_session_error(
-                &commands,
-                &check_output.combined(),
-                &message,
-            )),
-        },
-        Err(message) => Ok(classify_manual_mfa_session_error(&commands, &message, "")),
-    }
+    Ok(run_manual_mfa_session_readiness(&commands))
 }
 
 #[tauri::command]
@@ -1172,28 +1092,9 @@ fn build_local_checks(settings: &NibiSettings) -> Vec<NibiConnectionCheck> {
             validate_host(settings.manual_login_host()),
         ),
         local_check(
-            "local_private_key_exists",
-            "Private key path exists",
-            validate_local_path(settings.private_key_path(), "SSH key path").and_then(|_| {
-                if Path::new(settings.private_key_path()).is_file() {
-                    Ok(())
-                } else {
-                    Err("Private SSH key file was not found at this path.".to_string())
-                }
-            }),
-        ),
-        local_check(
-            "local_private_key_not_public",
-            "Key path is not .pub",
-            if settings
-                .private_key_path()
-                .to_ascii_lowercase()
-                .ends_with(".pub")
-            {
-                Err("Choose the private SSH key file, not the .pub public key.".to_string())
-            } else {
-                Ok(())
-            },
+            "local_wsl_private_key_path",
+            "WSL private key path is configured",
+            validate_wsl_private_key_path_setting(&settings.wsl_ssh_private_key_path),
         ),
         local_check(
             "local_remote_paths_absolute",
@@ -1207,20 +1108,6 @@ fn build_local_checks(settings: &NibiSettings) -> Vec<NibiConnectionCheck> {
                     )
                 }),
         ),
-        NibiConnectionCheck {
-            id: "manual_login_confirmed",
-            label: "Manual SSH login works in PowerShell",
-            status: if settings.manual_ssh_login_confirmed {
-                CheckStatus::Passed
-            } else {
-                CheckStatus::Skipped
-            },
-            message: if settings.manual_ssh_login_confirmed {
-                "You marked manual PowerShell login as working.".to_string()
-            } else {
-                "Use the manual SSH command below, complete password/Duo if prompted, then check the confirmation box.".to_string()
-            },
-        },
     ]
 }
 
@@ -1336,35 +1223,127 @@ fn build_manual_mfa_session_commands(
     let socket_name = control_path
         .rsplit('/')
         .next()
-        .unwrap_or("cm-user-nibi.sock")
+        .unwrap_or("cm-nibi.sock")
         .to_string();
-    let prelude = wsl_prelude(&control_path, &key, &target);
     let script_dir = "$HOME/.fluorcast/scripts".to_string();
     let start_script_path = "$HOME/.fluorcast/scripts/start-nibi-login.sh".to_string();
     let check_script_path = "$HOME/.fluorcast/scripts/check-nibi-session.sh".to_string();
     let end_script_path = "$HOME/.fluorcast/scripts/end-nibi-session.sh".to_string();
     let clean_script_path = "$HOME/.fluorcast/scripts/clean-nibi-session.sh".to_string();
-    let manual_wsl_login_command = format!("bash {start_script_path}");
-    let setup = format!(
-        "mkdir -p ~/.ssh ~/.fluorcast/ssh\ncp {} ~/.ssh/fluorcast_nibi_ed25519\nchmod 600 ~/.ssh/fluorcast_nibi_ed25519",
-        shell_quote(&windows_path_to_wsl_mount(settings.private_key_path()))
+    let manual_wsl_login_command = format!(
+        "wsl.exe -d {} -- bash -c {} -- {} {}",
+        powershell_single_quote(&distro),
+        powershell_single_quote("exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\""),
+        powershell_single_quote(&target),
+        powershell_single_quote(&key),
     );
-    let clean = format!(
-        "#!/usr/bin/env bash\nset -u\n\n{prelude}\n\nssh -S \"$ctl\" -O exit \"$host\" 2>/dev/null || true\nrm -f \"$ctl\"\nmkdir -p \"$HOME/.fluorcast/ssh\""
+    let setup = "Debug only: create or copy the private key inside WSL, then enter its absolute Linux path in FluorCast.".to_string();
+    let clean = [
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        "",
+        "HOST=\"$1\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "",
+        "printf 'WSL_DISTRO=%s\\n' \"${WSL_DISTRO_NAME:-unknown}\"",
+        "printf 'WSL_USER=%s\\n' \"$(whoami)\"",
+        "printf 'WSL_HOME=%s\\n' \"$HOME\"",
+        "printf 'CONTROL_PATH=%s\\n' \"$CTL\"",
+        "mkdir -p \"$HOME/.fluorcast/ssh\"",
+        "chmod 700 \"$HOME/.fluorcast/ssh\"",
+        "",
+        "if [[ ! -e \"$CTL\" ]]; then",
+        "    printf 'CLEAN_RESULT=NO_SESSION\\n'",
+        "    exit 0",
+        "fi",
+        "",
+        "if [[ -S \"$CTL\" ]] && ssh -S \"$CTL\" -O check \"$HOST\" >/dev/null 2>&1; then",
+        "    ssh -S \"$CTL\" -O exit \"$HOST\" >/dev/null 2>&1 || true",
+        "fi",
+        "",
+        "rm -f \"$CTL\"",
+        "",
+        "printf 'CLEAN_RESULT=SESSION_REMOVED\\n'",
+    ]
+    .join("\n");
+    let login = [
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        "",
+        "HOST=\"$1\"",
+        "KEY=\"$2\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "",
+        "mkdir -p \"$HOME/.fluorcast/ssh\"",
+        "chmod 700 \"$HOME/.fluorcast/ssh\"",
+        "",
+        "if [[ \"$KEY\" != /* ]]; then",
+        "  echo \"WSL private key path must be an absolute POSIX path.\"",
+        "  exit 20",
+        "fi",
+        "if [[ ! -e \"$KEY\" ]]; then",
+        "  echo \"WSL private key was not found.\"",
+        "  exit 21",
+        "fi",
+        "if [[ ! -f \"$KEY\" ]]; then",
+        "  echo \"WSL private key path is not a regular file.\"",
+        "  exit 22",
+        "fi",
+        "if [[ ! -r \"$KEY\" ]]; then",
+        "  echo \"WSL private key is not readable.\"",
+        "  exit 23",
+        "fi",
+        "",
+        "if [[ -S \"$CTL\" ]] && ssh -S \"$CTL\" -O check \"$HOST\" >/dev/null 2>&1; then",
+        "  echo \"An active FluorCast NIBI session already exists.\"",
+        "else",
+        "  rm -f \"$CTL\"",
+        "  ssh -fMN \\",
+        "    -S \"$CTL\" \\",
+        "    -i \"$KEY\" \\",
+        "    -o IdentitiesOnly=yes \\",
+        "    -o ControlMaster=yes \\",
+        "    -o ControlPath=\"$CTL\" \\",
+        "    -o ControlPersist=4h \\",
+        "    -o ServerAliveInterval=60 \\",
+        "    -o ServerAliveCountMax=3 \\",
+        "    \"$HOST\"",
+        "fi",
+        "echo",
+        "echo \"Checking FluorCast NIBI session...\"",
+        "test -S \"$CTL\"",
+        "ssh -S \"$CTL\" -O check \"$HOST\"",
+        "echo",
+        "echo \"FluorCast NIBI session created.\"",
+        "echo \"Return to FluorCast and press Test authenticated session.\"",
+        "read -r -p \"Press Enter to close this window...\"",
+    ]
+    .join("\n");
+    let check_script = manual_mfa_session_test_script();
+    let end_script = [
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        "",
+        "HOST=\"$1\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "",
+        "ssh -S \"$CTL\" -O exit \"$HOST\"",
+    ]
+    .join("\n");
+    let check = format!(
+        "wsl.exe -d {} -- bash -s -- {}",
+        powershell_single_quote(&distro),
+        powershell_single_quote(&target)
     );
-    let login = format!(
-        "#!/usr/bin/env bash\nset -u\n\n{prelude}\n\nmkdir -p \"$HOME/.fluorcast/ssh\"\n\nif ssh -S \"$ctl\" -O check \"$host\" >/dev/null 2>&1; then\n  echo \"An active FluorCast NIBI session already exists.\"\nelse\n  rm -f \"$ctl\"\n  ssh -fMN \\\n    -S \"$ctl\" \\\n    -i \"$key\" \\\n    -o IdentitiesOnly=yes \\\n    -o ControlMaster=yes \\\n    -o ControlPath=\"$ctl\" \\\n    -o ControlPersist=4h \\\n    -o ServerAliveInterval=60 \\\n    -o ServerAliveCountMax=3 \\\n    \"$host\"\nfi\n\necho\necho \"Checking FluorCast NIBI session...\"\nssh -S \"$ctl\" -O check \"$host\" || true\necho\necho \"Return to FluorCast and click Test authenticated session.\"\nread -r -p \"Press Enter to close this window...\""
-    );
-    let check_script =
-        format!("#!/usr/bin/env bash\nset -u\n\n{prelude}\n\nssh -S \"$ctl\" -O check \"$host\"");
-    let end_script =
-        format!("#!/usr/bin/env bash\nset -u\n\n{prelude}\n\nssh -S \"$ctl\" -O exit \"$host\"");
-    let check = format!("bash {check_script_path}");
-    let test =
-        format!("{prelude}\nssh -S \"$ctl\" -o BatchMode=yes \"$host\" \"echo {MANUAL_MFA_OK}\"");
+    let test = check_script.clone();
     let end = format!("bash {end_script_path}");
-    let background =
-        format!("{prelude}\nssh -S \"$ctl\" -o BatchMode=yes \"$host\" \"<remote command>\"");
+    let background = [
+        "HOST=\"$1\"",
+        "REMOTE_COMMAND=\"$2\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "ssh -S \"$CTL\" -o ControlMaster=no -o BatchMode=yes \"$HOST\" \"$REMOTE_COMMAND\"",
+    ]
+    .join("\n");
 
     Ok(ManualMfaSessionCommands {
         backend: "wsl",
@@ -1377,11 +1356,11 @@ fn build_manual_mfa_session_commands(
         clean_script_path: clean_script_path.clone(),
         wsl_distro: distro.clone(),
         wsl_key_path: key.clone(),
-        host: target,
+        host: target.clone(),
         wsl_setup_key_commands: setup,
         clean_stale_session_command: format!("bash {clean_script_path}"),
-        windows_terminal_command: windows_terminal_command(&start_script_path, &distro),
-        powershell_launch_command: powershell_launch_command(&start_script_path, &distro),
+        windows_terminal_command: windows_terminal_command(&distro, &target, &key),
+        powershell_launch_command: powershell_launch_command(&distro, &target, &key),
         login_command: login.clone(),
         clean_script_content: clean,
         check_script_content: check_script.clone(),
@@ -1449,6 +1428,7 @@ fn run_ssh_invocation(invocation: &SshInvocation) -> Result<CommandOutput, Strin
                 status: output.status.code().unwrap_or(1),
                 stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                timed_out: false,
             });
         }
 
@@ -1667,6 +1647,7 @@ fn read_terminal_action_output(paths: &TerminalActionPaths) -> Result<CommandOut
         status,
         stdout: stdout.trim().to_string(),
         stderr: stderr.trim().to_string(),
+        timed_out: false,
     })
 }
 
@@ -1955,6 +1936,9 @@ fn validate_remote_command_spec(command_spec: &RemoteCommandSpecInput) -> Result
         {
             validate_remote_path(&command_spec.args[2], "Remote JSON path")
         }
+        "fluorcast-python-version" if command_spec.args.len() == 1 => {
+            validate_remote_path(&command_spec.args[0], "Python executable path")
+        }
         "cat" if command_spec.args.len() == 1 => {
             validate_remote_path(&command_spec.args[0], "Remote log path")
         }
@@ -2035,6 +2019,10 @@ fn structured_remote_command_to_shell(
         "python3" => Ok(format!(
             "python3 -m json.tool {} >/dev/null",
             shell_quote(&command_spec.args[2])
+        )),
+        "fluorcast-python-version" => Ok(format!(
+            "{} --version",
+            shell_quote(&command_spec.args[0])
         )),
         "cat" => Ok(format!("cat {}", shell_quote(&command_spec.args[0]))),
         "fluorcast-record-slurm-submission" => Ok(format!(
@@ -2256,23 +2244,425 @@ fn build_manual_mfa_download_target(
     })
 }
 
-fn run_wsl_script(script: &str) -> Result<CommandOutput, String> {
-    let output = Command::new("wsl.exe")
-        .args(["-e", "bash", "-lc", script])
-        .stdin(Stdio::null())
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WslBashScriptInvocation {
+    program: String,
+    args: Vec<String>,
+    stdin: String,
+}
+
+fn build_wsl_bash_script_invocation(
+    distro: &str,
+    script: &str,
+    positional_args: &[String],
+) -> WslBashScriptInvocation {
+    let mut args = vec![
+        "-d".to_string(),
+        wsl_distro_name(distro),
+        "--".to_string(),
+        "bash".to_string(),
+        "-s".to_string(),
+        "--".to_string(),
+    ];
+    args.extend(positional_args.iter().cloned());
+    WslBashScriptInvocation {
+        program: "wsl.exe".to_string(),
+        args,
+        stdin: normalize_bash_source(script),
+    }
+}
+
+fn run_manual_mfa_remote_command_result(
+    settings: &NibiSettings,
+    remote_command: &str,
+    label: String,
+    redacted_preview: Option<String>,
+) -> Result<RemoteCommandResult, String> {
+    validate_manual_login_settings(settings)?;
+    let commands = build_manual_mfa_session_commands(settings)?;
+    let preview = redacted_preview.unwrap_or_else(|| label.clone());
+    let started = Instant::now();
+    let readiness = run_manual_mfa_session_readiness(&commands);
+    if !readiness.can_run_background_commands {
+        return Ok(RemoteCommandResult {
+            exit_code: readiness.last_session_test_exit_code.unwrap_or(1),
+            stdout: readiness.last_session_test_stdout,
+            stderr: readiness.message,
+            duration_ms: started.elapsed().as_millis(),
+            command_label: label,
+            redacted_command_preview: preview,
+            timed_out: matches!(readiness.status, ManualMfaSessionStatus::Timeout),
+        });
+    }
+
+    let invocation = build_manual_mfa_remote_command_invocation(&commands, remote_command);
+    let output = run_program_with_stdin_timeout(
+        &invocation.program,
+        &invocation.args,
+        &invocation.stdin,
+        command_timeout(settings, remote_command),
+    )?;
+
+    Ok(RemoteCommandResult {
+        exit_code: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        duration_ms: started.elapsed().as_millis(),
+        command_label: label,
+        redacted_command_preview: preview,
+        timed_out: output.timed_out,
+    })
+}
+
+fn build_manual_mfa_remote_command_invocation(
+    commands: &ManualMfaSessionCommands,
+    remote_command: &str,
+) -> WslBashScriptInvocation {
+    let args = vec![commands.host.clone(), remote_command.to_string()];
+    build_wsl_bash_script_invocation(
+        &commands.wsl_distro,
+        &manual_mfa_remote_command_script(),
+        &args,
+    )
+}
+
+fn manual_mfa_remote_command_script() -> String {
+    [
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        "",
+        "HOST=\"$1\"",
+        "REMOTE_COMMAND=\"$2\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "",
+        "ssh \\",
+        "  -S \"$CTL\" \\",
+        "  -o ControlMaster=no \\",
+        "  -o BatchMode=yes \\",
+        "  \"$HOST\" \\",
+        "  \"$REMOTE_COMMAND\"",
+    ]
+    .join("\n")
+}
+
+fn command_timeout(_settings: &NibiSettings, _remote_command: &str) -> Duration {
+    WSL_SCRIPT_TIMEOUT
+}
+
+fn manual_mfa_session_test_script() -> String {
+    [
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        "",
+        "HOST=\"$1\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "",
+        "printf 'WSL_DISTRO=%s\\n' \"${WSL_DISTRO_NAME:-unknown}\"",
+        "printf 'WSL_USER=%s\\n' \"$(whoami)\"",
+        "printf 'WSL_HOME=%s\\n' \"$HOME\"",
+        "printf 'CONTROL_PATH=%s\\n' \"$CTL\"",
+        "",
+        "if [[ ! -e \"$CTL\" ]]; then",
+        "    printf 'SESSION_ERROR=CONTROL_PATH_MISSING\\n'",
+        "    exit 10",
+        "fi",
+        "",
+        "if [[ ! -S \"$CTL\" ]]; then",
+        "    printf 'SESSION_ERROR=CONTROL_PATH_NOT_SOCKET\\n'",
+        "    exit 11",
+        "fi",
+        "",
+        "printf 'SOCKET_EXISTS=1\\n'",
+        "",
+        "if ! ssh -S \"$CTL\" -O check \"$HOST\"; then",
+        "    printf 'SESSION_ERROR=CONTROL_MASTER_CHECK_FAILED\\n'",
+        "    exit 12",
+        "fi",
+        "",
+        "printf 'MASTER_RUNNING=1\\n'",
+        "",
+        "RESULT=\"$(",
+        "    ssh \\",
+        "      -S \"$CTL\" \\",
+        "      -o ControlMaster=no \\",
+        "      -o BatchMode=yes \\",
+        "      -o ConnectTimeout=10 \\",
+        "      -o PasswordAuthentication=no \\",
+        "      -o KbdInteractiveAuthentication=no \\",
+        "      \"$HOST\" \\",
+        "      'printf \"FLUORCAST_AUTH_OK\\n\"'",
+        ")\"",
+        "",
+        "if [[ \"$RESULT\" != \"FLUORCAST_AUTH_OK\" ]]; then",
+        "    printf 'SESSION_ERROR=AUTH_MARKER_MISSING\\n'",
+        "    printf 'REMOTE_OUTPUT=%s\\n' \"$RESULT\"",
+        "    exit 13",
+        "fi",
+        "",
+        "printf 'FLUORCAST_AUTH_OK\\n'",
+    ]
+    .join("\n")
+}
+
+fn run_manual_mfa_session_readiness(commands: &ManualMfaSessionCommands) -> ManualMfaSessionResult {
+    let args = vec![commands.host.clone()];
+    match run_wsl_bash_script(
+        &commands.wsl_distro,
+        &commands.check_script_content,
+        &args,
+        WSL_SCRIPT_TIMEOUT,
+    ) {
+        Ok(output) => classify_manual_mfa_session_probe_output(commands, &output),
+        Err(message) => manual_mfa_transport_error_result(commands, message),
+    }
+}
+
+fn classify_manual_mfa_session_probe_output(
+    commands: &ManualMfaSessionCommands,
+    output: &CommandOutput,
+) -> ManualMfaSessionResult {
+    let combined = output.combined();
+    let control_path =
+        resolved_control_path_from_output(output).unwrap_or_else(|| commands.control_path.clone());
+    let (status, message, can_run_background_commands, control_path_exists) = if output.status == 0
+        && output.stdout.contains(MANUAL_MFA_OK)
+    {
+        (
+            ManualMfaSessionStatus::Authenticated,
+            format!("Authenticated WSL NIBI session is ready.\n{MANUAL_MFA_OK}"),
+            true,
+            true,
+        )
+    } else if output.timed_out || output.status == 124 {
+        (
+            ManualMfaSessionStatus::Timeout,
+            "The WSL NIBI session test timed out.".to_string(),
+            false,
+            output.stdout.contains("SOCKET_EXISTS=1"),
+        )
+    } else if output.status == 10 || combined.contains("SESSION_ERROR=CONTROL_PATH_MISSING") {
+        (
+            ManualMfaSessionStatus::SessionNotFound,
+            "ControlPath is missing. Start the NIBI session, then test again.".to_string(),
+            false,
+            false,
+        )
+    } else if output.status == 11 || combined.contains("SESSION_ERROR=CONTROL_PATH_NOT_SOCKET") {
+        (
+            ManualMfaSessionStatus::ControlPathNotSocket,
+            "ControlPath exists but is not a socket. Clean stale WSL session, then start again."
+                .to_string(),
+            false,
+            true,
+        )
+    } else if output.status == 12 || combined.contains("SESSION_ERROR=CONTROL_MASTER_CHECK_FAILED")
+    {
+        (
+            ManualMfaSessionStatus::StaleControlmaster,
+            "The ControlMaster socket is stale or not running. Clean stale WSL session, then start again."
+                .to_string(),
+            false,
+            true,
+        )
+    } else if output.status == 13 || combined.contains("SESSION_ERROR=AUTH_MARKER_MISSING") {
+        (
+            ManualMfaSessionStatus::AuthMarkerMissing,
+            "Authenticated session reuse did not return FLUORCAST_AUTH_OK.".to_string(),
+            false,
+            output.stdout.contains("SOCKET_EXISTS=1"),
+        )
+    } else if is_interactive_login_required_output(&combined) {
+        (
+            ManualMfaSessionStatus::SessionNotReused,
+            "BatchMode reuse failed and NIBI attempted interactive authentication.".to_string(),
+            false,
+            output.stdout.contains("SOCKET_EXISTS=1"),
+        )
+    } else if output.status == 126 || output.status == 127 {
+        (
+            ManualMfaSessionStatus::BashTransportFailed,
+            "WSL bash transport failed before the session test could complete.".to_string(),
+            false,
+            output.stdout.contains("SOCKET_EXISTS=1"),
+        )
+    } else {
+        (
+            ManualMfaSessionStatus::BatchModeReuseFailed,
+            "BatchMode session reuse failed; no fresh password or Duo prompt was attempted."
+                .to_string(),
+            false,
+            output.stdout.contains("SOCKET_EXISTS=1"),
+        )
+    };
+
+    ManualMfaSessionResult {
+        status,
+        message,
+        control_path,
+        control_path_exists,
+        redacted_command_preview: commands.redacted_test_command_preview.clone(),
+        can_run_background_commands,
+        last_master_check_result: combined.clone(),
+        last_auth_ok_result: if output.stdout.contains(MANUAL_MFA_OK) {
+            MANUAL_MFA_OK.to_string()
+        } else {
+            combined.clone()
+        },
+        last_session_test_stdout: output.stdout.clone(),
+        last_session_test_stderr: output.stderr.clone(),
+        last_session_test_exit_code: Some(output.status),
+        parsed_session_status: status,
+        selected_backend: "wsl",
+        wsl_available: wsl_available_for_distro(&commands.wsl_distro),
+        wsl_ssh_available: wsl_ssh_available_for_distro(&commands.wsl_distro),
+    }
+}
+
+fn manual_mfa_transport_error_result(
+    commands: &ManualMfaSessionCommands,
+    message: String,
+) -> ManualMfaSessionResult {
+    let status = if message.to_ascii_lowercase().contains("could not start wsl") {
+        ManualMfaSessionStatus::WslUnavailable
+    } else {
+        ManualMfaSessionStatus::BashTransportFailed
+    };
+    ManualMfaSessionResult {
+        status,
+        message,
+        control_path: commands.control_path.clone(),
+        control_path_exists: false,
+        redacted_command_preview: commands.redacted_test_command_preview.clone(),
+        can_run_background_commands: false,
+        last_master_check_result: String::new(),
+        last_auth_ok_result: String::new(),
+        last_session_test_stdout: String::new(),
+        last_session_test_stderr: String::new(),
+        last_session_test_exit_code: None,
+        parsed_session_status: status,
+        selected_backend: "wsl",
+        wsl_available: wsl_available_for_distro(&commands.wsl_distro),
+        wsl_ssh_available: false,
+    }
+}
+
+fn resolved_control_path_from_output(output: &CommandOutput) -> Option<String> {
+    output
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("CONTROL_PATH=").map(str::to_string))
+}
+
+fn normalize_bash_source(script: &str) -> String {
+    script.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn run_wsl_bash_script(
+    distro: &str,
+    script: &str,
+    positional_args: &[String],
+    timeout: Duration,
+) -> Result<CommandOutput, String> {
+    let invocation = build_wsl_bash_script_invocation(distro, script, positional_args);
+    run_program_with_stdin_timeout(
+        &invocation.program,
+        &invocation.args,
+        &invocation.stdin,
+        timeout,
+    )
+    .map_err(|error| format!("Could not run WSL bash script: {error}"))
+}
+
+fn run_program_with_stdin_timeout(
+    program: &str,
+    args: &[String],
+    stdin_text: &str,
+    timeout: Duration,
+) -> Result<CommandOutput, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("Could not start WSL: {error}"))?;
-    let result = CommandOutput {
-        status: output.status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        .spawn()
+        .map_err(|error| format!("Could not start {program}: {error}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("Could not capture {program} stdout."))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("Could not capture {program} stderr."))?;
+    let stdout_handle = thread::spawn(move || {
+        let mut reader = stdout;
+        let mut output = String::new();
+        reader.read_to_string(&mut output).map(|_| output)
+    });
+    let stderr_handle = thread::spawn(move || {
+        let mut reader = stderr;
+        let mut output = String::new();
+        reader.read_to_string(&mut output).map(|_| output)
+    });
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(error) = stdin
+            .write_all(stdin_text.as_bytes())
+            .and_then(|_| stdin.flush())
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Could not write script stdin: {error}"));
+        }
+    }
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Could not read {program} status: {error}"))?
+        {
+            break status;
+        }
+        if started.elapsed() > timeout {
+            timed_out = true;
+            let _ = child.kill();
+            break child
+                .wait()
+                .map_err(|error| format!("Could not wait for timed out {program}: {error}"))?;
+        }
+        thread::sleep(Duration::from_millis(50));
     };
-    if result.status == 0 {
-        Ok(result)
+
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| format!("Could not join {program} stdout reader."))?
+        .map_err(|error| format!("Could not read {program} stdout: {error}"))?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| format!("Could not join {program} stderr reader."))?
+        .map_err(|error| format!("Could not read {program} stderr: {error}"))?;
+
+    Ok(CommandOutput {
+        status: if timed_out {
+            124
+        } else {
+            status.code().unwrap_or(1)
+        },
+        stdout: stdout.trim().to_string(),
+        stderr: stderr.trim().to_string(),
+        timed_out,
+    })
+}
+
+fn run_wsl_script(script: &str) -> Result<CommandOutput, String> {
+    let output = run_wsl_bash_script(&default_wsl_distro(), script, &[], WSL_SCRIPT_TIMEOUT)?;
+    if output.status == 0 {
+        Ok(output)
     } else {
-        Err(result.combined())
+        Err(output.combined())
     }
 }
 
@@ -2289,44 +2679,47 @@ fn write_manual_mfa_scripts(commands: &ManualMfaSessionCommands) -> Result<(), S
 }
 
 fn write_wsl_script(path: &str, content: &str, distro: &str) -> Result<(), String> {
-    let script = format!(
-        "mkdir -p \"$HOME/.fluorcast/scripts\" && cat > {} && chmod +x {}",
-        wsl_assignment_quote(path),
-        wsl_assignment_quote(path)
-    );
-    let mut command = Command::new("wsl.exe");
-    if !distro.trim().is_empty() {
-        command.args(["-d", distro.trim()]);
+    let script_name = path
+        .rsplit('/')
+        .next()
+        .ok_or_else(|| "WSL script path is invalid.".to_string())?
+        .to_string();
+    if script_name.is_empty()
+        || !script_name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err("WSL script filename contains unsupported characters.".to_string());
     }
-    let mut child = command
-        .args(["--", "bash", "-lc", &script])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
+    let writer_script = [
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        "SCRIPT_NAME=\"$1\"",
+        "CONTENT_B64=\"$2\"",
+        "SCRIPT_DIR=\"$HOME/.fluorcast/scripts\"",
+        "SCRIPT_PATH=\"$SCRIPT_DIR/$SCRIPT_NAME\"",
+        "mkdir -p \"$SCRIPT_DIR\"",
+        "printf '%s' \"$CONTENT_B64\" | base64 -d > \"$SCRIPT_PATH\"",
+        "chmod +x \"$SCRIPT_PATH\"",
+        "printf 'SCRIPT_PATH=%s\\n' \"$SCRIPT_PATH\"",
+    ]
+    .join("\n");
+    let args = vec![script_name, base64_encode(content.as_bytes())];
+    let output = run_wsl_bash_script(distro, &writer_script, &args, WSL_SCRIPT_TIMEOUT).map_err(
+        |error| {
             format!(
                 "{} {}",
-                terminal_command_not_found_message(&error.to_string()),
+                terminal_command_not_found_message(&error),
                 "Could not write WSL Manual MFA scripts."
             )
-        })?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(content.as_bytes())
-            .map_err(|error| format!("Could not send WSL script content: {error}"))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("Could not finish writing WSL script: {error}"))?;
-    if output.status.success() {
+        },
+    )?;
+    if output.status == 0 {
         Ok(())
     } else {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         Err(format!(
             "Could not write WSL script {path}.\n{}\n{}",
-            stdout, stderr
+            output.stdout, output.stderr
         ))
     }
 }
@@ -2418,8 +2811,11 @@ fn launch_manual_mfa_terminal(commands: ManualMfaSessionCommands) -> ManualMfaTe
         args.extend([
             "--".to_string(),
             "bash".to_string(),
-            "-lc".to_string(),
-            commands.manual_wsl_login_command.clone(),
+            "-c".to_string(),
+            "exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\"".to_string(),
+            "--".to_string(),
+            commands.host.clone(),
+            commands.wsl_key_path.clone(),
         ]);
         match Command::new("wt.exe").args(&args).spawn() {
             Ok(_) => {
@@ -2453,8 +2849,9 @@ fn launch_manual_mfa_terminal(commands: ManualMfaSessionCommands) -> ManualMfaTe
         let ps_command = format!(
             "Start-Process powershell.exe -ArgumentList '-NoExit','-Command',{}",
             powershell_single_quote(&wsl_command_line(
-                &commands.start_script_path,
-                &commands.wsl_distro
+                &commands.wsl_distro,
+                &commands.host,
+                &commands.wsl_key_path
             ))
         );
         match Command::new("powershell.exe")
@@ -2532,59 +2929,44 @@ fn command_available(program: &str) -> bool {
 }
 
 fn wsl_distro_available(distro: &str) -> bool {
-    if distro.trim().is_empty() {
-        return true;
-    }
-    Command::new("wsl.exe")
-        .args(["-d", distro.trim(), "--", "bash", "-lc", "echo ok"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    wsl_available_for_distro(distro)
 }
 
 fn wsl_available() -> bool {
-    Command::new("wsl.exe")
-        .args(["-e", "bash", "-lc", "echo ok"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
+    wsl_available_for_distro(&default_wsl_distro())
+}
+
+fn wsl_available_for_distro(distro: &str) -> bool {
+    run_wsl_bash_script(distro, "printf 'ok\\n'", &[], Duration::from_secs(5))
+        .map(|output| output.status == 0)
         .unwrap_or(false)
 }
 
 fn wsl_ssh_available() -> bool {
-    Command::new("wsl.exe")
-        .args(["-e", "bash", "-lc", "command -v ssh >/dev/null 2>&1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    wsl_ssh_available_for_distro(&default_wsl_distro())
+}
+
+fn wsl_ssh_available_for_distro(distro: &str) -> bool {
+    run_wsl_bash_script(
+        distro,
+        "command -v ssh >/dev/null 2>&1",
+        &[],
+        Duration::from_secs(5),
+    )
+    .map(|output| output.status == 0)
+    .unwrap_or(false)
 }
 
 fn wsl_path_exists(path: &str) -> bool {
-    Command::new("wsl.exe")
-        .args([
-            "-e",
-            "bash",
-            "-lc",
-            &format!(
-                "test -S {} || test -e {}",
-                shell_quote(path),
-                shell_quote(path)
-            ),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let args = vec![path.to_string()];
+    run_wsl_bash_script(
+        &default_wsl_distro(),
+        "PATH_TO_CHECK=\"$1\"\ncase \"$PATH_TO_CHECK\" in\n  '$HOME'/*) PATH_TO_CHECK=\"$HOME/${PATH_TO_CHECK#'$HOME'/}\" ;;\nesac\ntest -S \"$PATH_TO_CHECK\" || test -e \"$PATH_TO_CHECK\"",
+        &args,
+        Duration::from_secs(5),
+    )
+    .map(|output| output.status == 0)
+    .unwrap_or(false)
 }
 
 fn result_message(status: &CheckStatus, output: &CommandOutput) -> String {
@@ -2931,6 +3313,7 @@ struct CommandOutput {
     status: i32,
     stdout: String,
     stderr: String,
+    timed_out: bool,
 }
 
 impl CommandOutput {
@@ -2953,8 +3336,13 @@ fn validate_settings(settings: &NibiSettings) -> Result<(), String> {
 fn validate_manual_login_settings(settings: &NibiSettings) -> Result<(), String> {
     validate_simple_identifier(&settings.nibi_username, "NIBI username")?;
     validate_host(settings.manual_login_host())?;
-    validate_local_path(settings.private_key_path(), "SSH key path")?;
+    validate_wsl_distro(&settings.manual_mfa_wsl_distro)?;
     Ok(())
+}
+
+fn validate_manual_login_start_settings(settings: &NibiSettings) -> Result<(), String> {
+    validate_manual_login_settings(settings)?;
+    validate_wsl_private_key_path_setting(&settings.wsl_ssh_private_key_path)
 }
 
 fn validate_robot_settings(settings: &NibiSettings) -> Result<(), String> {
@@ -3154,6 +3542,46 @@ fn default_wsl_distro() -> String {
     "Ubuntu".to_string()
 }
 
+fn validate_wsl_distro(value: &str) -> Result<(), String> {
+    let distro = wsl_distro_name(value);
+    if !distro
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        return Err("WSL distribution contains unsupported characters.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_wsl_private_key_path_setting(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("WSL private key path is required.".to_string());
+    }
+    if !trimmed.starts_with('/') {
+        return Err("WSL private key path must be an absolute POSIX path.".to_string());
+    }
+    if trimmed.to_ascii_lowercase().ends_with(".pub") {
+        return Err("Choose the private SSH key file, not the .pub public key.".to_string());
+    }
+    if trimmed
+        .chars()
+        .any(|character| character.is_control() || "\"';&|`$<>\\\t".contains(character))
+    {
+        return Err("WSL private key path contains unsupported characters.".to_string());
+    }
+    Ok(())
+}
+
+fn wsl_distro_name(distro: &str) -> String {
+    let trimmed = distro.trim();
+    if trimmed.is_empty() {
+        default_wsl_distro()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn default_manual_mfa_provider() -> String {
     "terminal_action".to_string()
 }
@@ -3266,43 +3694,52 @@ fn timestamp_now() -> String {
     format!("{seconds}")
 }
 
-fn wsl_command_line(script_path: &str, distro: &str) -> String {
-    let bash_command = format!("bash {script_path}");
+fn wsl_command_line(distro: &str, host: &str, key: &str) -> String {
+    let launcher = "exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\"";
     if distro.trim().is_empty() {
         format!(
-            "wsl.exe -- bash -lc {}",
-            powershell_single_quote(&bash_command)
+            "wsl.exe -- bash -c {} -- {} {}",
+            powershell_single_quote(launcher),
+            powershell_single_quote(host),
+            powershell_single_quote(key)
         )
     } else {
         format!(
-            "wsl.exe -d {} -- bash -lc {}",
+            "wsl.exe -d {} -- bash -c {} -- {} {}",
             powershell_single_quote(distro.trim()),
-            powershell_single_quote(&bash_command)
+            powershell_single_quote(launcher),
+            powershell_single_quote(host),
+            powershell_single_quote(key)
         )
     }
 }
 
-fn windows_terminal_command(script_path: &str, distro: &str) -> String {
-    let bash_command = format!("bash {script_path}");
-    if distro.trim().is_empty() {
+fn windows_terminal_command(distro: &str, host: &str, key: &str) -> String {
+    let command = if distro.trim().is_empty() {
         format!(
-            "wt.exe new-tab --title \"FluorCast NIBI Login\" wsl.exe -- bash -lc {}",
-            powershell_single_quote(&bash_command)
+            "wt.exe new-tab --title \"FluorCast NIBI Login\" wsl.exe -- bash -c {} -- {} {}",
+            powershell_single_quote("exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\""),
+            powershell_single_quote(host),
+            powershell_single_quote(key)
         )
     } else {
         format!(
-            "wt.exe new-tab --title \"FluorCast NIBI Login\" wsl.exe -d {} -- bash -lc {}",
+            "wt.exe new-tab --title \"FluorCast NIBI Login\" wsl.exe -d {} -- bash -c {} -- {} {}",
             powershell_single_quote(distro.trim()),
-            powershell_single_quote(&bash_command)
+            powershell_single_quote("exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\""),
+            powershell_single_quote(host),
+            powershell_single_quote(key)
         )
-    }
+    };
+    redact_session_command(&command, CANONICAL_WSL_CONTROL_SOCKET_PATH, key)
 }
 
-fn powershell_launch_command(script_path: &str, distro: &str) -> String {
-    format!(
+fn powershell_launch_command(distro: &str, host: &str, key: &str) -> String {
+    let command = format!(
         "powershell.exe -NoProfile -Command \"Start-Process powershell.exe -ArgumentList '-NoExit', '-Command', '{}'\"",
-        wsl_command_line(script_path, distro).replace('\'', "''")
-    )
+        wsl_command_line(distro, host, key).replace('\'', "''")
+    );
+    redact_session_command(&command, CANONICAL_WSL_CONTROL_SOCKET_PATH, key)
 }
 
 fn terminal_launch_error_code(message: &str) -> String {
@@ -3386,32 +3823,8 @@ fn windows_path_to_wsl_mount(path: &str) -> String {
 }
 
 fn manual_mfa_control_path(settings: &NibiSettings) -> String {
-    if !settings.wsl_control_socket_path.trim().is_empty() {
-        return settings.wsl_control_socket_path.trim().to_string();
-    }
-    format!(
-        "$HOME/.fluorcast/ssh/cm-{}-{}.sock",
-        safe_control_path_part(settings.nibi_username.trim()),
-        safe_control_path_part(
-            settings
-                .manual_login_host()
-                .split('.')
-                .next()
-                .unwrap_or("nibi")
-        )
-    )
-}
-
-fn safe_control_path_part(value: &str) -> String {
-    let safe = value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-        .collect::<String>();
-    if safe.is_empty() {
-        "nibi".to_string()
-    } else {
-        safe
-    }
+    let _ = settings;
+    CANONICAL_WSL_CONTROL_SOCKET_PATH.to_string()
 }
 
 fn is_interactive_login_required_output(output: &str) -> bool {
@@ -3432,7 +3845,7 @@ mod tests {
 
     fn settings() -> NibiSettings {
         NibiSettings {
-            manual_mfa_provider: "persistent_shell".to_string(),
+            manual_mfa_provider: "controlmaster".to_string(),
             nibi_username: "alice".to_string(),
             normal_login_host: "nibi.alliancecan.ca".to_string(),
             robot_login_host: "robot.nibi.alliancecan.ca".to_string(),
@@ -3441,7 +3854,7 @@ mod tests {
             nibi_host: "nibi.alliancecan.ca".to_string(),
             ssh_private_key_path: "C:\\Users\\Alice\\.ssh\\fluorcast_nibi_ed25519".to_string(),
             ssh_key_path: "C:\\Users\\Alice\\.ssh\\fluorcast_nibi_ed25519".to_string(),
-            wsl_ssh_private_key_path: "$HOME/.ssh/fluorcast_nibi_ed25519".to_string(),
+            wsl_ssh_private_key_path: "/home/alice/.ssh/fluorcast_nibi_ed25519".to_string(),
             wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-alice-nibi.sock".to_string(),
             manual_mfa_wsl_distro: "Ubuntu".to_string(),
             remote_project_path: "/home/alice/scratch/FluorCast".to_string(),
@@ -3666,6 +4079,7 @@ mod tests {
         let commands = build_manual_mfa_session_commands(&settings()).unwrap();
 
         assert_eq!(commands.backend, "wsl");
+        assert_eq!(commands.control_path, "$HOME/.fluorcast/ssh/cm-nibi.sock");
         assert_eq!(
             commands.start_script_path,
             "$HOME/.fluorcast/scripts/start-nibi-login.sh"
@@ -3675,37 +4089,38 @@ mod tests {
             .starts_with("$HOME/.fluorcast/scripts/"));
         assert!(commands
             .login_command
-            .contains("ctl=\"$HOME/.fluorcast/ssh/cm-alice-nibi.sock\""));
-        assert!(commands
-            .login_command
-            .contains("key=\"$HOME/.ssh/fluorcast_nibi_ed25519\""));
+            .contains("CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\""));
+        assert!(commands.login_command.contains("HOST=\"$1\""));
+        assert!(commands.login_command.contains("KEY=\"$2\""));
+        assert!(commands.login_command.contains("[[ \"$KEY\" != /* ]]"));
         assert!(commands.login_command.contains("ssh -fMN"));
         assert!(commands.login_command.contains("-o ControlMaster=yes"));
-        assert!(commands.login_command.contains("-o ControlPath=\"$ctl\""));
+        assert!(commands.login_command.contains("-o ControlPath=\"$CTL\""));
         assert!(commands.login_command.contains("-o ControlPersist=4h"));
         assert!(commands
             .login_command
-            .contains("host=\"alice@nibi.alliancecan.ca\""));
-        assert!(commands
-            .login_command
-            .contains("ssh -S \"$ctl\" -O check \"$host\" >/dev/null 2>&1"));
+            .contains("ssh -S \"$CTL\" -O check \"$HOST\" >/dev/null 2>&1"));
         assert!(commands
             .login_command
             .contains("An active FluorCast NIBI session already exists."));
         assert!(
             commands
                 .login_command
-                .find("ssh -S \"$ctl\" -O check \"$host\"")
+                .find("ssh -S \"$CTL\" -O check \"$HOST\"")
                 .unwrap()
-                < commands.login_command.find("rm -f \"$ctl\"").unwrap()
+                < commands.login_command.find("rm -f \"$CTL\"").unwrap()
         );
         assert!(commands
             .login_command
             .contains("read -r -p \"Press Enter to close this window...\""));
         assert!(!commands.login_command.contains("pkill -f"));
+        assert!(!commands
+            .login_command
+            .contains("/home/alice/.ssh/fluorcast_nibi_ed25519"));
+        assert!(!commands.login_command.contains("alice@nibi.alliancecan.ca"));
         assert!(commands.windows_terminal_command.contains("wt.exe new-tab"));
         assert!(commands.windows_terminal_command.contains(
-            "wsl.exe -d 'Ubuntu' -- bash -lc 'bash $HOME/.fluorcast/scripts/start-nibi-login.sh'"
+            "wsl.exe -d 'Ubuntu' -- bash -c 'exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\"'"
         ));
         assert!(!commands.windows_terminal_command.contains("ssh -fMN"));
         assert!(!commands
@@ -3716,14 +4131,20 @@ mod tests {
             .contains("Start-Process powershell.exe"));
         assert!(commands
             .powershell_launch_command
-            .contains("bash $HOME/.fluorcast/scripts/start-nibi-login.sh"));
+            .contains("exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\""));
         assert!(!commands.powershell_launch_command.contains("ssh -fMN"));
         assert!(commands.powershell_launch_command.contains("-NoExit"));
         assert!(!commands
             .redacted_login_command_preview
-            .contains("$HOME/.ssh/fluorcast_nibi_ed25519"));
-        assert!(commands
+            .contains("/home/alice/.ssh/fluorcast_nibi_ed25519"));
+        assert!(!commands
             .redacted_login_command_preview
+            .contains("<wsl_private_key_path>"));
+        assert!(!commands
+            .windows_terminal_command
+            .contains("/home/alice/.ssh/fluorcast_nibi_ed25519"));
+        assert!(commands
+            .windows_terminal_command
             .contains("<wsl_private_key_path>"));
     }
 
@@ -3738,27 +4159,243 @@ mod tests {
         );
         assert!(commands
             .clean_script_content
-            .contains("ssh -S \"$ctl\" -O exit \"$host\" 2>/dev/null || true"));
+            .contains("ssh -S \"$CTL\" -O exit \"$HOST\" >/dev/null 2>&1 || true"));
         assert_eq!(
             commands.check_command,
-            "bash $HOME/.fluorcast/scripts/check-nibi-session.sh"
+            "wsl.exe -d 'Ubuntu' -- bash -s -- 'alice@nibi.alliancecan.ca'"
         );
         assert!(commands
             .check_script_content
-            .contains("ssh -S \"$ctl\" -O check \"$host\""));
+            .contains("ssh -S \"$CTL\" -O check \"$HOST\""));
+        assert!(commands.check_script_content.contains("HOST=\"$1\""));
+        assert!(commands.check_script_content.contains("CONTROL_PATH=%s"));
+        assert!(commands.test_command.contains("-o ControlMaster=no"));
+        assert!(commands.test_command.contains("-o BatchMode=yes"));
         assert!(commands
             .test_command
-            .contains("ssh -S \"$ctl\" -o BatchMode=yes \"$host\" \"echo FLUORCAST_AUTH_OK\""));
+            .contains("-o PasswordAuthentication=no"));
+        assert!(commands
+            .test_command
+            .contains("-o KbdInteractiveAuthentication=no"));
+        assert!(commands.test_command.contains("FLUORCAST_AUTH_OK"));
+        assert!(!commands.test_command.contains("KEY="));
+        assert!(!commands
+            .test_command
+            .contains("/home/alice/.ssh/fluorcast_nibi_ed25519"));
         assert_eq!(
             commands.end_command,
             "bash $HOME/.fluorcast/scripts/end-nibi-session.sh"
         );
         assert!(commands
             .end_script_content
-            .contains("ssh -S \"$ctl\" -O exit \"$host\""));
+            .contains("ssh -S \"$CTL\" -O exit \"$HOST\""));
+        assert!(commands
+            .clean_script_content
+            .contains("CLEAN_RESULT=SESSION_REMOVED"));
+        assert!(commands.clean_script_content.contains("rm -f \"$CTL\""));
+        assert!(!commands.clean_script_content.contains("cm-alice-nibi.sock"));
         assert!(commands
             .background_command_template
-            .contains("-o BatchMode=yes"));
+            .contains("ControlMaster=no -o BatchMode=yes"));
+    }
+
+    #[test]
+    fn wsl_bash_invocation_uses_separate_arguments_and_stdin() {
+        let invocation = build_wsl_bash_script_invocation(
+            "Ubuntu",
+            "printf 'one'\r\nprintf 'two'\r",
+            &[
+                "alice@nibi.alliancecan.ca".to_string(),
+                "hostname".to_string(),
+            ],
+        );
+
+        assert_eq!(invocation.program, "wsl.exe");
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-d",
+                "Ubuntu",
+                "--",
+                "bash",
+                "-s",
+                "--",
+                "alice@nibi.alliancecan.ca",
+                "hostname",
+            ]
+        );
+        assert_eq!(invocation.stdin, "printf 'one'\nprintf 'two'\n");
+        assert!(!invocation
+            .args
+            .iter()
+            .any(|arg| arg.contains("printf 'one'")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn program_runner_keeps_streams_exit_code_and_timeout_distinct() {
+        let echo = run_program_with_stdin_timeout(
+            "powershell.exe",
+            &[
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "$stdinText = [Console]::In.ReadToEnd(); [Console]::Out.Write(\"OUT:\" + $stdinText); [Console]::Error.Write(\"ERR\"); exit 7".to_string(),
+            ],
+            "script-over-stdin",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(echo.status, 7);
+        assert_eq!(echo.stdout, "OUT:script-over-stdin");
+        assert_eq!(echo.stderr, "ERR");
+        assert!(!echo.timed_out);
+
+        let timed_out = run_program_with_stdin_timeout(
+            "powershell.exe",
+            &[
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Seconds 5".to_string(),
+            ],
+            "",
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        assert_eq!(timed_out.status, 124);
+        assert!(timed_out.timed_out);
+    }
+
+    #[test]
+    fn manual_mfa_remote_environment_commands_reuse_wsl_socket() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let invocation = build_manual_mfa_remote_command_invocation(&commands, "command -v sacct");
+
+        assert_eq!(invocation.program, "wsl.exe");
+        assert_eq!(
+            invocation.args[..6],
+            [
+                "-d".to_string(),
+                "Ubuntu".to_string(),
+                "--".to_string(),
+                "bash".to_string(),
+                "-s".to_string(),
+                "--".to_string(),
+            ]
+        );
+        assert_eq!(invocation.args[6], "alice@nibi.alliancecan.ca");
+        assert_eq!(invocation.args[7], "command -v sacct");
+        assert!(invocation
+            .stdin
+            .contains("CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\""));
+        assert!(invocation.stdin.contains("-o ControlMaster=no"));
+        assert!(invocation.stdin.contains("-o BatchMode=yes"));
+        assert!(!invocation.stdin.contains("ssh.exe"));
+        assert!(!invocation.stdin.contains("-i \"$KEY\""));
+    }
+
+    #[test]
+    fn manual_mfa_session_probe_resolves_control_path_inside_wsl() {
+        let script = manual_mfa_session_test_script();
+
+        assert!(script.contains("CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\""));
+        assert!(script.contains("printf 'WSL_USER=%s\\n' \"$(whoami)\""));
+        assert!(script.contains("printf 'WSL_HOME=%s\\n' \"$HOME\""));
+        assert!(script.contains("printf 'CONTROL_PATH=%s\\n' \"$CTL\""));
+        assert!(!script.contains("KEY="));
+        assert!(!script.contains("-i \"$KEY\""));
+        assert!(script.contains("-o ControlMaster=no"));
+        assert!(script.contains("-o BatchMode=yes"));
+        assert!(script.contains("-o PasswordAuthentication=no"));
+        assert!(script.contains("-o KbdInteractiveAuthentication=no"));
+    }
+
+    #[test]
+    fn manual_mfa_probe_exit_codes_map_to_specific_statuses() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+
+        let missing = CommandOutput {
+            status: 10,
+            stdout: "CONTROL_PATH=/home/alice/.fluorcast/ssh/cm-nibi.sock\nSESSION_ERROR=CONTROL_PATH_MISSING".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        assert!(matches!(
+            classify_manual_mfa_session_probe_output(&commands, &missing).status,
+            ManualMfaSessionStatus::SessionNotFound
+        ));
+
+        let not_socket = CommandOutput {
+            status: 11,
+            stdout: "SOCKET_EXISTS=0\nSESSION_ERROR=CONTROL_PATH_NOT_SOCKET".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        assert!(matches!(
+            classify_manual_mfa_session_probe_output(&commands, &not_socket).status,
+            ManualMfaSessionStatus::ControlPathNotSocket
+        ));
+
+        let stale = CommandOutput {
+            status: 12,
+            stdout: "SOCKET_EXISTS=1\nSESSION_ERROR=CONTROL_MASTER_CHECK_FAILED".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        assert!(matches!(
+            classify_manual_mfa_session_probe_output(&commands, &stale).status,
+            ManualMfaSessionStatus::StaleControlmaster
+        ));
+
+        let marker_missing = CommandOutput {
+            status: 13,
+            stdout: "SOCKET_EXISTS=1\nMASTER_RUNNING=1\nSESSION_ERROR=AUTH_MARKER_MISSING"
+                .to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        assert!(matches!(
+            classify_manual_mfa_session_probe_output(&commands, &marker_missing).status,
+            ManualMfaSessionStatus::AuthMarkerMissing
+        ));
+
+        let timeout = CommandOutput {
+            status: 124,
+            stdout: "SOCKET_EXISTS=1".to_string(),
+            stderr: String::new(),
+            timed_out: true,
+        };
+        assert!(matches!(
+            classify_manual_mfa_session_probe_output(&commands, &timeout).status,
+            ManualMfaSessionStatus::Timeout
+        ));
+    }
+
+    #[test]
+    fn manual_mfa_probe_success_requires_auth_marker() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let output = CommandOutput {
+            status: 0,
+            stdout: "WSL_DISTRO=Ubuntu\nWSL_USER=alice\nWSL_HOME=/home/alice\nCONTROL_PATH=/home/alice/.fluorcast/ssh/cm-nibi.sock\nSOCKET_EXISTS=1\nMASTER_RUNNING=1\nFLUORCAST_AUTH_OK".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+        };
+        let result = classify_manual_mfa_session_probe_output(&commands, &output);
+
+        assert!(matches!(
+            result.status,
+            ManualMfaSessionStatus::Authenticated
+        ));
+        assert_eq!(
+            result.message,
+            "Authenticated WSL NIBI session is ready.\nFLUORCAST_AUTH_OK"
+        );
+        assert_eq!(
+            result.control_path,
+            "/home/alice/.fluorcast/ssh/cm-nibi.sock"
+        );
+        assert!(result.can_run_background_commands);
     }
 
     #[test]
@@ -3822,6 +4459,7 @@ mod tests {
             status: 0,
             stdout: "FLUORCAST_AUTH_OK".to_string(),
             stderr: String::new(),
+            timed_out: false,
         };
 
         assert!(matches!(
@@ -3836,6 +4474,7 @@ mod tests {
             status: 255,
             stdout: String::new(),
             stderr: "alice@nibi.alliancecan.ca's password:".to_string(),
+            timed_out: false,
         };
 
         assert!(matches!(
@@ -3850,6 +4489,7 @@ mod tests {
             status: 255,
             stdout: "Duo two-factor login for alice".to_string(),
             stderr: String::new(),
+            timed_out: false,
         };
 
         assert!(matches!(
@@ -3864,6 +4504,7 @@ mod tests {
             status: 255,
             stdout: String::new(),
             stderr: "Multifactor authentication is mandatory. Passcode:".to_string(),
+            timed_out: false,
         };
 
         assert!(matches!(
@@ -3886,6 +4527,7 @@ mod tests {
                 status: 255,
                 stdout: "Duo two-factor login for alice".to_string(),
                 stderr: String::new(),
+                timed_out: false,
             },
             redacted_robot_command_preview(&settings()),
         );

@@ -49,7 +49,7 @@ describe("JobsPage recovery actions", () => {
     );
 
     expect(screen.getByText("NIBI login required")).toBeInTheDocument();
-    expect(screen.getByText(/visible PowerShell window/i)).toBeInTheDocument();
+    expect(screen.getByText(/Start the login from FluorCast or test the app session below/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Copy app login command" }));
     expect(copyLogin).toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Open Manual MFA diagnostics" }));

@@ -39,6 +39,28 @@ describe("remote environment checks", () => {
     });
   });
 
+  it("generates authenticated session reuse check first for manual MFA", () => {
+    const checks = buildRemoteEnvironmentCheckDefinitions(settings);
+
+    expect(checks[0]).toMatchObject({
+      id: "authenticated_session",
+      name: "Authenticated session reuse",
+      commandSpec: {
+        executable: "fluorcast-session-ready",
+        redacted_preview: "test_manual_mfa_session",
+      },
+    });
+  });
+
+  it("generates project readability check command", () => {
+    const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "remote_project_readable");
+
+    expect(check?.commandSpec).toMatchObject({
+      executable: "test",
+      args: ["-r", "/home/alice/scratch/FluorCast"],
+    });
+  });
+
   it("generates jobs path mkdir/test command", () => {
     const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "remote_jobs_path");
 
@@ -51,30 +73,30 @@ describe("remote environment checks", () => {
     });
   });
 
-  it("generates python environment check command", () => {
-    const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "python_environment");
+  it("generates jobs path writable check command", () => {
+    const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "remote_jobs_writable");
 
     expect(check?.commandSpec).toMatchObject({
       executable: "test",
-      args: ["-x", "/home/alice/scratch/FluorCast/.venv/bin/python"],
+      args: ["-w", "/home/alice/scratch/fluorcast-jobs"],
     });
   });
 
-  it("generates prediction script check command", () => {
-    const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "prediction_script");
+  it("generates python environment run command", () => {
+    const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "python_environment_runs");
+
+    expect(check?.commandSpec).toMatchObject({
+      executable: "fluorcast-python-version",
+      args: ["/home/alice/scratch/FluorCast/.venv/bin/python"],
+    });
+  });
+
+  it("generates prediction entry point check command", () => {
+    const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "prediction_entry_point");
 
     expect(check?.commandSpec).toMatchObject({
       executable: "test",
       args: ["-f", "/home/alice/scratch/FluorCast/scripts/run_prediction_job.py"],
-    });
-  });
-
-  it("generates Slurm script check command", () => {
-    const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "slurm_script");
-
-    expect(check?.commandSpec).toMatchObject({
-      executable: "test",
-      args: ["-f", "/home/alice/scratch/FluorCast/slurm/run_prediction_job.sbatch"],
     });
   });
 
@@ -93,22 +115,22 @@ describe("remote environment checks", () => {
       executable: "command",
       args: ["-v", "sacct"],
     });
-    expect(checks.find((item) => item.id === "sacct")?.optional).toBe(true);
+    expect(checks.find((item) => item.id === "sacct")?.optional).toBe(false);
   });
 
-  it("sacct failure is optional and not fatal", () => {
+  it("sacct failure is a required Stage 1 failure", () => {
     const rows = buildRemoteEnvironmentCheckDefinitions(settings).map((definition) =>
       resultToRemoteEnvironmentRow(definition, result(definition.id === "sacct" ? 1 : 0, definition.id)),
     );
 
     expect(rows.find((row) => row.id === "sacct")).toMatchObject({
       status: "failed",
-      optional: true,
-      message: "sacct is unavailable. Job polling may fall back to squeue/output-file checks.",
+      optional: false,
+      message: "sacct is unavailable.",
     });
     expect(getRemoteEnvironmentReadiness(rows)).toEqual({
-      ready: true,
-      summary: "Remote environment ready",
+      ready: false,
+      summary: "Remote environment needs attention",
     });
   });
 

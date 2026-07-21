@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { defaultNibiSettings, type ConnectionMode, type NibiSettings } from "../../features/settings";
@@ -50,6 +50,39 @@ function expandRemoteEnvironmentChecks() {
   fireEvent.click(screen.getByRole("button", { name: /Remote Environment Checks/ }));
 }
 
+function buildLaunchCommandsFixture() {
+  return {
+    backend: "wsl",
+    control_path: "$HOME/.fluorcast/ssh/cm-nibi.sock",
+    control_path_exists: false,
+    control_socket_filename: "cm-nibi.sock",
+    script_dir: "$HOME/.fluorcast/scripts",
+    start_script_path: "$HOME/.fluorcast/scripts/start-nibi-login.sh",
+    check_script_path: "$HOME/.fluorcast/scripts/check-nibi-session.sh",
+    end_script_path: "$HOME/.fluorcast/scripts/end-nibi-session.sh",
+    clean_script_path: "$HOME/.fluorcast/scripts/clean-nibi-session.sh",
+    wsl_distro: "Ubuntu",
+    wsl_key_path: "/home/alice/.ssh/fluorcast_nibi_ed25519",
+    host: "alice@nibi.alliancecan.ca",
+    wsl_setup_key_commands: "",
+    clean_stale_session_command: "",
+    windows_terminal_command: "",
+    powershell_launch_command: "",
+    login_command: "",
+    clean_script_content: "",
+    check_script_content: "",
+    end_script_content: "",
+    check_command: "",
+    test_command: "",
+    end_command: "",
+    background_command_template: "",
+    manual_wsl_login_command: "",
+    redacted_login_command_preview: "redacted login",
+    redacted_test_command_preview: "redacted test",
+    redacted_end_command_preview: "redacted end",
+  };
+}
+
 describe("SettingsPage", () => {
   beforeEach(() => {
     dialogMock.open.mockReset();
@@ -92,49 +125,26 @@ describe("SettingsPage", () => {
     expect(screen.queryByText("Remote Environment Checks")).not.toBeInTheDocument();
   });
 
-  it("section is collapsed by default in interactive_mfa mode and shows status summary", () => {
+  it("shows the Settings-only NIBI Session actions in Manual MFA mode", () => {
     renderMode("interactive_mfa");
 
-    expect(screen.getByText("Remote Environment Checks")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Remote Environment Checks/ }))
-      .toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("heading", { name: "NIBI Session" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clean stale WSL session" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start NIBI session" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Test authenticated session" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run remote environment checks" })).toBeDisabled();
     expect(screen.getByText("Log into NIBI first before running remote environment checks."))
       .toBeInTheDocument();
-    expect(screen.getAllByText("Login required").length).toBeGreaterThan(1);
-    expect(screen.queryByRole("button", { name: "Run remote environment checks" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Remote Environment Checks")).not.toBeInTheDocument();
   });
 
-  it("expanding reveals disabled interactive_mfa message and Run button", () => {
+  it("keeps generated scripts hidden in collapsed diagnostics by default", () => {
     renderMode("interactive_mfa");
 
-    expandRemoteEnvironmentChecks();
+    const diagnostics = screen.getByTestId("advanced-session-diagnostics") as HTMLDetailsElement;
 
-    expect(screen.getByRole("button", { name: /Remote Environment Checks/ }))
-      .toHaveAttribute("aria-expanded", "true");
-    expect(screen.getAllByText("Log into NIBI first before running remote environment checks.").length)
-      .toBeGreaterThan(1);
-    expect(screen.getByRole("button", { name: "Run remote environment checks" })).toBeDisabled();
-  });
-
-  it("enables Remote Environment Checks in interactive_mfa after authenticated", () => {
-    renderSettings({
-      connection_mode: "interactive_mfa",
-      nibi_username: "alice",
-    }, {
-      manualMfaSession: {
-        ...defaultManualMfaSessionState,
-        status: "authenticated",
-        can_run_background_commands: true,
-      },
-    });
-
-    expect(screen.getByText("Remote Environment Checks")).toBeInTheDocument();
-    expect(screen.getByText("Not run yet")).toBeInTheDocument();
-    expect(screen.getByText("Not run")).toBeInTheDocument();
-    expandRemoteEnvironmentChecks();
-    expect(screen.queryByText("Log into NIBI first before running remote environment checks."))
-      .not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Run remote environment checks" })).toBeEnabled();
+    expect(diagnostics.open).toBe(false);
+    expect(within(diagnostics).getByText("Generated login script")).toBeInTheDocument();
   });
 
   it("section is collapsed by default in robot_automation mode and shows status summary", () => {
@@ -182,15 +192,36 @@ describe("SettingsPage", () => {
     expect(screen.getByRole("button", { name: "Run remote environment checks" })).toBeEnabled();
   });
 
-  it("preserves previous check results after collapse and re-expand", async () => {
-    coreMock.invoke.mockImplementation(async (_command, payload) => ({
-      exit_code: payload.commandSpec.args?.includes("sacct") ? 1 : 0,
-      stdout: payload.commandSpec.args?.includes("sacct") ? "" : "ok",
-      stderr: payload.commandSpec.args?.includes("sacct") ? "sacct missing" : "",
-      duration_ms: 10,
-      command_label: payload.commandSpec.label,
-      redacted_command_preview: payload.commandSpec.redacted_preview,
-    }));
+  it("runs manual environment checks after authenticated session readiness", async () => {
+    coreMock.invoke.mockImplementation(async (command, payload) => {
+      if (command === "test_manual_mfa_session") {
+        return {
+          status: "authenticated",
+          message: "Authenticated WSL NIBI session is ready.\nFLUORCAST_AUTH_OK",
+          control_path: "/home/alice/.fluorcast/ssh/cm-nibi.sock",
+          control_path_exists: true,
+          redacted_command_preview: "wsl.exe -d <distribution> -- bash -s -- <host>",
+          can_run_background_commands: true,
+          last_master_check_result: "MASTER_RUNNING=1",
+          last_auth_ok_result: "FLUORCAST_AUTH_OK",
+          last_session_test_stdout: "WSL_DISTRO=Ubuntu\nWSL_USER=alice\nWSL_HOME=/home/alice\nCONTROL_PATH=/home/alice/.fluorcast/ssh/cm-nibi.sock\nFLUORCAST_AUTH_OK",
+          last_session_test_stderr: "",
+          last_session_test_exit_code: 0,
+          parsed_session_status: "authenticated",
+          selected_backend: "wsl",
+          wsl_available: true,
+          wsl_ssh_available: true,
+        };
+      }
+      return {
+        exit_code: payload.commandSpec.args?.includes("sacct") ? 1 : 0,
+        stdout: payload.commandSpec.args?.includes("sacct") ? "" : "ok",
+        stderr: payload.commandSpec.args?.includes("sacct") ? "sacct missing" : "",
+        duration_ms: 10,
+        command_label: payload.commandSpec.label,
+        redacted_command_preview: payload.commandSpec.redacted_preview,
+      };
+    });
 
     renderSettings({
       connection_mode: "interactive_mfa",
@@ -203,27 +234,14 @@ describe("SettingsPage", () => {
       },
     });
 
-    const toggle = screen.getByRole("button", { name: /Remote Environment Checks/ });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
     fireEvent.click(screen.getByRole("button", { name: "Run remote environment checks" }));
 
-    expect(await screen.findByText("Remote environment ready; sacct unavailable, polling will use fallback checks."))
+    expect(await screen.findByText("Remote environment needs attention"))
       .toBeInTheDocument();
-    expect(screen.getByText("sacct is unavailable. Job polling may fall back to squeue/output-file checks."))
+    expect(screen.getByText("sacct is unavailable."))
       .toBeInTheDocument();
-    expect(screen.getAllByText("Ready").length).toBeGreaterThan(1);
-
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByText("sacct is unavailable. Job polling may fall back to squeue/output-file checks."))
-      .not.toBeInTheDocument();
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText("sacct is unavailable. Job polling may fall back to squeue/output-file checks."))
-      .toBeInTheDocument();
+    expect(screen.getAllByText("failed").length).toBeGreaterThan(0);
+    expect(coreMock.invoke).toHaveBeenNthCalledWith(1, "test_manual_mfa_session", expect.any(Object));
   });
 
   it("interactive_mfa shows manual login controls and hides robot-only controls", () => {
@@ -231,13 +249,12 @@ describe("SettingsPage", () => {
 
     expect(screen.getByLabelText("NIBI username")).toBeInTheDocument();
     expect(screen.getByLabelText("Normal login host")).toHaveValue("nibi.alliancecan.ca");
-    expect(screen.getByLabelText(/Private SSH key file/)).toBeInTheDocument();
-    expect(screen.getByText("Manual MFA Login")).toBeInTheDocument();
-    expect(screen.getAllByText(/Manual MFA mode runs each NIBI action in a visible PowerShell window/).length)
-      .toBeGreaterThanOrEqual(1);
-    expect(screen.getByRole("button", { name: "Copy manual SSH command" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Start NIBI session" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Test session readiness" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/WSL private key path/)).toBeInTheDocument();
+    expect(screen.getByText("/home/cl/.ssh/fluorcast_nibi_ed25519")).toBeInTheDocument();
+    expect(screen.getByText("NIBI Session")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clean stale WSL session" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start NIBI session" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Test authenticated session" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "End NIBI session" })).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Robot login host")).not.toBeInTheDocument();
     expect(screen.queryByText("Restricted public key preview")).not.toBeInTheDocument();
@@ -262,14 +279,22 @@ describe("SettingsPage", () => {
     expect(screen.queryByText("Manual MFA Login")).not.toBeInTheDocument();
   });
 
-  it("shows reusable session controls only for legacy persistent shell mode", () => {
+  it("shows NIBI Session buttons in the requested order", () => {
     renderMode("interactive_mfa", {
-      manual_mfa_provider: "persistent_shell",
+      manual_mfa_provider: "controlmaster",
     });
 
-    expect(screen.getByRole("button", { name: "Start NIBI session" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Test session readiness" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "End NIBI session" })).toBeInTheDocument();
+    const buttons = within(screen.getByRole("heading", { name: "NIBI Session" }).closest("section")!)
+      .getAllByRole("button")
+      .slice(0, 4)
+      .map((button) => button.textContent);
+
+    expect(buttons).toEqual([
+      "Clean stale WSL session",
+      "Start NIBI session",
+      "Test authenticated session",
+      "Run remote environment checks",
+    ]);
   });
 
   it("remote path section only appears for interactive_mfa and robot_automation", () => {
@@ -286,12 +311,12 @@ describe("SettingsPage", () => {
     expect(screen.getByLabelText("Python environment path")).toBeInTheDocument();
   });
 
-  it("updates the SSH key path when a file is selected from Browse", async () => {
+  it("updates the robot SSH key path when a file is selected from Browse", async () => {
     dialogMock.open.mockResolvedValue("C:\\Users\\CL\\.ssh\\fluorcast_nibi_ed25519");
     pathMock.homeDir.mockResolvedValue("C:\\Users\\CL");
     pathMock.join.mockResolvedValue("C:\\Users\\CL\\.ssh");
 
-    renderMode("interactive_mfa");
+    renderMode("robot_automation");
 
     fireEvent.click(screen.getByRole("button", { name: "Browse..." }));
 
@@ -400,29 +425,17 @@ describe("SettingsPage", () => {
     });
   });
 
-  it("copies the manual SSH command and saves manual login confirmation", async () => {
-    const save = vi.fn().mockResolvedValue(true);
+  it("removes the manual PowerShell confirmation checkbox from Manual MFA", () => {
     renderMode("interactive_mfa", {
       nibi_username: "alice",
-      ssh_private_key_path: "C:\\Users\\Alice\\.ssh\\id_ed25519",
+      wsl_ssh_private_key_path: "/home/alice/.ssh/fluorcast_nibi_ed25519",
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Copy manual SSH command" }));
-
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
-      "ssh -i \"C:\\Users\\Alice\\.ssh\\id_ed25519\" alice@nibi.alliancecan.ca",
-    );
-    expect(await screen.findByText("Manual SSH command copied.")).toBeInTheDocument();
-
-    renderSettings({
-      connection_mode: "interactive_mfa",
-      nibi_username: "alice",
-      ssh_private_key_path: "C:\\Users\\Alice\\.ssh\\id_ed25519",
-    }, { onNibiSettingsSave: save });
-    fireEvent.click(screen.getAllByLabelText("Manual SSH login works in PowerShell").at(-1)!);
-    fireEvent.click(screen.getAllByRole("button", { name: "Save settings" }).at(-1)!);
-
-    expect(save).toHaveBeenCalledWith(expect.objectContaining({ manual_login_verified: true }));
+    expect(screen.queryByLabelText("Manual SSH login works in PowerShell")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy manual SSH command" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open PowerShell login" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Debug: copy legacy PowerShell SSH command" }))
+      .toBeInTheDocument();
   });
 
   it("marks terminal launch as waiting for user MFA, not authenticated", async () => {
@@ -445,16 +458,16 @@ describe("SettingsPage", () => {
       distro_available: true,
       commands: {
         backend: "wsl",
-        control_path: "$HOME/.fluorcast/ssh/cm-alice-nibi.sock",
+        control_path: "$HOME/.fluorcast/ssh/cm-nibi.sock",
         control_path_exists: false,
-        control_socket_filename: "cm-alice-nibi.sock",
+        control_socket_filename: "cm-nibi.sock",
         script_dir: "$HOME/.fluorcast/scripts",
         start_script_path: "$HOME/.fluorcast/scripts/start-nibi-login.sh",
         check_script_path: "$HOME/.fluorcast/scripts/check-nibi-session.sh",
         end_script_path: "$HOME/.fluorcast/scripts/end-nibi-session.sh",
         clean_script_path: "$HOME/.fluorcast/scripts/clean-nibi-session.sh",
         wsl_distro: "Ubuntu",
-        wsl_key_path: "$HOME/.ssh/fluorcast_nibi_ed25519",
+        wsl_key_path: "/home/alice/.ssh/fluorcast_nibi_ed25519",
         host: "alice@nibi.alliancecan.ca",
         wsl_setup_key_commands: "",
         clean_stale_session_command: "",
@@ -480,16 +493,111 @@ describe("SettingsPage", () => {
       manual_mfa_provider: "controlmaster",
       nibi_username: "alice",
       ssh_private_key_path: "C:\\Users\\Alice\\.ssh\\id_ed25519",
+      wsl_ssh_private_key_path: "/home/alice/.ssh/fluorcast_nibi_ed25519",
     }, { onManualMfaSessionChange });
 
     fireEvent.click(screen.getByRole("button", { name: "Start NIBI session" }));
 
-    expect(await screen.findByText("Windows Terminal opened. Complete password/Duo there, then click Test authenticated session."))
-      .toBeInTheDocument();
+    expect((await screen.findAllByText("Windows Terminal opened. Complete password/Duo there, then click Test authenticated session.")).length)
+      .toBeGreaterThan(0);
     expect(onManualMfaSessionChange).toHaveBeenCalledWith(expect.objectContaining({
       status: "waiting_for_user_mfa",
       can_run_background_commands: false,
     }));
+  });
+
+  it("rapid Start NIBI session clicks launch one session", async () => {
+    let resolveLaunch!: (value: unknown) => void;
+    coreMock.invoke.mockImplementation(() => new Promise((resolve) => {
+      resolveLaunch = resolve;
+    }));
+
+    renderMode("interactive_mfa", {
+      nibi_username: "alice",
+      wsl_ssh_private_key_path: "/home/alice/.ssh/fluorcast_nibi_ed25519",
+    });
+
+    const startButton = screen.getByRole("button", { name: "Start NIBI session" });
+    fireEvent.click(startButton);
+    fireEvent.click(startButton);
+
+    expect(coreMock.invoke).toHaveBeenCalledTimes(1);
+    expect(startButton).toBeDisabled();
+
+    resolveLaunch({
+      launched: true,
+      method: "windows_terminal",
+      message: "Windows Terminal opened.",
+      error_message: "",
+      timestamp: "2026-07-16T10:00:00.000Z",
+      command_preview: "wt.exe",
+      generated_script_path: "$HOME/.fluorcast/scripts/start-nibi-login.sh",
+      script_file_exists: true,
+      launch_method_attempted: "windows_terminal",
+      launch_error_code: "",
+      manual_wsl_command: "",
+      windows_terminal_available: true,
+      powershell_available: true,
+      wsl_available: true,
+      distro_available: true,
+      commands: buildLaunchCommandsFixture(),
+    });
+    await waitFor(() => expect(startButton).toBeEnabled());
+  });
+
+  it("a failed environment check preserves authenticated status", async () => {
+    const onManualMfaSessionChange = vi.fn();
+    coreMock.invoke.mockImplementation(async (command, payload) => {
+      if (command === "test_manual_mfa_session") {
+        return {
+          status: "authenticated",
+          message: "Authenticated WSL NIBI session is ready.\nFLUORCAST_AUTH_OK",
+          control_path: "/home/alice/.fluorcast/ssh/cm-nibi.sock",
+          control_path_exists: true,
+          redacted_command_preview: "wsl.exe -d <distribution> -- bash -s -- <host>",
+          can_run_background_commands: true,
+          last_master_check_result: "MASTER_RUNNING=1",
+          last_auth_ok_result: "FLUORCAST_AUTH_OK",
+          last_session_test_stdout: "WSL_DISTRO=Ubuntu\nWSL_USER=alice\nWSL_HOME=/home/alice\nCONTROL_PATH=/home/alice/.fluorcast/ssh/cm-nibi.sock\nFLUORCAST_AUTH_OK",
+          last_session_test_stderr: "",
+          last_session_test_exit_code: 0,
+          parsed_session_status: "authenticated",
+          selected_backend: "wsl",
+          wsl_available: true,
+          wsl_ssh_available: true,
+        };
+      }
+      return {
+        exit_code: payload.commandSpec.args?.includes("-r") ? 1 : 0,
+        stdout: payload.commandSpec.args?.includes("-r") ? "" : "ok",
+        stderr: payload.commandSpec.args?.includes("-r") ? "not readable" : "",
+        duration_ms: 10,
+        command_label: payload.commandSpec.label,
+        redacted_command_preview: payload.commandSpec.redacted_preview,
+      };
+    });
+
+    renderSettings({
+      connection_mode: "interactive_mfa",
+      nibi_username: "alice",
+      wsl_ssh_private_key_path: "/home/alice/.ssh/fluorcast_nibi_ed25519",
+    }, {
+      manualMfaSession: {
+        ...defaultManualMfaSessionState,
+        status: "authenticated",
+        can_run_background_commands: true,
+      },
+      onManualMfaSessionChange,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Run remote environment checks" }));
+
+    expect(await screen.findByText("Remote project path is not readable.")).toBeInTheDocument();
+    expect(onManualMfaSessionChange).toHaveBeenCalledWith(expect.objectContaining({
+      status: "authenticated",
+      can_run_background_commands: true,
+    }));
+    expect(screen.getByText("authenticated")).toBeInTheDocument();
   });
 
   it("appearance section remains at the bottom and is collapsible", () => {

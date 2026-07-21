@@ -8,14 +8,16 @@ import type { RemoteCommandResult, RemoteCommandSpec } from "./types";
 export type RemoteEnvironmentCheckStatus = "not_run" | "running" | "passed" | "failed";
 
 export type RemoteEnvironmentCheckId =
+  | "authenticated_session"
   | "remote_project_path"
+  | "remote_project_readable"
   | "remote_jobs_path"
-  | "python_environment"
-  | "prediction_script"
-  | "slurm_script"
+  | "remote_jobs_writable"
+  | "python_environment_runs"
   | "sbatch"
   | "squeue"
-  | "sacct";
+  | "sacct"
+  | "prediction_entry_point";
 
 export type RemoteEnvironmentCheckDefinition = {
   id: RemoteEnvironmentCheckId;
@@ -56,10 +58,26 @@ function withSettings(commandSpec: Omit<RemoteCommandSpec, "settings">, settings
 export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): RemoteEnvironmentCheckDefinition[] {
   const trimmed = trimNibiSettings(settings);
   const predictionScriptPath = `${trimmed.remote_project_path}/scripts/run_prediction_job.py`;
-  const slurmScriptPath = `${trimmed.remote_project_path}/slurm/run_prediction_job.sbatch`;
   const jobsCommand = `mkdir -p ${shellQuote(trimmed.remote_jobs_path)} && test -d ${shellQuote(trimmed.remote_jobs_path)}`;
+  const checks: RemoteEnvironmentCheckDefinition[] = [];
 
-  return [
+  if (trimmed.connection_mode === "interactive_mfa") {
+    checks.push({
+      id: "authenticated_session",
+      name: "Authenticated session reuse",
+      optional: false,
+      commandSpec: withSettings({
+        label: "Authenticated session reuse",
+        executable: "fluorcast-session-ready",
+        args: [],
+        redacted_preview: "test_manual_mfa_session",
+      }, trimmed),
+      successMessage: "Authenticated session reuse returned FLUORCAST_AUTH_OK.",
+      failureMessage: "Authenticated session reuse failed.",
+    });
+  }
+
+  checks.push(
     {
       id: "remote_project_path",
       name: "Remote project path exists",
@@ -72,6 +90,19 @@ export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): 
       }, trimmed),
       successMessage: "Remote project path exists.",
       failureMessage: "Remote project path was not found.",
+    },
+    {
+      id: "remote_project_readable",
+      name: "Remote project path is readable",
+      optional: false,
+      commandSpec: withSettings({
+        label: "Remote project path is readable",
+        executable: "test",
+        args: ["-r", trimmed.remote_project_path],
+        redacted_preview: `test -r ${shellQuote(trimmed.remote_project_path)}`,
+      }, trimmed),
+      successMessage: "Remote project path is readable.",
+      failureMessage: "Remote project path is not readable.",
     },
     {
       id: "remote_jobs_path",
@@ -87,43 +118,30 @@ export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): 
       failureMessage: "Remote jobs path could not be created or verified.",
     },
     {
-      id: "python_environment",
-      name: "Python environment exists",
+      id: "remote_jobs_writable",
+      name: "Remote jobs path is writable",
       optional: false,
       commandSpec: withSettings({
-        label: "Python environment exists",
+        label: "Remote jobs path is writable",
         executable: "test",
-        args: ["-x", trimmed.python_environment_path],
-        redacted_preview: `test -x ${shellQuote(trimmed.python_environment_path)}`,
+        args: ["-w", trimmed.remote_jobs_path],
+        redacted_preview: `test -w ${shellQuote(trimmed.remote_jobs_path)}`,
       }, trimmed),
-      successMessage: "Python environment is executable.",
-      failureMessage: "Python environment was not found or is not executable.",
+      successMessage: "Remote jobs path is writable.",
+      failureMessage: "Remote jobs path is not writable.",
     },
     {
-      id: "prediction_script",
-      name: "Prediction script exists",
+      id: "python_environment_runs",
+      name: "Python executable exists and runs",
       optional: false,
       commandSpec: withSettings({
-        label: "Prediction script exists",
-        executable: "test",
-        args: ["-f", predictionScriptPath],
-        redacted_preview: `test -f ${shellQuote(predictionScriptPath)}`,
+        label: "Python executable exists and runs",
+        executable: "fluorcast-python-version",
+        args: [trimmed.python_environment_path],
+        redacted_preview: `${shellQuote(trimmed.python_environment_path)} --version`,
       }, trimmed),
-      successMessage: "Prediction script exists.",
-      failureMessage: "Prediction script was not found.",
-    },
-    {
-      id: "slurm_script",
-      name: "Slurm prediction script exists",
-      optional: false,
-      commandSpec: withSettings({
-        label: "Slurm prediction script exists",
-        executable: "test",
-        args: ["-f", slurmScriptPath],
-        redacted_preview: `test -f ${shellQuote(slurmScriptPath)}`,
-      }, trimmed),
-      successMessage: "Slurm prediction script exists.",
-      failureMessage: "Slurm prediction script was not found.",
+      successMessage: "Python executable runs.",
+      failureMessage: "Python executable was not found or did not run.",
     },
     {
       id: "sbatch",
@@ -154,7 +172,7 @@ export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): 
     {
       id: "sacct",
       name: "sacct is available",
-      optional: true,
+      optional: false,
       commandSpec: withSettings({
         label: "sacct is available",
         executable: "command",
@@ -162,9 +180,24 @@ export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): 
         redacted_preview: "command -v sacct",
       }, trimmed),
       successMessage: "sacct is available.",
-      failureMessage: "sacct is unavailable. Job polling may fall back to squeue/output-file checks.",
+      failureMessage: "sacct is unavailable.",
     },
-  ];
+    {
+      id: "prediction_entry_point",
+      name: "Prediction entry point exists",
+      optional: false,
+      commandSpec: withSettings({
+        label: "Prediction entry point exists",
+        executable: "test",
+        args: ["-f", predictionScriptPath],
+        redacted_preview: `test -f ${shellQuote(predictionScriptPath)}`,
+      }, trimmed),
+      successMessage: "Prediction entry point exists.",
+      failureMessage: "Prediction entry point was not found.",
+    },
+  );
+
+  return checks;
 }
 
 export function createInitialRemoteEnvironmentRows(settings: NibiSettings): RemoteEnvironmentCheckRow[] {

@@ -86,15 +86,6 @@ type RobotAutomationTestResult = {
   stderr: string;
 };
 
-type PersistentShellSessionStatus = {
-  session_id: string;
-  process_id: number | null;
-  started_at: string;
-  status: "not_started" | "connecting" | "waiting_for_login_mfa" | "active" | "failed" | "disconnected";
-  output: string;
-  message: string;
-};
-
 export function SettingsPage({
   accentColor,
   manualMfaSession = defaultManualMfaSessionState,
@@ -115,7 +106,7 @@ export function SettingsPage({
   const [manualMfaStatus, setManualMfaStatus] = useState("");
   const [localSshCapabilities, setLocalSshCapabilities] = useState<LocalSshCapabilitiesResult | null>(null);
   const [isManualMfaWorking, setIsManualMfaWorking] = useState(false);
-  const persistentShellInputRef = useRef<HTMLInputElement | null>(null);
+  const startManualMfaLaunchInFlightRef = useRef(false);
   const [restrictedPublicKey, setRestrictedPublicKey] = useState("");
   const [restrictedPublicKeyStatus, setRestrictedPublicKeyStatus] = useState("");
   const [robotTestStatus, setRobotTestStatus] = useState("");
@@ -135,7 +126,6 @@ export function SettingsPage({
     : null;
   const remoteExecutor = createRemoteExecutor(values.connection_mode);
   const connectionStatus = remoteExecutor.getConnectionStatus(values);
-  const isPersistentShellProvider = values.manual_mfa_provider === "persistent_shell";
 
   useEffect(() => {
     setValues(nibiSettings);
@@ -164,7 +154,7 @@ export function SettingsPage({
     }));
   }
 
-  function updateBooleanField(field: "manual_login_verified" | "robot_access_verified", value: boolean) {
+  function updateBooleanField(field: "robot_access_verified", value: boolean) {
     setValues((current) => ({
       ...current,
       [field]: value,
@@ -224,6 +214,18 @@ export function SettingsPage({
     };
   }
 
+  function createSessionReadinessRemoteEnvironmentResult(result: ManualMfaSessionResult): RemoteCommandResult {
+    return {
+      exit_code: result.can_run_background_commands ? 0 : result.last_session_test_exit_code ?? 1,
+      stdout: result.last_session_test_stdout,
+      stderr: result.can_run_background_commands ? "" : result.message || result.last_session_test_stderr,
+      duration_ms: 0,
+      command_label: "Authenticated session reuse",
+      redacted_command_preview: result.redacted_command_preview,
+      timed_out: result.status === "timeout",
+    };
+  }
+
   async function runRemoteEnvironmentChecks() {
     const trimmed = trimNibiSettings(values);
     const isConnectionReady = isManualMfaMode
@@ -237,10 +239,6 @@ export function SettingsPage({
       return;
     }
 
-    const executor = createRemoteExecutor(trimmed.connection_mode);
-    if (executor instanceof InteractiveMfaRemoteExecutor) {
-      executor.setAuthenticated(isConnectionReady);
-    }
     const definitions = buildRemoteEnvironmentCheckDefinitions(trimmed);
     setRemoteEnvironmentRows(definitions.map((definition) => ({
       ...definition,
@@ -250,6 +248,11 @@ export function SettingsPage({
     setIsRunningRemoteEnvironmentChecks(true);
 
     const completedRows: RemoteEnvironmentCheckRow[] = [];
+    const executor = createRemoteExecutor(trimmed.connection_mode);
+    if (executor instanceof InteractiveMfaRemoteExecutor) {
+      executor.setAuthenticated(isConnectionReady);
+    }
+    let stoppedAfterReadinessFailure = false;
     try {
       for (const definition of definitions) {
         setRemoteEnvironmentRows((current) => current.map((row) => (
@@ -259,13 +262,21 @@ export function SettingsPage({
         )));
 
         let result: RemoteCommandResult;
-        try {
+        if (definition.id === "authenticated_session") {
+          const readiness = await invoke<ManualMfaSessionResult>("test_manual_mfa_session", {
+            settings: trimmed,
+          });
+          updateManualMfaFromResult(readiness, true);
+          result = createSessionReadinessRemoteEnvironmentResult(readiness);
+        } else {
+          try {
           result = await executor.runCommand(definition.commandSpec);
-        } catch (error) {
-          result = createFailedRemoteEnvironmentResult(
-            definition.name,
-            error instanceof Error ? error.message : "Remote environment check could not run.",
-          );
+          } catch (error) {
+            result = createFailedRemoteEnvironmentResult(
+              definition.name,
+              error instanceof Error ? error.message : "Remote environment check could not run.",
+            );
+          }
         }
 
         const completedRow = resultToRemoteEnvironmentRow(definition, result);
@@ -273,9 +284,17 @@ export function SettingsPage({
         setRemoteEnvironmentRows((current) => current.map((row) => (
           row.id === definition.id ? completedRow : row
         )));
+
+        if (definition.id === "authenticated_session" && completedRow.status !== "passed") {
+          setRemoteEnvironmentStatus("Authenticated session reuse failed. Remote environment checks were not run.");
+          stoppedAfterReadinessFailure = true;
+          break;
+        }
       }
 
-      setRemoteEnvironmentStatus(getRemoteEnvironmentReadiness(completedRows).summary);
+      if (!stoppedAfterReadinessFailure) {
+        setRemoteEnvironmentStatus(getRemoteEnvironmentReadiness(completedRows).summary);
+      }
     } finally {
       setIsRunningRemoteEnvironmentChecks(false);
       void executor.dispose();
@@ -427,39 +446,6 @@ export function SettingsPage({
     }
   }
 
-  function updateManualMfaFromPersistentShell(result: PersistentShellSessionStatus) {
-    const authenticated = result.status === "active";
-    const now = new Date().toISOString();
-    onManualMfaSessionChange({
-      ...manualMfaSession,
-      status: authenticated ? "authenticated" : result.status === "disconnected" ? "disconnected" : "waiting_for_user_mfa",
-      parsed_session_status: authenticated ? "authenticated" : "authentication_required",
-      selected_backend: "persistent_shell",
-      session_started_at: result.started_at || manualMfaSession.session_started_at,
-      last_successful_command_at: authenticated ? now : manualMfaSession.last_successful_command_at,
-      last_session_probe_at: now,
-      last_session_test_result: result.message,
-      can_run_background_commands: authenticated,
-      last_master_check_result: result.output,
-      last_auth_ok_result: result.output,
-      last_session_test_stdout: result.output,
-      last_session_test_stderr: "",
-      last_session_test_exit_code: authenticated ? 0 : null,
-      persistent_shell_output: result.output,
-      persistent_shell_process_id: result.process_id,
-    });
-    setManualMfaStatus(result.message);
-    if (authenticated) {
-      const nextSettings = {
-        ...trimNibiSettings(values),
-        manual_login_verified: true,
-        last_manual_login_check_at: now,
-      };
-      setValues(nextSettings);
-      void onNibiSettingsSave(nextSettings);
-    }
-  }
-
   async function copyManualMfaLoginCommand() {
     setManualMfaStatus("");
     try {
@@ -505,15 +491,13 @@ export function SettingsPage({
   }
 
   async function startManualMfaLogin() {
+    if (startManualMfaLaunchInFlightRef.current) {
+      return;
+    }
+    startManualMfaLaunchInFlightRef.current = true;
     setIsManualMfaWorking(true);
     setManualMfaStatus("");
     try {
-      if (isPersistentShellProvider) {
-        updateManualMfaFromPersistentShell(await invoke<PersistentShellSessionStatus>("persistent_shell_start", {
-          settings: trimNibiSettings(values),
-        }));
-        return;
-      }
       const launch = await invoke<ManualMfaTerminalLaunchResult>("open_manual_mfa_login", {
         settings: trimNibiSettings(values),
       });
@@ -525,6 +509,7 @@ export function SettingsPage({
       setManualMfaStatus(error instanceof Error ? error.message : "Could not open a terminal automatically. Copy the WSL login command and run it manually.");
     } finally {
       setIsManualMfaWorking(false);
+      startManualMfaLaunchInFlightRef.current = false;
     }
   }
 
@@ -537,47 +522,6 @@ export function SettingsPage({
       }), true);
     } catch (error) {
       setManualMfaStatus(error instanceof Error ? error.message : "Manual MFA session test could not run.");
-    } finally {
-      setIsManualMfaWorking(false);
-    }
-  }
-
-  async function sendPersistentShellInput() {
-    const input = persistentShellInputRef.current?.value ?? "";
-    if (!input) {
-      return;
-    }
-    if (persistentShellInputRef.current) {
-      persistentShellInputRef.current.value = "";
-    }
-    setIsManualMfaWorking(true);
-    setManualMfaStatus("");
-    try {
-      const result = await invoke<PersistentShellSessionStatus>("persistent_shell_send_input", { input });
-      updateManualMfaFromPersistentShell({
-        ...result,
-        message: "Input sent to persistent NIBI session.",
-      });
-    } catch (error) {
-      setManualMfaStatus(error instanceof Error ? error.message : "Could not send input to the NIBI session.");
-    } finally {
-      setIsManualMfaWorking(false);
-    }
-  }
-
-  async function endManualMfaSession() {
-    setIsManualMfaWorking(true);
-    setManualMfaStatus("");
-    try {
-      if (isPersistentShellProvider) {
-        updateManualMfaFromPersistentShell(await invoke<PersistentShellSessionStatus>("persistent_shell_stop"));
-        return;
-      }
-      updateManualMfaFromResult(await invoke<ManualMfaSessionResult>("end_manual_mfa_session", {
-        settings: trimNibiSettings(values),
-      }));
-    } catch (error) {
-      setManualMfaStatus(error instanceof Error ? error.message : "Manual MFA session could not be ended.");
     } finally {
       setIsManualMfaWorking(false);
     }
@@ -604,6 +548,13 @@ export function SettingsPage({
   const isManualSessionReady = manualMfaSession.status === "authenticated"
     || manualMfaSession.can_run_background_commands;
   const isRobotAutomationReady = values.robot_access_verified;
+  const nibiTarget = `${values.nibi_username || "<username>"}@${values.normal_login_host || "nibi.alliancecan.ca"}`;
+  const resolvedWslUser = manualMfaSession.wsl_user || "Unknown until tested";
+  const resolvedWslHome = manualMfaSession.wsl_home || "Unknown until tested";
+  const resolvedControlPath = manualMfaSession.control_path
+    || displayedManualMfaCommands?.control_path
+    || "$HOME/.fluorcast/ssh/cm-nibi.sock";
+  const mostRecentManualAction = manualMfaStatus || manualMfaSession.last_session_test_result || "No action run yet.";
   const canRunRemoteEnvironmentChecks = isManualMfaMode
     ? isManualSessionReady
     : isRobotAutomationMode && isRobotAutomationReady;
@@ -616,9 +567,6 @@ export function SettingsPage({
   const requiredRemoteEnvironmentFailures = remoteEnvironmentRows.filter((row) => (
     !row.optional && row.status === "failed"
   )).length;
-  const sacctUnavailable = remoteEnvironmentRows.some((row) => (
-    row.id === "sacct" && row.status === "failed"
-  ));
   const remoteEnvironmentHasRun = remoteEnvironmentRows.some((row) => row.status !== "not_run");
   const remoteEnvironmentBadge = isRunningRemoteEnvironmentChecks
     ? "Running"
@@ -636,8 +584,6 @@ export function SettingsPage({
       ? "Running remote environment checks"
       : !remoteEnvironmentHasRun
       ? "Not run yet"
-      : remoteEnvironmentReadiness.ready && sacctUnavailable
-      ? "Remote environment ready; sacct unavailable, polling will use fallback checks."
       : remoteEnvironmentReadiness.ready
       ? "Remote environment ready"
       : `${requiredRemoteEnvironmentFailures || 1} check${(requiredRemoteEnvironmentFailures || 1) === 1 ? "" : "s"} need attention`);
@@ -760,6 +706,18 @@ export function SettingsPage({
             {isManualMfaMode ? (
               <p className="settings-note">Password and Duo may be required each app session.</p>
             ) : null}
+            {isManualMfaMode ? (
+              <label>
+                <span>WSL distribution</span>
+                <input
+                  name="manual_mfa_wsl_distro"
+                  onChange={(event) => updateField("manual_mfa_wsl_distro", event.target.value)}
+                  placeholder="Ubuntu"
+                  value={values.manual_mfa_wsl_distro}
+                />
+                <small>Use the Ubuntu distribution that contains the NIBI SSH key.</small>
+              </label>
+            ) : null}
           </section>
         ) : null}
 
@@ -821,8 +779,35 @@ export function SettingsPage({
         <section className="settings-subsection" aria-labelledby="ssh-key-heading">
           <div className="section-heading compact-heading">
             <h3 id="ssh-key-heading">SSH key</h3>
-            <span>Private key</span>
+            <span>{isManualMfaMode ? "WSL private key" : "Private key"}</span>
           </div>
+        {isManualMfaMode ? (
+        <label>
+          <span>WSL private key path</span>
+          <input
+            aria-describedby="wsl_ssh_private_key_path-help wsl_ssh_private_key_path-error wsl_ssh_private_key_path-warning"
+            aria-invalid={errors.wsl_ssh_private_key_path ? "true" : "false"}
+            name="wsl_ssh_private_key_path"
+            onChange={(event) => updateField("wsl_ssh_private_key_path", event.target.value)}
+            placeholder="/home/<wsl-user>/.ssh/fluorcast_nibi_ed25519"
+            value={values.wsl_ssh_private_key_path}
+          />
+          {errors.wsl_ssh_private_key_path ? (
+            <span className="field-error" id="wsl_ssh_private_key_path-error">
+              {errors.wsl_ssh_private_key_path}
+            </span>
+          ) : null}
+          {warnings.wsl_ssh_private_key_path ? (
+            <span className="field-warning" id="wsl_ssh_private_key_path-warning">
+              {warnings.wsl_ssh_private_key_path}
+            </span>
+          ) : null}
+          <small className="field-help" id="wsl_ssh_private_key_path-help">
+            Use the absolute private-key path inside WSL. The tested path for this workstation is <code>/home/cl/.ssh/fluorcast_nibi_ed25519</code>.
+          </small>
+        </label>
+        ) : null}
+        {isRobotAutomationMode ? (
         <label>
           <span>Private SSH key file</span>
           <div className="field-with-button">
@@ -872,6 +857,7 @@ export function SettingsPage({
             connect to NIBI.
           </small>
         </label>
+        ) : null}
         {isRobotAutomationMode ? (
           <div>
             <span className="step-label">Expected public key path</span>
@@ -897,55 +883,7 @@ export function SettingsPage({
         </section>
         ) : null}
 
-        {isManualMfaMode ? (
-        <details className="help-disclosure">
-          <summary>Manual MFA provider settings</summary>
-          <label>
-            <span>Manual MFA provider</span>
-            <select
-              name="manual_mfa_provider"
-              onChange={(event) => updateField("manual_mfa_provider", event.target.value)}
-              value={values.manual_mfa_provider}
-            >
-              <option value="terminal_action">Terminal action recommended</option>
-              <option value="persistent_shell">Persistent shell legacy</option>
-              <option value="controlmaster">ControlMaster legacy experimental</option>
-            </select>
-            <small>Terminal action opens PowerShell for each NIBI action. Persistent shell and ControlMaster are legacy reusable-session paths.</small>
-          </label>
-          <div className="field-row">
-          <label>
-            <span>WSL private key path</span>
-            <input
-              name="wsl_ssh_private_key_path"
-              onChange={(event) => updateField("wsl_ssh_private_key_path", event.target.value)}
-              value={values.wsl_ssh_private_key_path}
-            />
-          </label>
-          <label>
-            <span>WSL control socket path</span>
-            <input
-              name="wsl_control_socket_path"
-              onChange={(event) => updateField("wsl_control_socket_path", event.target.value)}
-              value={values.wsl_control_socket_path}
-            />
-          </label>
-          </div>
-
-        <label>
-          <span>WSL distro</span>
-          <input
-            name="manual_mfa_wsl_distro"
-            onChange={(event) => updateField("manual_mfa_wsl_distro", event.target.value)}
-            placeholder="Ubuntu"
-            value={values.manual_mfa_wsl_distro}
-          />
-          <small>Use Ubuntu by default. Leave blank to use the default WSL distro.</small>
-        </label>
-        </details>
-        ) : null}
-
-        {!isMockMode ? (
+        {isRobotAutomationMode ? (
         <>
         <details className="help-disclosure">
           <summary>{isRobotAutomationMode ? "How to upload public key to Alliance/CCDB" : "How to set up SSH key"}</summary>
@@ -1112,7 +1050,7 @@ export function SettingsPage({
         </details>
         ) : null}
 
-        {!isMockMode ? (
+        {isRobotAutomationMode ? (
         <section className="remote-environment-panel" aria-labelledby="remote-environment-heading">
           <button
             aria-expanded={isRemoteEnvironmentOpen}
@@ -1220,202 +1158,134 @@ export function SettingsPage({
         {isManualMfaMode ? (
         <section className="manual-login-panel" aria-labelledby="manual-login-heading">
           <div>
-            <h3 id="manual-login-heading">Manual MFA Login</h3>
-            {values.manual_mfa_provider === "terminal_action" ? (
-              <p>
-                Manual MFA mode runs each NIBI action in a visible PowerShell window. Complete password and Duo when prompted.
-                It does not reuse login sessions, so each remote action may ask again. This is slower but reliable; robot automation removes repeated MFA once enabled.
-              </p>
-            ) : isPersistentShellProvider ? (
-              <p>
-                Start a live NIBI SSH session, enter your password and Duo response here, then test readiness.
-                FluorCast keeps this session open for upload, submission, and polling.
-              </p>
-            ) : (
-              <p>
-                Start an experimental reusable ControlMaster login, enter your password and Duo/MFA there,
-                then test whether FluorCast can reuse the SSH control session.
-              </p>
-            )}
+            <h3 id="manual-login-heading">NIBI Session</h3>
+            <p>Start one WSL SSH ControlMaster session, then verify FluorCast can reuse it without another password or Duo prompt.</p>
           </div>
+
           <div className="diagnostic-grid">
-            <div><span className="step-label">Normal login host</span><code>{values.normal_login_host || "Not configured"}</code></div>
-            <div><span className="step-label">Username</span><code>{values.nibi_username || "Not configured"}</code></div>
-            <div><span className="step-label">Private key path</span><code>{values.ssh_private_key_path || "Not configured"}</code></div>
-            <div><span className="step-label">Manual MFA provider</span><strong>{values.manual_mfa_provider.replaceAll("_", " ")}</strong></div>
-            <div><span className="step-label">WSL key path</span><code>{values.wsl_ssh_private_key_path}</code></div>
-            <div><span className="step-label">WSL distro</span><code>{values.manual_mfa_wsl_distro || "Default WSL"}</code></div>
-            <div><span className="step-label">Login status</span><strong>{manualMfaSession.status.replaceAll("_", " ")}</strong></div>
-            <div><span className="step-label">Parsed session status</span><strong>{manualMfaSession.parsed_session_status.replaceAll("_", " ")}</strong></div>
-            <div><span className="step-label">Control path</span><code>{manualMfaSession.control_path || displayedManualMfaCommands?.control_path || "Created when login starts"}</code></div>
-            <div><span className="step-label">Control path exists</span><strong>{manualMfaSession.control_path_exists === null ? "Unknown" : manualMfaSession.control_path_exists ? "Yes" : "No"}</strong></div>
-            <div><span className="step-label">Background commands</span><strong>{manualMfaSession.can_run_background_commands ? "Ready" : "Blocked"}</strong></div>
-            <div><span className="step-label">Last login launch</span><code>{manualMfaSession.last_terminal_launch_at || "None"}</code></div>
-            <div><span className="step-label">Last session test</span><code>{manualMfaSession.last_session_probe_at || "None"}</code></div>
-            <div><span className="step-label">Last test exit code</span><strong>{manualMfaSession.last_session_test_exit_code ?? "None"}</strong></div>
+            <div><span className="step-label">WSL distribution</span><code>{values.manual_mfa_wsl_distro || "Ubuntu"}</code></div>
+            <div><span className="step-label">Resolved WSL user</span><code>{resolvedWslUser}</code></div>
+            <div><span className="step-label">Resolved WSL HOME</span><code>{resolvedWslHome}</code></div>
+            <div><span className="step-label">NIBI target</span><code>{nibiTarget}</code></div>
+            <div><span className="step-label">Resolved ControlPath</span><code>{resolvedControlPath}</code></div>
+            <div><span className="step-label">Session status</span><strong>{manualMfaSession.status.replaceAll("_", " ")}</strong></div>
+            <div><span className="step-label">Most recent action result</span><strong>{mostRecentManualAction}</strong></div>
           </div>
-          {isPersistentShellProvider ? (
-            <section className="remote-environment-panel" aria-label="Persistent NIBI session console">
-              <div className="section-heading compact-heading">
-                <h3>NIBI Session</h3>
-                <span>{manualMfaSession.status.replaceAll("_", " ")}</span>
-              </div>
-              <pre className="terminal-output">{manualMfaSession.persistent_shell_output || "Start the NIBI session to see SSH output."}</pre>
-              <div className="field-with-button">
-                <input
-                  aria-label="NIBI session input"
-                  autoComplete="off"
-                  ref={persistentShellInputRef}
-                  type="password"
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      void sendPersistentShellInput();
-                    }
-                  }}
-                />
-                <button className="secondary-button" disabled={isManualMfaWorking} onClick={sendPersistentShellInput} type="button">
-                  Send
-                </button>
-              </div>
-            </section>
-          ) : null}
-          {!isPersistentShellProvider && displayedManualMfaCommands ? (
-            <section className="remote-environment-panel" aria-label="Manual MFA session diagnostics">
-              <div className="section-heading compact-heading">
-                <h3>Manual MFA session diagnostics</h3>
-                <span>{manualMfaSession.parsed_session_status.replaceAll("_", " ")}</span>
-              </div>
-              <p className="settings-note">Generated reusable login command</p>
-              <pre>{displayedManualMfaCommands.login_command}</pre>
-              <p className="settings-note">Generated session test command</p>
-              <pre>{displayedManualMfaCommands.test_command}</pre>
-              <div className="diagnostic-grid">
-                <div><span className="step-label">Session test stdout</span><pre>{manualMfaSession.last_session_test_stdout || "(empty)"}</pre></div>
-                <div><span className="step-label">Session test stderr</span><pre>{manualMfaSession.last_session_test_stderr || "(empty)"}</pre></div>
-                <div><span className="step-label">Master check output</span><pre>{manualMfaSession.last_master_check_result || "(empty)"}</pre></div>
-                <div><span className="step-label">FLUORCAST_AUTH_OK output</span><pre>{manualMfaSession.last_auth_ok_result || "(empty)"}</pre></div>
-              </div>
-            </section>
-          ) : null}
+
           <div className="button-row manual-login-actions">
-            {!isPersistentShellProvider ? (
-              <>
-                <button className="secondary-button" onClick={copyManualMfaLoginCommand} type="button">
-                  Copy login command
-                </button>
-                <button className="secondary-button" onClick={copyManualMfaSessionTestCommand} type="button">
-                  Copy session test command
-                </button>
-                <button className="secondary-button" disabled={isManualMfaWorking} onClick={checkLocalSshCapabilities} type="button">
-                  Check local SSH capabilities
-                </button>
-              </>
-            ) : null}
-            {values.manual_mfa_provider !== "terminal_action" ? (
-              <button className="secondary-button" disabled={isManualMfaWorking} onClick={startManualMfaLogin} type="button">
-                Start NIBI session
-              </button>
-            ) : null}
-            {!isPersistentShellProvider && values.manual_mfa_provider !== "terminal_action" ? (
-              <button className="secondary-button" disabled={isManualMfaWorking} onClick={cleanStaleManualMfaSession} type="button">
-                Clean stale WSL session
-              </button>
-            ) : null}
-            {values.manual_mfa_provider !== "terminal_action" ? (
-              <>
-                <button className="secondary-button" disabled={isManualMfaWorking} onClick={testManualMfaSession} type="button">
-                  Test session readiness
-                </button>
-                <button className="secondary-button" disabled={isManualMfaWorking} onClick={endManualMfaSession} type="button">
-                  End NIBI session
-                </button>
-              </>
-            ) : null}
-          </div>
-          <div className="button-row manual-login-actions">
-            <button className="secondary-button" onClick={copyManualSshCommand} type="button">
-              Copy manual SSH command
+            <button className="secondary-button" disabled={isManualMfaWorking} onClick={cleanStaleManualMfaSession} type="button">
+              Clean stale WSL session
             </button>
-            <button className="secondary-button" onClick={openPowerShellLogin} type="button">
-              Open PowerShell login
+            <button className="secondary-button" disabled={isManualMfaWorking} onClick={startManualMfaLogin} type="button">
+              Start NIBI session
+            </button>
+            <button className="secondary-button" disabled={isManualMfaWorking} onClick={testManualMfaSession} type="button">
+              Test authenticated session
+            </button>
+            <button
+              className="secondary-button"
+              disabled={!canRunRemoteEnvironmentChecks || isRunningRemoteEnvironmentChecks}
+              onClick={runRemoteEnvironmentChecks}
+              type="button"
+            >
+              {isRunningRemoteEnvironmentChecks ? "Running remote environment checks" : "Run remote environment checks"}
             </button>
           </div>
-          <label className="checkbox-label">
-            <input
-              checked={values.manual_login_verified}
-              name="manual_login_verified"
-              onChange={(event) => updateBooleanField("manual_login_verified", event.target.checked)}
-              type="checkbox"
-            />
-            <span>Manual SSH login works in PowerShell</span>
-          </label>
-          {manualCommandStatus ? (
-            <p className="connection-test-status" role="status">
-              {manualCommandStatus}
-            </p>
-          ) : null}
+
           {manualMfaStatus || manualMfaSession.last_session_test_result ? (
             <p className="connection-test-status" role="status">
               {manualMfaStatus || manualMfaSession.last_session_test_result}
             </p>
           ) : null}
-          {localSshCapabilities ? (
-            <details className="help-disclosure" open>
-              <summary>Local SSH capabilities</summary>
-              <div>
-                <p>ssh version:</p>
-                <pre>{localSshCapabilities.ssh_version || "(empty)"}</pre>
-                <p>Platform:</p>
-                <pre>{localSshCapabilities.platform}</pre>
-                <p>ControlMaster attempted: {localSshCapabilities.attempted_controlmaster ? "yes" : "no"}</p>
-                <p>ControlMaster supported: {localSshCapabilities.controlmaster_supported === null ? "unknown" : localSshCapabilities.controlmaster_supported ? "yes" : "no"}</p>
-                <p>Syntax exit code: {localSshCapabilities.syntax_exit_code ?? "None"}</p>
-                <p>stdout:</p>
-                <pre>{localSshCapabilities.syntax_stdout || "(empty)"}</pre>
-                <p>stderr:</p>
-                <pre>{localSshCapabilities.syntax_stderr || "(empty)"}</pre>
-                <p>{localSshCapabilities.recommendation}</p>
-              </div>
-            </details>
+          {remoteEnvironmentDisabledMessage ? (
+            <p className="connection-test-status">{remoteEnvironmentDisabledMessage}</p>
           ) : null}
-          {displayedManualMfaCommands ? (
-            <details className="help-disclosure">
-              <summary>WSL Manual MFA debug commands</summary>
-              <div>
-                <p>WSL setup key commands:</p>
-                <pre>{displayedManualMfaCommands.wsl_setup_key_commands}</pre>
-                <p>Clean stale session command:</p>
-                <pre>{displayedManualMfaCommands.clean_stale_session_command}</pre>
-                <p>Start login script path:</p>
-                <pre>{displayedManualMfaCommands.start_script_path}</pre>
-                <p>Manual WSL login command:</p>
-                <pre>{displayedManualMfaCommands.manual_wsl_login_command}</pre>
-                <p>Start master login script content:</p>
-                <pre>{displayedManualMfaCommands.login_command}</pre>
-                <p>Open with Windows Terminal command:</p>
-                <pre>{displayedManualMfaCommands.windows_terminal_command}</pre>
-                <p>Open with PowerShell command:</p>
-                <pre>{displayedManualMfaCommands.powershell_launch_command}</pre>
-                <p>Raw WSL login command:</p>
-                <pre>{displayedManualMfaCommands.login_command}</pre>
-                <p>Check master command:</p>
-                <pre>{displayedManualMfaCommands.check_command}</pre>
-                <p>Check master script content:</p>
-                <pre>{displayedManualMfaCommands.check_script_content}</pre>
-                <p>Test FLUORCAST_AUTH_OK command:</p>
-                <pre>{displayedManualMfaCommands.test_command}</pre>
-                <p>End session command:</p>
-                <pre>{displayedManualMfaCommands.end_command}</pre>
-                <p>End session script content:</p>
-                <pre>{displayedManualMfaCommands.end_script_content}</pre>
-                <p>Clean stale session script content:</p>
-                <pre>{displayedManualMfaCommands.clean_script_content}</pre>
-                <p>Background command template:</p>
-                <pre>{displayedManualMfaCommands.background_command_template}</pre>
-              </div>
-            </details>
+          {remoteEnvironmentStatus ? (
+            <p className="connection-test-status" role="status">{remoteEnvironmentStatus}</p>
           ) : null}
+
+          <ol className="remote-checklist" aria-label="Remote environment check results">
+            {remoteEnvironmentRows.map((row) => (
+              <li className={`remote-check-${row.status}`} key={row.id}>
+                <div className="remote-check-row">
+                  <div>
+                    <strong>{row.name}</strong>
+                    <p>{row.message}</p>
+                  </div>
+                  <span>{row.status.replaceAll("_", " ")}</span>
+                </div>
+                <details className="remote-check-details">
+                  <summary>Technical details</summary>
+                  <dl>
+                    <dt>Command</dt>
+                    <dd><code>{row.result?.redacted_command_preview || row.commandSpec.redacted_preview || row.commandSpec.executable}</code></dd>
+                    <dt>Exit code</dt>
+                    <dd>{row.result?.exit_code ?? "Not run"}</dd>
+                    <dt>stdout</dt>
+                    <dd><pre>{row.result?.stdout || "(empty)"}</pre></dd>
+                    <dt>stderr</dt>
+                    <dd><pre>{row.result?.stderr || "(empty)"}</pre></dd>
+                  </dl>
+                </details>
+              </li>
+            ))}
+          </ol>
+
+          <details className="help-disclosure" data-testid="advanced-session-diagnostics">
+            <summary>Advanced session diagnostics</summary>
+            <div>
+              <div className="button-row manual-login-actions">
+                <button className="secondary-button" onClick={copyManualMfaLoginCommand} type="button">
+                  Copy generated login script
+                </button>
+                <button className="secondary-button" onClick={copyManualMfaSessionTestCommand} type="button">
+                  Copy generated session-test script
+                </button>
+                <button className="secondary-button" disabled={isManualMfaWorking} onClick={checkLocalSshCapabilities} type="button">
+                  Debug: check legacy PowerShell SSH capabilities
+                </button>
+                <button className="secondary-button" onClick={copyManualSshCommand} type="button">
+                  Debug: copy legacy PowerShell SSH command
+                </button>
+                <button className="secondary-button" onClick={openPowerShellLogin} type="button">
+                  Debug: open legacy PowerShell SSH login
+                </button>
+              </div>
+              {manualCommandStatus ? (
+                <p className="connection-test-status" role="status">{manualCommandStatus}</p>
+              ) : null}
+              {displayedManualMfaCommands ? (
+                <>
+                  <p className="settings-note">Generated login script</p>
+                  <pre>{displayedManualMfaCommands.login_command}</pre>
+                  <p className="settings-note">Generated session-test script</p>
+                  <pre>{displayedManualMfaCommands.test_command}</pre>
+                  <p>Clean stale session script</p>
+                  <pre>{displayedManualMfaCommands.clean_script_content}</pre>
+                  <p>Open with Windows Terminal command</p>
+                  <pre>{displayedManualMfaCommands.windows_terminal_command}</pre>
+                  <p>Open with PowerShell command</p>
+                  <pre>{displayedManualMfaCommands.powershell_launch_command}</pre>
+                </>
+              ) : null}
+              <div className="diagnostic-grid">
+                <div><span className="step-label">stdout</span><pre>{manualMfaSession.last_session_test_stdout || "(empty)"}</pre></div>
+                <div><span className="step-label">stderr</span><pre>{manualMfaSession.last_session_test_stderr || "(empty)"}</pre></div>
+                <div><span className="step-label">Exit code</span><strong>{manualMfaSession.last_session_test_exit_code ?? "None"}</strong></div>
+                <div><span className="step-label">Master-check output</span><pre>{manualMfaSession.last_master_check_result || "(empty)"}</pre></div>
+                <div><span className="step-label">Authentication-marker output</span><pre>{manualMfaSession.last_auth_ok_result || "(empty)"}</pre></div>
+              </div>
+              {localSshCapabilities ? (
+                <div>
+                  <p>Legacy PowerShell diagnostics</p>
+                  <pre>{localSshCapabilities.ssh_version || "(empty)"}</pre>
+                  <pre>{localSshCapabilities.syntax_stdout || "(empty)"}</pre>
+                  <pre>{localSshCapabilities.syntax_stderr || "(empty)"}</pre>
+                  <p>{localSshCapabilities.recommendation}</p>
+                </div>
+              ) : null}
+            </div>
+          </details>
         </section>
         ) : null}
 

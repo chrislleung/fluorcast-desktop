@@ -14,7 +14,7 @@ const settings = {
   nibi_username: "alice",
   normal_login_host: "nibi.alliancecan.ca",
   ssh_private_key_path: "C:\\Users\\Alice\\.ssh\\fluorcast_nibi_ed25519",
-  wsl_ssh_private_key_path: "$HOME/.ssh/fluorcast_nibi_ed25519",
+  wsl_ssh_private_key_path: "/home/alice/.ssh/fluorcast_nibi_ed25519",
   wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-alice-nibi.sock",
   manual_mfa_wsl_distro: "Ubuntu",
 };
@@ -24,43 +24,50 @@ describe("manual MFA session helpers", () => {
     const commands = buildManualMfaSessionCommands(settings);
 
     expect(commands.backend).toBe("wsl");
+    expect(commands.control_path).toBe("$HOME/.fluorcast/ssh/cm-nibi.sock");
     expect(commands.start_script_path).toBe("$HOME/.fluorcast/scripts/start-nibi-login.sh");
     expect(commands.start_script_path.startsWith("$HOME/.fluorcast/scripts/")).toBe(true);
-    expect(commands.login_command).toContain("ctl=\"$HOME/.fluorcast/ssh/cm-alice-nibi.sock\"");
-    expect(commands.login_command).toContain("key=\"$HOME/.ssh/fluorcast_nibi_ed25519\"");
-    expect(commands.login_command).toContain("host=\"alice@nibi.alliancecan.ca\"");
+    expect(commands.login_command).toContain('CTL="$HOME/.fluorcast/ssh/cm-nibi.sock"');
+    expect(commands.login_command).toContain('KEY="$2"');
+    expect(commands.login_command).toContain('HOST="$1"');
+    expect(commands.login_command).toContain('[[ "$KEY" != /* ]]');
     expect(commands.login_command).toContain("ssh -fMN");
-    expect(commands.login_command).toContain('-S "$ctl"');
+    expect(commands.login_command).toContain('-S "$CTL"');
     expect(commands.login_command).toContain("-o ControlMaster=yes");
-    expect(commands.login_command).toContain('-o ControlPath="$ctl"');
+    expect(commands.login_command).toContain('-o ControlPath="$CTL"');
     expect(commands.login_command).toContain("-o ControlPersist=4h");
     expect(commands.login_command).not.toContain("pkill -f");
-    expect(commands.login_command).toContain('ssh -S "$ctl" -O check "$host" >/dev/null 2>&1');
+    expect(commands.login_command).toContain('ssh -S "$CTL" -O check "$HOST" >/dev/null 2>&1');
     expect(commands.login_command).toContain("An active FluorCast NIBI session already exists.");
-    expect(commands.login_command.indexOf('ssh -S "$ctl" -O check "$host"'))
-      .toBeLessThan(commands.login_command.indexOf('rm -f "$ctl"'));
+    expect(commands.login_command.indexOf('ssh -S "$CTL" -O check "$HOST"'))
+      .toBeLessThan(commands.login_command.indexOf('rm -f "$CTL"'));
   });
 
   it("generates WSL check, test, and end commands", () => {
     const commands = buildManualMfaSessionCommands(settings);
 
-    expect(commands.check_command).toBe("bash $HOME/.fluorcast/scripts/check-nibi-session.sh");
-    expect(commands.check_script_content).toContain('ssh -S "$ctl" -O check "$host"');
-    expect(commands.test_command).toContain('ssh -S "$ctl" -o BatchMode=yes "$host" "echo FLUORCAST_AUTH_OK"');
+    expect(commands.check_command).toBe('wsl.exe -d "Ubuntu" -- bash -s -- "alice@nibi.alliancecan.ca"');
+    expect(commands.check_script_content).toContain('ssh -S "$CTL" -O check "$HOST"');
+    expect(commands.test_command).toContain('printf \'FLUORCAST_AUTH_OK\\n\'');
+    expect(commands.test_command).not.toContain("KEY=");
     expect(commands.end_command).toBe("bash $HOME/.fluorcast/scripts/end-nibi-session.sh");
-    expect(commands.end_script_content).toContain('ssh -S "$ctl" -O exit "$host"');
+    expect(commands.end_script_content).toContain('ssh -S "$CTL" -O exit "$HOST"');
   });
 
   it("generates terminal launch commands with configured distro", () => {
     const commands = buildManualMfaSessionCommands(settings);
 
     expect(commands.windows_terminal_command).toContain("wt.exe new-tab");
-    expect(commands.windows_terminal_command).toContain("wsl.exe -d \"Ubuntu\" -- bash -lc \"bash $HOME/.fluorcast/scripts/start-nibi-login.sh\"");
+    expect(commands.windows_terminal_command).toContain("wsl.exe -d \"Ubuntu\" -- bash -c");
+    expect(commands.windows_terminal_command).toContain("start-nibi-login.sh");
+    expect(commands.windows_terminal_command).toContain("alice@nibi.alliancecan.ca");
+    expect(commands.windows_terminal_command).toContain("<wsl_private_key_path>");
     expect(commands.windows_terminal_command).not.toContain("An active FluorCast NIBI session already exists.");
     expect(commands.windows_terminal_command).not.toContain("ssh -fMN");
     expect(commands.powershell_launch_command).toContain("powershell.exe -NoProfile");
     expect(commands.powershell_launch_command).toContain("Start-Process powershell.exe");
-    expect(commands.powershell_launch_command).toContain("wsl.exe -d \"Ubuntu\" -- bash -lc \"bash $HOME/.fluorcast/scripts/start-nibi-login.sh\"");
+    expect(commands.powershell_launch_command).toContain("wsl.exe -d \"Ubuntu\" -- bash -c");
+    expect(commands.powershell_launch_command).toContain("start-nibi-login.sh");
     expect(commands.powershell_launch_command).not.toContain("An active FluorCast NIBI session already exists.");
     expect(commands.powershell_launch_command).not.toContain("ssh -fMN");
     expect(commands.powershell_launch_command).toContain("-NoExit");
@@ -71,30 +78,26 @@ describe("manual MFA session helpers", () => {
 
     expect(commands.clean_script_content).not.toContain("pkill -f");
     expect(commands.clean_stale_session_command).toBe("bash $HOME/.fluorcast/scripts/clean-nibi-session.sh");
-    expect(commands.clean_script_content).toContain('ssh -S "$ctl" -O exit "$host" 2>/dev/null || true');
-    expect(commands.clean_script_content).toContain('rm -f "$ctl"');
+    expect(commands.clean_script_content).toContain('ssh -S "$CTL" -O exit "$HOST" >/dev/null 2>&1 || true');
+    expect(commands.clean_script_content).toContain('rm -f "$CTL"');
     expect(commands.clean_script_content).toContain('mkdir -p "$HOME/.fluorcast/ssh"');
+    expect(commands.clean_script_content).toContain('CLEAN_RESULT=SESSION_REMOVED');
   });
 
-  it("defines ctl key and host inside every copied debug command block", () => {
+  it("passes configurable values as positional arguments in generated scripts", () => {
     const commands = buildManualMfaSessionCommands(settings);
 
-    for (const command of [
-      commands.login_command,
-      commands.test_command,
-      commands.clean_script_content,
-      commands.check_script_content,
-      commands.end_script_content,
-    ]) {
-      expect(command).toContain("ctl=");
-      expect(command).toContain("key=");
-      expect(command).toContain("host=");
-    }
+    expect(commands.login_command).toContain('HOST="$1"');
+    expect(commands.login_command).toContain('KEY="$2"');
+    expect(commands.check_script_content).toContain('HOST="$1"');
+    expect(commands.clean_script_content).toContain('HOST="$1"');
+    expect(commands.login_command).not.toContain("alice@nibi.alliancecan.ca");
+    expect(commands.test_command).not.toContain("/home/alice/.ssh/fluorcast_nibi_ed25519");
   });
 
   it("background remote command uses BatchMode=yes", () => {
     expect(buildWslBackgroundCommand(settings, "hostname")).toContain(
-      'ssh -S "$ctl" -o BatchMode=yes "$host" "hostname"',
+      'ssh -S "$CTL" -o ControlMaster=no -o BatchMode=yes "$HOST" "$REMOTE_COMMAND"',
     );
   });
 

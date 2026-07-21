@@ -2,6 +2,7 @@ import { getSetting, saveSetting } from "../../lib/db";
 import type { RemoteConnectionMode } from "../../lib/remote/types";
 
 export const NIBI_SETTINGS_KEY = "nibiSettings";
+export const CANONICAL_WSL_CONTROL_SOCKET_PATH = "$HOME/.fluorcast/ssh/cm-nibi.sock";
 
 export const connectionModes = ["mock", "interactive_mfa", "robot_automation"] as const;
 export type ConnectionMode = (typeof connectionModes)[number];
@@ -41,7 +42,7 @@ export type NibiSettingsWarnings = Partial<Record<keyof NibiSettings, string>>;
 export const defaultNibiSettings: NibiSettings = {
   connection_mode: "mock",
   backend_mode: "mock",
-  manual_mfa_provider: "terminal_action",
+  manual_mfa_provider: "controlmaster",
   manual_mfa_ssh_backend: "wsl",
   manual_mfa_wsl_distro: "Ubuntu",
   nibi_username: "user",
@@ -52,7 +53,7 @@ export const defaultNibiSettings: NibiSettings = {
   nibi_host: "nibi.alliancecan.ca",
   ssh_private_key_path: "",
   wsl_ssh_private_key_path: "$HOME/.ssh/fluorcast_nibi_ed25519",
-  wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-user-nibi.sock",
+  wsl_control_socket_path: CANONICAL_WSL_CONTROL_SOCKET_PATH,
   ssh_key_path: "",
   remote_project_path: "/home/user/scratch/FluorCast",
   remote_jobs_path: "/home/user/scratch/fluorcast-jobs",
@@ -88,10 +89,10 @@ function normalizeConnectionMode(value: Record<string, unknown>): RemoteConnecti
 }
 
 function normalizeManualMfaProvider(value: unknown): NibiSettings["manual_mfa_provider"] {
-  if (value === "terminal_action" || value === "persistent_shell" || value === "controlmaster" || value === "windows_openssh" || value === "wsl_openssh") {
+  if (value === "terminal_action" || value === "persistent_shell" || value === "controlmaster" || value === "wsl_openssh") {
     return value;
   }
-  return "terminal_action";
+  return "controlmaster";
 }
 
 export function safeWslControlSocketName(username: string, host: string): string {
@@ -104,7 +105,8 @@ export function safeWslControlSocketName(username: string, host: string): string
 }
 
 export function defaultWslControlSocketPath(settings: Pick<NibiSettings, "nibi_username" | "normal_login_host">): string {
-  return `$HOME/.fluorcast/ssh/${safeWslControlSocketName(settings.nibi_username, settings.normal_login_host)}`;
+  void settings;
+  return CANONICAL_WSL_CONTROL_SOCKET_PATH;
 }
 
 export function isAbsolutePath(path: string): boolean {
@@ -134,10 +136,10 @@ export function normalizeNibiSettings(value: unknown): NibiSettings {
     defaultNibiSettings.ssh_private_key_path,
   );
   const username = stringValue(value.nibi_username, defaultNibiSettings.nibi_username);
-  const wslControlSocketPath = stringValue(
-    value.wsl_control_socket_path,
-    defaultWslControlSocketPath({ nibi_username: username, normal_login_host: normalLoginHost }),
-  );
+  const wslControlSocketPath = defaultWslControlSocketPath({
+    nibi_username: username,
+    normal_login_host: normalLoginHost,
+  });
   const manualLoginVerified = booleanValue(
     value.manual_login_verified ?? value.manual_ssh_login_confirmed,
     defaultNibiSettings.manual_login_verified,
@@ -216,10 +218,11 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
     if (trimmed.connection_mode === "robot_automation" && !trimmed.robot_login_host) {
       errors.robot_login_host = "Robot login host is required for robot automation mode.";
     }
-    if (trimmed.connection_mode !== "mock" && !trimmed.ssh_private_key_path) {
-      errors.ssh_private_key_path = trimmed.connection_mode === "interactive_mfa"
-        ? "SSH key path is required for manual MFA mode."
-        : "SSH key path is required for robot automation mode.";
+    if (trimmed.connection_mode === "interactive_mfa" && !trimmed.wsl_ssh_private_key_path) {
+      errors.wsl_ssh_private_key_path = "WSL private key path is required for manual MFA mode.";
+    }
+    if (trimmed.connection_mode === "robot_automation" && !trimmed.ssh_private_key_path) {
+      errors.ssh_private_key_path = "SSH key path is required for robot automation mode.";
       errors.ssh_key_path = errors.ssh_private_key_path;
     }
   }
@@ -228,7 +231,7 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
     ? []
     : trimmed.connection_mode === "interactive_mfa"
     ? [
-      "ssh_private_key_path",
+      "wsl_ssh_private_key_path",
       "remote_project_path",
       "remote_jobs_path",
       "python_environment_path",
@@ -246,6 +249,14 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
     if (trimmed[field] && hasShellMetacharacters(trimmed[field])) {
       errors[field] = "Path contains unsupported shell metacharacters.";
     }
+  }
+
+  if (
+    trimmed.connection_mode === "interactive_mfa"
+    && trimmed.wsl_ssh_private_key_path
+    && !trimmed.wsl_ssh_private_key_path.startsWith("/")
+  ) {
+    errors.wsl_ssh_private_key_path = "WSL private key path must be an absolute Linux path.";
   }
 
   if (trimmed.connection_mode !== "mock") {
@@ -277,6 +288,9 @@ export function validateNibiSettingsWarnings(settings: NibiSettings): NibiSettin
     warnings.ssh_private_key_path = PUBLIC_SSH_KEY_WARNING;
     warnings.ssh_key_path = PUBLIC_SSH_KEY_WARNING;
   }
+  if (trimmed.wsl_ssh_private_key_path && isPublicSshKeyPath(trimmed.wsl_ssh_private_key_path)) {
+    warnings.wsl_ssh_private_key_path = PUBLIC_SSH_KEY_WARNING;
+  }
 
   return warnings;
 }
@@ -302,8 +316,10 @@ export function trimNibiSettings(settings: NibiSettings): NibiSettings {
     nibi_host: normalLoginHost,
     ssh_private_key_path: sshPrivateKeyPath,
     wsl_ssh_private_key_path: settings.wsl_ssh_private_key_path.trim(),
-    wsl_control_socket_path: settings.wsl_control_socket_path.trim()
-      || defaultWslControlSocketPath({ nibi_username: username, normal_login_host: normalLoginHost }),
+    wsl_control_socket_path: defaultWslControlSocketPath({
+      nibi_username: username,
+      normal_login_host: normalLoginHost,
+    }),
     ssh_key_path: sshPrivateKeyPath,
     remote_project_path: settings.remote_project_path.trim(),
     remote_jobs_path: settings.remote_jobs_path.trim(),

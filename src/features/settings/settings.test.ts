@@ -25,7 +25,7 @@ describe("NIBI settings validation", () => {
   it("uses generic NIBI defaults", () => {
     expect(defaultNibiSettings).toMatchObject({
       connection_mode: "mock",
-      manual_mfa_provider: "terminal_action",
+      manual_mfa_provider: "controlmaster",
       manual_mfa_ssh_backend: "wsl",
       nibi_username: "user",
       normal_login_host: "nibi.alliancecan.ca",
@@ -33,7 +33,7 @@ describe("NIBI settings validation", () => {
       robot_key_restriction_from: "134.153.150.*",
       robot_key_forced_command: "/cvmfs/soft.computecanada.ca/custom/bin/computecanada/allowed_commands/allowed_commands.sh",
       wsl_ssh_private_key_path: "$HOME/.ssh/fluorcast_nibi_ed25519",
-      wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-user-nibi.sock",
+      wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-nibi.sock",
       remote_project_path: "/home/user/scratch/FluorCast",
       remote_jobs_path: "/home/user/scratch/fluorcast-jobs",
       python_environment_path: "/home/user/scratch/FluorCast/.venv/bin/python",
@@ -43,19 +43,19 @@ describe("NIBI settings validation", () => {
     });
   });
 
-  it("requires username, host, and SSH key path in manual MFA mode", () => {
+  it("requires username, host, and WSL SSH key path in manual MFA mode", () => {
     const errors = validateNibiSettings({
       ...defaultNibiSettings,
       connection_mode: "interactive_mfa",
       normal_login_host: "",
       nibi_username: "",
-      ssh_private_key_path: "",
+      wsl_ssh_private_key_path: "",
     });
 
     expect(errors).toMatchObject({
       nibi_username: "Username is required for NIBI mode.",
       normal_login_host: "Normal login host is required for manual MFA mode.",
-      ssh_private_key_path: "SSH key path is required for manual MFA mode.",
+      wsl_ssh_private_key_path: "WSL private key path is required for manual MFA mode.",
     });
   });
 
@@ -130,14 +130,14 @@ describe("NIBI settings validation", () => {
     const errors = validateNibiSettings({
       ...defaultNibiSettings,
       connection_mode: "interactive_mfa",
-      ssh_private_key_path: "C:\\Users\\CL\\.ssh\\id_ed25519; rm",
+      wsl_ssh_private_key_path: "/home/cl/.ssh/id_ed25519; rm",
       remote_project_path: "/home/chrisl/scratch/project$(whoami)",
       remote_jobs_path: "/home/chrisl/scratch/jobs|tee",
       python_environment_path: "/home/chrisl/project/.venv/bin/python`date`",
     });
 
     expect(errors).toMatchObject({
-      ssh_private_key_path: "Path contains unsupported shell metacharacters.",
+      wsl_ssh_private_key_path: "Path contains unsupported shell metacharacters.",
       remote_project_path: "Path contains unsupported shell metacharacters.",
       remote_jobs_path: "Path contains unsupported shell metacharacters.",
       python_environment_path: "Path contains unsupported shell metacharacters.",
@@ -171,7 +171,7 @@ describe("NIBI settings validation", () => {
     expect(normalizeNibiSettings({ manual_mfa_provider: "controlmaster" }).manual_mfa_provider)
       .toBe("controlmaster");
     expect(normalizeNibiSettings({ manual_mfa_provider: "unexpected" }).manual_mfa_provider)
-      .toBe("terminal_action");
+      .toBe("controlmaster");
   });
 
   it("saves and loads the manual SSH login confirmation setting shape", () => {
