@@ -82,7 +82,16 @@ describe("remote environment checks", () => {
     });
   });
 
-  it("generates python environment run command", () => {
+  it("generates python environment existence command", () => {
+    const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "python_environment_exists");
+
+    expect(check?.commandSpec).toMatchObject({
+      executable: "test",
+      args: ["-x", "/home/alice/scratch/FluorCast/.venv/bin/python"],
+    });
+  });
+
+  it("generates python environment version command", () => {
     const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "python_environment_runs");
 
     expect(check?.commandSpec).toMatchObject({
@@ -116,6 +125,16 @@ describe("remote environment checks", () => {
       args: ["-v", "sacct"],
     });
     expect(checks.find((item) => item.id === "sacct")?.optional).toBe(false);
+  });
+
+  it("generates upload/read/delete smoke test command", () => {
+    const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "upload_read_delete_smoke");
+
+    expect(check?.commandSpec).toMatchObject({
+      executable: "fluorcast-upload-smoke-test",
+      args: ["/home/alice/scratch/fluorcast-jobs"],
+      redacted_preview: "create/read/delete <remote_jobs_path>/.fluorcast-smoke-*.txt",
+    });
   });
 
   it("sacct failure is a required Stage 1 failure", () => {

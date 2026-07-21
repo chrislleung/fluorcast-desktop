@@ -30,7 +30,8 @@ describe("manual MFA session helpers", () => {
     expect(commands.login_command).toContain('CTL="$HOME/.fluorcast/ssh/cm-nibi.sock"');
     expect(commands.login_command).toContain('KEY="$2"');
     expect(commands.login_command).toContain('HOST="$1"');
-    expect(commands.login_command).toContain('[[ "$KEY" != /* ]]');
+    expect(commands.login_command).toContain("'$HOME'/*) KEY=\"$HOME/${KEY#\\$HOME/}\"");
+    expect(commands.login_command).toContain("'~'/*) KEY=\"$HOME/${KEY#~/}\"");
     expect(commands.login_command).toContain("ssh -fMN");
     expect(commands.login_command).toContain('-S "$CTL"');
     expect(commands.login_command).toContain("-o ControlMaster=yes");
@@ -58,19 +59,17 @@ describe("manual MFA session helpers", () => {
     const commands = buildManualMfaSessionCommands(settings);
 
     expect(commands.windows_terminal_command).toContain("wt.exe new-tab");
-    expect(commands.windows_terminal_command).toContain("wsl.exe -d \"Ubuntu\" -- bash -c");
+    expect(commands.windows_terminal_command).toContain("wsl.exe -d \"Ubuntu\" -- bash --");
     expect(commands.windows_terminal_command).toContain("start-nibi-login.sh");
     expect(commands.windows_terminal_command).toContain("alice@nibi.alliancecan.ca");
     expect(commands.windows_terminal_command).toContain("<wsl_private_key_path>");
+    expect(commands.windows_terminal_command).not.toContain("bash -c");
+    expect(commands.windows_terminal_command).not.toContain("$@");
     expect(commands.windows_terminal_command).not.toContain("An active FluorCast NIBI session already exists.");
     expect(commands.windows_terminal_command).not.toContain("ssh -fMN");
-    expect(commands.powershell_launch_command).toContain("powershell.exe -NoProfile");
-    expect(commands.powershell_launch_command).toContain("Start-Process powershell.exe");
-    expect(commands.powershell_launch_command).toContain("wsl.exe -d \"Ubuntu\" -- bash -c");
-    expect(commands.powershell_launch_command).toContain("start-nibi-login.sh");
+    expect(commands.powershell_launch_command).toContain("PowerShell fallback is disabled");
     expect(commands.powershell_launch_command).not.toContain("An active FluorCast NIBI session already exists.");
     expect(commands.powershell_launch_command).not.toContain("ssh -fMN");
-    expect(commands.powershell_launch_command).toContain("-NoExit");
   });
 
   it("generates stale socket cleanup command", () => {
@@ -81,7 +80,8 @@ describe("manual MFA session helpers", () => {
     expect(commands.clean_script_content).toContain('ssh -S "$CTL" -O exit "$HOST" >/dev/null 2>&1 || true');
     expect(commands.clean_script_content).toContain('rm -f "$CTL"');
     expect(commands.clean_script_content).toContain('mkdir -p "$HOME/.fluorcast/ssh"');
-    expect(commands.clean_script_content).toContain('CLEAN_RESULT=SESSION_REMOVED');
+    expect(commands.clean_script_content).toContain('CLEAN_RESULT=HEALTHY_SESSION_CLOSED');
+    expect(commands.clean_script_content).toContain('CLEAN_RESULT=STALE_SOCKET_REMOVED');
   });
 
   it("passes configurable values as positional arguments in generated scripts", () => {
@@ -97,7 +97,7 @@ describe("manual MFA session helpers", () => {
 
   it("background remote command uses BatchMode=yes", () => {
     expect(buildWslBackgroundCommand(settings, "hostname")).toContain(
-      'ssh -S "$CTL" -o ControlMaster=no -o BatchMode=yes "$HOST" "$REMOTE_COMMAND"',
+      'ssh -S "$CTL" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "$HOST" "$REMOTE_COMMAND"',
     );
   });
 

@@ -340,8 +340,10 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Jobs" }));
 
     expect(await screen.findByText("NIBI login required")).toBeInTheDocument();
-    expect(screen.getByText(/NIBI session required/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Test app session" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Start manual NIBI login" })).toBeInTheDocument();
+    expect(screen.getByText(/Open Settings to start or test the NIBI session/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Test app session" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start manual NIBI login" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
   });
 });

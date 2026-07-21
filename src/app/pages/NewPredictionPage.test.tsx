@@ -243,7 +243,7 @@ describe("NewPredictionPage", () => {
     expect(sbatchCalls).toHaveLength(1);
   });
 
-  it("terminal-action Manual MFA upload waits for an explicit Slurm submission from Jobs", async () => {
+  it("legacy terminal-action Manual MFA settings still require an authenticated session", async () => {
     const handleJobChange = vi.fn();
     render(
       <NewPredictionPage
@@ -271,7 +271,7 @@ describe("NewPredictionPage", () => {
           robot_access_verified: false,
           last_manual_login_check_at: "",
           manual_ssh_login_confirmed: false,
-        }}
+        } as unknown as typeof defaultNibiSettings}
         onJobChange={handleJobChange}
       />,
     );
@@ -284,10 +284,11 @@ describe("NewPredictionPage", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /Submit to NIBI/i }));
 
-    expect(await screen.findByText("Input uploaded. Open Jobs and click Submit to Slurm.")).toBeInTheDocument();
+    expect(await screen.findAllByText("Log into NIBI first, then retry this action.")).toHaveLength(2);
     expect(handleJobChange).toHaveBeenCalledWith(expect.objectContaining({
-      status: "uploaded_to_nibi",
-      remote_input_path: expect.stringContaining("/input.json"),
+      status: "login_required",
+      molecule_smiles: "CCO",
+      solvent_smiles: "O",
     }));
     const sbatchCalls = vi.mocked(invoke).mock.calls.filter(([command, args]) => (
       command === "run_nibi_remote_command"

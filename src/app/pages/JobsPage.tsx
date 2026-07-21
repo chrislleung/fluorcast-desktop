@@ -4,20 +4,15 @@ import type { ManualMfaSessionUiState } from "../../lib/remote";
 
 type JobsPageProps = {
   jobs: StoredPredictionJob[];
-  isManualMfaWorking?: boolean;
   manualMfaSession?: ManualMfaSessionUiState;
   manualMfaStatus?: string;
   nibiSettings?: NibiSettings;
   onOpenResult: (jobId: string) => void;
   onReconnect?: () => void;
   onOpenRobotSetup?: () => void;
-  onOpenManualMfaDiagnostics?: () => void;
-  onCopyManualMfaLoginCommand?: () => Promise<unknown>;
   onRefreshJobStatus?: (job: StoredPredictionJob) => Promise<unknown>;
   onCancelRemoteJob?: (job: StoredPredictionJob) => Promise<unknown>;
-  onStartManualMfaLogin?: () => Promise<unknown>;
   onSubmitSlurmJob?: (job: StoredPredictionJob) => Promise<unknown>;
-  onTestManualMfaSession?: (job: StoredPredictionJob) => Promise<unknown>;
 };
 
 const statusLabels: Record<StoredPredictionJob["status"], string> = {
@@ -26,12 +21,14 @@ const statusLabels: Record<StoredPredictionJob["status"], string> = {
   upload_waiting_for_login: "Waiting for login",
   uploaded_to_nibi: "Uploaded to NIBI",
   upload_failed: "Upload failed",
+  queued: "Queued",
   submitted_to_slurm: "Submitted to Slurm",
   slurm_submission_failed: "Submission failed",
   running: "Running",
   completed: "Completed",
   failed: "Failed",
   cancelled: "Cancelled",
+  timed_out: "Timed out",
   timeout: "Timed out",
   login_required: "Login required",
   robot_access_required: "Robot access required",
@@ -40,6 +37,7 @@ const statusLabels: Record<StoredPredictionJob["status"], string> = {
   output_missing: "Output missing",
   output_invalid: "Output invalid",
   download_failed: "Download failed",
+  unknown: "Unknown",
 };
 
 function formatCreatedDate(value: string) {
@@ -61,6 +59,7 @@ function canSubmitToSlurm(job: StoredPredictionJob) {
 
 function isRemoteActive(job: StoredPredictionJob) {
   return job.status === "submitting"
+    || job.status === "queued"
     || job.status === "submitted_to_slurm"
     || job.status === "running";
 }
@@ -71,10 +70,6 @@ function isManualSessionReady(manualMfaSession?: ManualMfaSessionUiState) {
 
 function usesPersistentShell(nibiSettings?: NibiSettings) {
   return nibiSettings?.manual_mfa_provider === "persistent_shell";
-}
-
-function usesTerminalAction(nibiSettings?: NibiSettings) {
-  return nibiSettings?.manual_mfa_provider === "terminal_action";
 }
 
 function showReconnectPanel(job: StoredPredictionJob, nibiSettings?: NibiSettings, manualMfaSession?: ManualMfaSessionUiState) {
@@ -97,20 +92,15 @@ function failureDetails(job: StoredPredictionJob) {
 
 export function JobsPage({
   jobs,
-  isManualMfaWorking = false,
   manualMfaSession,
   manualMfaStatus,
   nibiSettings,
   onOpenResult,
   onReconnect,
   onOpenRobotSetup,
-  onOpenManualMfaDiagnostics,
-  onCopyManualMfaLoginCommand,
   onRefreshJobStatus,
   onCancelRemoteJob,
-  onStartManualMfaLogin,
   onSubmitSlurmJob,
-  onTestManualMfaSession,
 }: JobsPageProps) {
   function confirmAndCancel(job: StoredPredictionJob) {
     if (!job.remote_slurm_id) return;
@@ -149,6 +139,7 @@ export function JobsPage({
               <thead>
                 <tr>
                   <th>Created</th>
+                  <th>Local job ID</th>
                   <th>Molecule SMILES</th>
                   <th>Solvent SMILES</th>
                   <th>Model choice</th>
@@ -161,6 +152,7 @@ export function JobsPage({
                 {jobs.map((job) => (
                   <tr key={job.id}>
                     <td>{formatCreatedDate(job.created_at)}</td>
+                    <td><code>{job.id}</code></td>
                     <td><code>{job.molecule_smiles}</code></td>
                     <td><code>{job.solvent_smiles}</code></td>
                     <td>{job.model_choice}</td>
@@ -210,7 +202,7 @@ export function JobsPage({
                             </details>
                           ) : null}
                         </>
-                      ) : job.status === "submitted_to_slurm" ? (
+                      ) : job.status === "submitted_to_slurm" || job.status === "queued" ? (
                         <>
                           <span>{job.remote_slurm_id ? "View queued job" : "Submitted to Slurm"}</span>
                           {onRefreshJobStatus ? (
@@ -236,50 +228,15 @@ export function JobsPage({
                         <section className="inline-action-panel" aria-label="NIBI login required">
                           <h3>NIBI login required</h3>
                           <p>
-                            {usesPersistentShell(nibiSettings)
-                              ? "NIBI session required. Start a Manual MFA session and complete password + Duo."
-                              : usesTerminalAction(nibiSettings)
-                                ? "Manual MFA mode runs each NIBI action in a visible PowerShell window. Complete password and Duo when prompted."
-                              : "FluorCast cannot currently reuse an authenticated NIBI session. Start the login from FluorCast or test the app session below."}
+                            Open Settings to start or test the NIBI session, then return here to refresh or submit this job.
                           </p>
                           <div className="button-row">
-                            <button
-                              className="secondary-button compact-button"
-                              disabled={isManualMfaWorking}
-                              onClick={() => void onCopyManualMfaLoginCommand?.()}
-                              type="button"
-                            >
-                              Copy app login command
-                            </button>
-                            <button
-                              className="secondary-button compact-button"
-                              onClick={onOpenManualMfaDiagnostics ?? onReconnect}
-                              type="button"
-                            >
-                              Open Manual MFA diagnostics
-                            </button>
-                            <button
-                              className="secondary-button compact-button"
-                              disabled={isManualMfaWorking}
-                              onClick={() => void onTestManualMfaSession?.(job)}
-                              type="button"
-                            >
-                              Test app session
-                            </button>
-                            <button
-                              className="secondary-button compact-button"
-                              disabled={isManualMfaWorking}
-                              onClick={() => void onStartManualMfaLogin?.()}
-                              type="button"
-                            >
-                              Start manual NIBI login
-                            </button>
                             <button
                               className="secondary-button compact-button"
                               onClick={onReconnect}
                               type="button"
                             >
-                              Go to Settings
+                              Open Settings
                             </button>
                           </div>
                           {manualMfaStatus || manualMfaSession?.last_session_test_result ? (
@@ -308,7 +265,7 @@ export function JobsPage({
                         <span>
                           {usesPersistentShell(nibiSettings)
                             ? "NIBI session required. Start a Manual MFA session and complete password + Duo."
-                            : "Manual MFA mode runs each NIBI action in a visible PowerShell window. Complete password and Duo when prompted."}
+                            : "Open Settings, start the NIBI session, then press Test authenticated session before continuing."}
                         </span>
                       ) : job.status === "robot_access_required" || job.status === "robot_auth_failed" ? (
                         <button
@@ -329,9 +286,11 @@ export function JobsPage({
                       ) : job.status === "failed"
                         || job.status === "upload_failed"
                         || job.status === "cancelled"
+                        || job.status === "timed_out"
                         || job.status === "timeout"
                         || job.status === "output_invalid"
-                        || job.status === "download_failed" ? (
+                        || job.status === "download_failed"
+                        || job.status === "unknown" ? (
                         <>
                           <span>{job.error_message ?? "Failed"}</span>
                           {failureDetails(job) ? (

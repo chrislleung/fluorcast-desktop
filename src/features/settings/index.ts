@@ -13,7 +13,7 @@ export type BackendMode = (typeof backendModes)[number];
 export type NibiSettings = {
   connection_mode: RemoteConnectionMode;
   backend_mode: BackendMode;
-  manual_mfa_provider: "terminal_action" | "persistent_shell" | "controlmaster" | "windows_openssh" | "wsl_openssh";
+  manual_mfa_provider: "persistent_shell" | "controlmaster";
   manual_mfa_ssh_backend: "wsl";
   manual_mfa_wsl_distro: string;
   nibi_username: string;
@@ -89,7 +89,7 @@ function normalizeConnectionMode(value: Record<string, unknown>): RemoteConnecti
 }
 
 function normalizeManualMfaProvider(value: unknown): NibiSettings["manual_mfa_provider"] {
-  if (value === "terminal_action" || value === "persistent_shell" || value === "controlmaster" || value === "wsl_openssh") {
+  if (value === "persistent_shell") {
     return value;
   }
   return "controlmaster";
@@ -111,6 +111,10 @@ export function defaultWslControlSocketPath(settings: Pick<NibiSettings, "nibi_u
 
 export function isAbsolutePath(path: string): boolean {
   return path.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(path) || path.startsWith("\\\\");
+}
+
+export function isSupportedWslPrivateKeyPath(path: string): boolean {
+  return path.startsWith("/") || path.startsWith("$HOME/") || path.startsWith("~/");
 }
 
 export function hasShellMetacharacters(value: string): boolean {
@@ -220,6 +224,11 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
     }
     if (trimmed.connection_mode === "interactive_mfa" && !trimmed.wsl_ssh_private_key_path) {
       errors.wsl_ssh_private_key_path = "WSL private key path is required for manual MFA mode.";
+    } else if (
+      trimmed.connection_mode === "interactive_mfa"
+      && !isSupportedWslPrivateKeyPath(trimmed.wsl_ssh_private_key_path)
+    ) {
+      errors.wsl_ssh_private_key_path = "WSL private key path must be /home, $HOME/, or ~/.";
     }
     if (trimmed.connection_mode === "robot_automation" && !trimmed.ssh_private_key_path) {
       errors.ssh_private_key_path = "SSH key path is required for robot automation mode.";
@@ -231,7 +240,6 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
     ? []
     : trimmed.connection_mode === "interactive_mfa"
     ? [
-      "wsl_ssh_private_key_path",
       "remote_project_path",
       "remote_jobs_path",
       "python_environment_path",
@@ -254,9 +262,19 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
   if (
     trimmed.connection_mode === "interactive_mfa"
     && trimmed.wsl_ssh_private_key_path
-    && !trimmed.wsl_ssh_private_key_path.startsWith("/")
+    && /[\0\r\n"';&|`<>\\\t]/.test(trimmed.wsl_ssh_private_key_path)
   ) {
-    errors.wsl_ssh_private_key_path = "WSL private key path must be an absolute Linux path.";
+    errors.wsl_ssh_private_key_path = "WSL private key path contains unsupported shell metacharacters.";
+  }
+  if (
+    trimmed.connection_mode === "interactive_mfa"
+    && trimmed.wsl_ssh_private_key_path
+    && (
+      trimmed.wsl_ssh_private_key_path.replace(/^\$HOME\//, "").replace(/^~\//, "").includes("$")
+      || trimmed.wsl_ssh_private_key_path.replace(/^~\//, "").replace(/^\$HOME\//, "").includes("~")
+    )
+  ) {
+    errors.wsl_ssh_private_key_path = "WSL private key path contains unsupported shell metacharacters.";
   }
 
   if (trimmed.connection_mode !== "mock") {

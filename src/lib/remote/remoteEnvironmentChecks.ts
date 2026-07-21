@@ -13,11 +13,13 @@ export type RemoteEnvironmentCheckId =
   | "remote_project_readable"
   | "remote_jobs_path"
   | "remote_jobs_writable"
+  | "python_environment_exists"
   | "python_environment_runs"
   | "sbatch"
   | "squeue"
   | "sacct"
-  | "prediction_entry_point";
+  | "prediction_entry_point"
+  | "upload_read_delete_smoke";
 
 export type RemoteEnvironmentCheckDefinition = {
   id: RemoteEnvironmentCheckId;
@@ -131,16 +133,29 @@ export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): 
       failureMessage: "Remote jobs path is not writable.",
     },
     {
-      id: "python_environment_runs",
-      name: "Python executable exists and runs",
+      id: "python_environment_exists",
+      name: "Python executable exists",
       optional: false,
       commandSpec: withSettings({
-        label: "Python executable exists and runs",
+        label: "Python executable exists",
+        executable: "test",
+        args: ["-x", trimmed.python_environment_path],
+        redacted_preview: `test -x ${shellQuote(trimmed.python_environment_path)}`,
+      }, trimmed),
+      successMessage: "Python executable exists.",
+      failureMessage: "Python executable was not found or is not executable.",
+    },
+    {
+      id: "python_environment_runs",
+      name: "Python executable reports version",
+      optional: false,
+      commandSpec: withSettings({
+        label: "Python executable reports version",
         executable: "fluorcast-python-version",
         args: [trimmed.python_environment_path],
         redacted_preview: `${shellQuote(trimmed.python_environment_path)} --version`,
       }, trimmed),
-      successMessage: "Python executable runs.",
+      successMessage: "Python executable reports its version.",
       failureMessage: "Python executable was not found or did not run.",
     },
     {
@@ -194,6 +209,19 @@ export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): 
       }, trimmed),
       successMessage: "Prediction entry point exists.",
       failureMessage: "Prediction entry point was not found.",
+    },
+    {
+      id: "upload_read_delete_smoke",
+      name: "Upload/read/delete smoke test",
+      optional: false,
+      commandSpec: withSettings({
+        label: "Upload/read/delete smoke test",
+        executable: "fluorcast-upload-smoke-test",
+        args: [trimmed.remote_jobs_path],
+        redacted_preview: "create/read/delete <remote_jobs_path>/.fluorcast-smoke-*.txt",
+      }, trimmed),
+      successMessage: "Remote jobs path passed the create/read/delete smoke test.",
+      failureMessage: "Remote jobs path failed the create/read/delete smoke test.",
     },
   );
 

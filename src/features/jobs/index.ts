@@ -7,12 +7,15 @@ export type StoredJobStatus =
   | "upload_waiting_for_login"
   | "uploaded_to_nibi"
   | "upload_failed"
+  | "queued"
   | "submitted_to_slurm"
   | "slurm_submission_failed"
   | "running"
   | "completed"
   | "failed"
   | "cancelled"
+  | "timed_out"
+  // Legacy value kept readable for jobs saved before the Slurm status rename.
   | "timeout"
   | "login_required"
   | "robot_access_required"
@@ -20,7 +23,8 @@ export type StoredJobStatus =
   | "connection_failed"
   | "output_missing"
   | "output_invalid"
-  | "download_failed";
+  | "download_failed"
+  | "unknown";
 
 export type StoredPredictionJob = {
   id: string;

@@ -117,7 +117,6 @@ export async function uploadPredictionInput(
 
   if (
     mode === "interactive_mfa"
-    && trimmed.manual_mfa_provider !== "terminal_action"
     && remoteExecutor.getConnectionStatus(trimmed).state !== "authenticated"
   ) {
     const error = appError("interactive_login_required");

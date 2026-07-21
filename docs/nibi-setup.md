@@ -157,32 +157,42 @@ Workflow:
 3. Select **Manual MFA**.
 4. Enter your NIBI username.
 5. Confirm the normal login host is `nibi.alliancecan.ca`.
-6. Choose the private SSH key file on your computer.
+6. Enter the WSL private key path, for example `$HOME/.ssh/fluorcast_nibi_ed25519`.
 7. Enter the remote project path, remote jobs path, and Python environment path.
 8. Save settings.
-9. Confirm the Manual MFA provider is **Terminal action recommended**.
-10. Upload a prediction input.
-11. Open Jobs and click **Submit to Slurm**.
-12. Complete password and Duo/MFA in the visible PowerShell window.
-13. Return to FluorCast after PowerShell finishes so the app can read stdout, stderr, and the exit code.
-14. Use **Refresh status** and **Download result** from Jobs; each action may open PowerShell and ask for password + Duo again.
+9. Click **Clean stale WSL session**.
+10. Click **Start NIBI session**.
+11. Complete password and Duo/MFA in the Windows Terminal tab.
+12. Return to FluorCast and click **Test authenticated session**.
+13. Confirm the status includes `FLUORCAST_AUTH_OK`.
+14. Click **Run remote environment checks**.
+15. Submit a prediction from New Prediction.
+16. Use Jobs to refresh status, cancel active Slurm jobs, and inspect stdout/stderr.
 
-### Manual MFA terminal-action mode
+### Manual MFA ControlMaster Mode
 
-Terminal-action mode is the recommended Manual MFA mode for Windows. FluorCast opens a visible PowerShell window for each NIBI action, such as Slurm submission, status refresh, and result download. You complete password and Duo in PowerShell. FluorCast does not capture that input; it reads local output files after the command finishes.
+Manual MFA uses one WSL SSH ControlMaster session. FluorCast opens Windows Terminal once for the human password and Duo step, then background upload, submission, polling, cancellation, log retrieval, and output download run inside WSL through the same socket:
 
-This mode does not reuse login sessions. It is slower because each remote action may ask for password + Duo, but it avoids unreliable SSH `ControlMaster`/`ControlPath` reuse on Windows. Robot automation remains the preferred production path because it removes repeated MFA once enabled.
+```text
+$HOME/.fluorcast/ssh/cm-nibi.sock
+```
+
+The automatic launcher passes the login script, host, and key as separate arguments:
+
+```text
+wt.exe new-tab --title FluorCast NIBI Login wsl.exe -d <wsl_distro> -- bash -- <wsl_home>/.fluorcast/scripts/start-nibi-login.sh <nibi_username>@nibi.alliancecan.ca <wsl_private_key_path>
+```
 
 For Slurm submission, FluorCast runs:
 
-```powershell
-ssh -i "<ssh_private_key_path>" -o IdentitiesOnly=yes <username>@<normal_login_host> "sbatch --parsable <remote_project_path>/slurm/run_prediction_job.sbatch <remote_input_path> <remote_output_path>"
+```text
+sbatch --parsable --chdir="<remote_project_path>" --output="<remote_job_directory>/stdout.log" --error="<remote_job_directory>/stderr.log" "<remote_project_path>/slurm/run_prediction_job.sbatch" "<remote_job_directory>/input.json" "<remote_job_directory>/output.json"
 ```
 
-For result download, FluorCast runs:
+For file transfers, FluorCast uses WSL `scp` with:
 
-```powershell
-scp -i "<ssh_private_key_path>" -o IdentitiesOnly=yes <username>@<normal_login_host>:<remote_output_path> "<local_output_path>"
+```text
+-o ControlPath="$HOME/.fluorcast/ssh/cm-nibi.sock" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
 ```
 
 ### Legacy Manual MFA persistent shell mode
@@ -200,12 +210,6 @@ printf '\n__FLUORCAST_READY_START__\n'; echo FLUORCAST_READY; printf '\n__FLUORC
 If the marked output contains `FLUORCAST_READY`, FluorCast marks the session active. If NIBI asks for password, Duo, passcode, verification, or keyboard-interactive authentication again, FluorCast blocks remote commands and asks you to reconnect.
 
 For small JSON files, persistent shell mode transfers content through the live shell instead of opening separate `scp` or `sftp` processes. Remote paths must be absolute and under the configured remote jobs path.
-
-### Legacy ControlMaster mode
-
-ControlMaster mode is experimental on Windows and may not work reliably. It depends on SSH multiplexing options such as `ControlMaster`, `ControlPath`, and `ControlPersist`. Use it only if you explicitly need the older WSL/OpenSSH reusable-session diagnostics.
-
-A normal SSH login in a separate terminal can confirm your account works, but FluorCast cannot send commands through that separate process. Terminal-action mode avoids reusable-session assumptions by opening a fresh visible PowerShell action when work is needed.
 
 ## Robot Automation Mode
 

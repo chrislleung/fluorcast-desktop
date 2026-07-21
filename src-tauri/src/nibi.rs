@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
@@ -74,11 +74,6 @@ impl NibiSettings {
     fn uses_persistent_shell(&self) -> bool {
         self.manual_mfa_provider.trim() == "persistent_shell"
     }
-
-    fn uses_terminal_action(&self) -> bool {
-        self.manual_mfa_provider.trim().is_empty()
-            || self.manual_mfa_provider.trim() == "terminal_action"
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -116,17 +111,6 @@ pub struct RemoteCommandResult {
     command_label: String,
     redacted_command_preview: String,
     timed_out: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TerminalActionPaths {
-    action_id: String,
-    work_dir: String,
-    command_path: String,
-    stdout_path: String,
-    stderr_path: String,
-    exit_code_path: String,
-    result_json_path: String,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -529,9 +513,6 @@ pub fn upload_nibi_file(
 ) -> Result<(), String> {
     validate_local_upload_path(&local_path)?;
     validate_remote_path(&remote_path, "Remote upload path")?;
-    if mode == "interactive_mfa" && settings.uses_terminal_action() {
-        return upload_file_via_terminal(&settings, &local_path, &remote_path);
-    }
     if mode == "interactive_mfa" && settings.uses_persistent_shell() {
         validate_remote_path_under_jobs(&remote_path, &settings.remote_jobs_path)?;
         let text = std::fs::read_to_string(&local_path)
@@ -539,9 +520,10 @@ pub fn upload_nibi_file(
         upload_text_file_via_shell(&settings, &remote_path, &text)?;
         return Ok(());
     }
-    let target = if mode == "interactive_mfa" {
-        build_manual_mfa_scp_target(&settings, &local_path, &remote_path)?
-    } else if mode == "robot_automation" {
+    if mode == "interactive_mfa" {
+        return upload_file_via_wsl_scp(&settings, &local_path, &remote_path);
+    }
+    let target = if mode == "robot_automation" {
         build_robot_scp_target(&settings, &local_path, &remote_path)?
     } else {
         return Err("Unsupported NIBI connection mode.".to_string());
@@ -567,9 +549,6 @@ pub fn download_nibi_file(
 ) -> Result<(), String> {
     validate_remote_path(&remote_path, "Remote download path")?;
     validate_local_download_path(&local_path)?;
-    if mode == "interactive_mfa" && settings.uses_terminal_action() {
-        return download_file_via_terminal(&settings, &remote_path, &local_path);
-    }
     if mode == "interactive_mfa" && settings.uses_persistent_shell() {
         validate_remote_path_under_jobs(&remote_path, &settings.remote_jobs_path)?;
         let text = download_text_file_via_shell(&settings, &remote_path)?;
@@ -577,9 +556,10 @@ pub fn download_nibi_file(
             .map_err(|error| format!("Could not write downloaded output.json: {error}"))?;
         return Ok(());
     }
-    let source = if mode == "interactive_mfa" {
-        build_manual_mfa_download_target(&settings, &remote_path, &local_path)?
-    } else if mode == "robot_automation" {
+    if mode == "interactive_mfa" {
+        return download_file_via_wsl_scp(&settings, &remote_path, &local_path);
+    }
+    let source = if mode == "robot_automation" {
         build_robot_download_target(&settings, &remote_path, &local_path)?
     } else {
         return Err("Unsupported NIBI connection mode.".to_string());
@@ -638,15 +618,27 @@ pub fn clean_stale_manual_mfa_session(
             } else {
                 ManualMfaSessionStatus::Failed
             };
+            let message = if output.status == 0 && output.stdout.contains("CLEAN_RESULT=NO_SESSION")
+            {
+                "No WSL NIBI session existed.".to_string()
+            } else if output.status == 0
+                && output
+                    .stdout
+                    .contains("CLEAN_RESULT=HEALTHY_SESSION_CLOSED")
+            {
+                "Healthy WSL NIBI session closed.".to_string()
+            } else if output.status == 0
+                && output.stdout.contains("CLEAN_RESULT=STALE_SOCKET_REMOVED")
+            {
+                "Stale WSL NIBI socket removed.".to_string()
+            } else if output.timed_out {
+                "WSL stale-session cleanup timed out.".to_string()
+            } else {
+                "WSL stale-session cleanup failed.".to_string()
+            };
             Ok(ManualMfaSessionResult {
                 status,
-                message: if output.status == 0 {
-                    "Stale WSL NIBI session cleaned.".to_string()
-                } else if output.timed_out {
-                    "WSL stale-session cleanup timed out.".to_string()
-                } else {
-                    "WSL stale-session cleanup failed.".to_string()
-                },
+                message,
                 control_path: resolved_control_path_from_output(&output)
                     .unwrap_or_else(|| commands.control_path.clone()),
                 control_path_exists: false,
@@ -1230,13 +1222,7 @@ fn build_manual_mfa_session_commands(
     let check_script_path = "$HOME/.fluorcast/scripts/check-nibi-session.sh".to_string();
     let end_script_path = "$HOME/.fluorcast/scripts/end-nibi-session.sh".to_string();
     let clean_script_path = "$HOME/.fluorcast/scripts/clean-nibi-session.sh".to_string();
-    let manual_wsl_login_command = format!(
-        "wsl.exe -d {} -- bash -c {} -- {} {}",
-        powershell_single_quote(&distro),
-        powershell_single_quote("exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\""),
-        powershell_single_quote(&target),
-        powershell_single_quote(&key),
-    );
+    let manual_wsl_login_command = wsl_command_line(&distro, &start_script_path, &target, &key);
     let setup = "Debug only: create or copy the private key inside WSL, then enter its absolute Linux path in FluorCast.".to_string();
     let clean = [
         "#!/usr/bin/env bash",
@@ -1259,11 +1245,19 @@ fn build_manual_mfa_session_commands(
         "",
         "if [[ -S \"$CTL\" ]] && ssh -S \"$CTL\" -O check \"$HOST\" >/dev/null 2>&1; then",
         "    ssh -S \"$CTL\" -O exit \"$HOST\" >/dev/null 2>&1 || true",
+        "    rm -f \"$CTL\"",
+        "    printf 'CLEAN_RESULT=HEALTHY_SESSION_CLOSED\\n'",
+        "    exit 0",
         "fi",
         "",
-        "rm -f \"$CTL\"",
+        "if [[ -S \"$CTL\" ]]; then",
+        "    rm -f \"$CTL\"",
+        "    printf 'CLEAN_RESULT=STALE_SOCKET_REMOVED\\n'",
+        "    exit 0",
+        "fi",
         "",
-        "printf 'CLEAN_RESULT=SESSION_REMOVED\\n'",
+        "printf 'CLEAN_RESULT=CLEANUP_FAILED\\n'",
+        "exit 14",
     ]
     .join("\n");
     let login = [
@@ -1277,10 +1271,16 @@ fn build_manual_mfa_session_commands(
         "mkdir -p \"$HOME/.fluorcast/ssh\"",
         "chmod 700 \"$HOME/.fluorcast/ssh\"",
         "",
-        "if [[ \"$KEY\" != /* ]]; then",
-        "  echo \"WSL private key path must be an absolute POSIX path.\"",
-        "  exit 20",
-        "fi",
+        "case \"$KEY\" in",
+        "  '$HOME'/*) KEY=\"$HOME/${KEY#\\$HOME/}\" ;;",
+        "  '~'/*) KEY=\"$HOME/${KEY#~/}\" ;;",
+        "  /*) ;;",
+        "  *)",
+        "    echo \"WSL private key path must be /home, $HOME/, or ~/.\"",
+        "    exit 20",
+        "    ;;",
+        "esac",
+        "",
         "if [[ ! -e \"$KEY\" ]]; then",
         "  echo \"WSL private key was not found.\"",
         "  exit 21",
@@ -1296,8 +1296,11 @@ fn build_manual_mfa_session_commands(
         "",
         "if [[ -S \"$CTL\" ]] && ssh -S \"$CTL\" -O check \"$HOST\" >/dev/null 2>&1; then",
         "  echo \"An active FluorCast NIBI session already exists.\"",
+        "elif [[ -e \"$CTL\" && ! -S \"$CTL\" ]]; then",
+        "  echo \"ControlPath exists but is not a socket. Clean stale WSL session first.\"",
+        "  exit 24",
         "else",
-        "  rm -f \"$CTL\"",
+        "  [[ ! -e \"$CTL\" || -S \"$CTL\" ]] && rm -f \"$CTL\"",
         "  ssh -fMN \\",
         "    -S \"$CTL\" \\",
         "    -i \"$KEY\" \\",
@@ -1341,7 +1344,7 @@ fn build_manual_mfa_session_commands(
         "HOST=\"$1\"",
         "REMOTE_COMMAND=\"$2\"",
         "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
-        "ssh -S \"$CTL\" -o ControlMaster=no -o BatchMode=yes \"$HOST\" \"$REMOTE_COMMAND\"",
+        "ssh -S \"$CTL\" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \"$HOST\" \"$REMOTE_COMMAND\"",
     ]
     .join("\n");
 
@@ -1359,7 +1362,12 @@ fn build_manual_mfa_session_commands(
         host: target.clone(),
         wsl_setup_key_commands: setup,
         clean_stale_session_command: format!("bash {clean_script_path}"),
-        windows_terminal_command: windows_terminal_command(&distro, &target, &key),
+        windows_terminal_command: windows_terminal_command(
+            &distro,
+            &start_script_path,
+            &target,
+            &key,
+        ),
         powershell_launch_command: powershell_launch_command(&distro, &target, &key),
         login_command: login.clone(),
         clean_script_content: clean,
@@ -1471,45 +1479,24 @@ fn run_remote_invocation_result(
     }
 }
 
-fn run_remote_command_via_terminal(
-    settings: &NibiSettings,
-    remote_command: &str,
-    label: String,
-    redacted_preview: Option<String>,
-) -> Result<RemoteCommandResult, String> {
-    validate_manual_login_settings(settings)?;
-    let started = Instant::now();
-    let paths = create_terminal_action_paths("ssh")?;
-    let script = terminal_ssh_script(settings, remote_command, &paths);
-    run_terminal_action_script(&paths, &script)?;
-    let output = read_terminal_action_output(&paths)?;
-    Ok(RemoteCommandResult {
-        exit_code: output.status,
-        stdout: output.stdout,
-        stderr: output.stderr,
-        duration_ms: started.elapsed().as_millis(),
-        command_label: label.clone(),
-        redacted_command_preview: redacted_preview.unwrap_or(label),
-        timed_out: false,
-    })
-}
-
-fn upload_file_via_terminal(
+fn upload_file_via_wsl_scp(
     settings: &NibiSettings,
     local_path: &str,
     remote_path: &str,
 ) -> Result<(), String> {
     validate_manual_login_settings(settings)?;
-    let paths = create_terminal_action_paths("scp-upload")?;
-    let target = format!(
-        "{}@{}:{}",
-        settings.nibi_username.trim(),
-        settings.manual_login_host(),
-        remote_path
-    );
-    let script = terminal_scp_script(settings, local_path, &target, &paths);
-    run_terminal_action_script(&paths, &script)?;
-    let output = read_terminal_action_output(&paths)?;
+    validate_remote_path_under_jobs(remote_path, &settings.remote_jobs_path)?;
+    let commands = build_manual_mfa_session_commands(settings)?;
+    let output = run_wsl_bash_script(
+        &commands.wsl_distro,
+        &manual_mfa_scp_upload_script(),
+        &[
+            local_path.to_string(),
+            commands.host,
+            remote_path.to_string(),
+        ],
+        WSL_SCRIPT_TIMEOUT,
+    )?;
     if output.status == 0 {
         Ok(())
     } else {
@@ -1517,22 +1504,24 @@ fn upload_file_via_terminal(
     }
 }
 
-fn download_file_via_terminal(
+fn download_file_via_wsl_scp(
     settings: &NibiSettings,
     remote_path: &str,
     local_path: &str,
 ) -> Result<(), String> {
     validate_manual_login_settings(settings)?;
-    let paths = create_terminal_action_paths("scp-download")?;
-    let source = format!(
-        "{}@{}:{}",
-        settings.nibi_username.trim(),
-        settings.manual_login_host(),
-        remote_path
-    );
-    let script = terminal_scp_script(settings, &source, local_path, &paths);
-    run_terminal_action_script(&paths, &script)?;
-    let output = read_terminal_action_output(&paths)?;
+    validate_remote_path_under_jobs(remote_path, &settings.remote_jobs_path)?;
+    let commands = build_manual_mfa_session_commands(settings)?;
+    let output = run_wsl_bash_script(
+        &commands.wsl_distro,
+        &manual_mfa_scp_download_script(),
+        &[
+            remote_path.to_string(),
+            local_path.to_string(),
+            commands.host,
+        ],
+        WSL_SCRIPT_TIMEOUT,
+    )?;
     if output.status == 0 {
         Ok(())
     } else {
@@ -1540,131 +1529,54 @@ fn download_file_via_terminal(
     }
 }
 
-fn create_terminal_action_paths(action_kind: &str) -> Result<TerminalActionPaths, String> {
-    let action_id = new_nonce(action_kind);
-    let work_dir = std::env::temp_dir()
-        .join("fluorcast-terminal-actions")
-        .join(&action_id);
-    std::fs::create_dir_all(&work_dir)
-        .map_err(|error| format!("Could not create terminal action folder: {error}"))?;
-    let command_path = work_dir.join("command.ps1");
-    let stdout_path = work_dir.join("stdout.txt");
-    let stderr_path = work_dir.join("stderr.txt");
-    let exit_code_path = work_dir.join("exit_code.txt");
-    let result_json_path = work_dir.join("result.json");
-    Ok(TerminalActionPaths {
-        action_id,
-        work_dir: path_to_string(&work_dir)?,
-        command_path: path_to_string(&command_path)?,
-        stdout_path: path_to_string(&stdout_path)?,
-        stderr_path: path_to_string(&stderr_path)?,
-        exit_code_path: path_to_string(&exit_code_path)?,
-        result_json_path: path_to_string(&result_json_path)?,
-    })
+fn manual_mfa_scp_upload_script() -> String {
+    [
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        "",
+        "LOCAL_WINDOWS_PATH=\"$1\"",
+        "HOST=\"$2\"",
+        "REMOTE_PATH=\"$3\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "LOCAL_WSL_PATH=\"$(wslpath -a \"$LOCAL_WINDOWS_PATH\")\"",
+        "",
+        "test -S \"$CTL\"",
+        "test -f \"$LOCAL_WSL_PATH\"",
+        "scp \\",
+        "  -o ControlPath=\"$CTL\" \\",
+        "  -o ControlMaster=no \\",
+        "  -o BatchMode=yes \\",
+        "  -o PasswordAuthentication=no \\",
+        "  -o KbdInteractiveAuthentication=no \\",
+        "  \"$LOCAL_WSL_PATH\" \\",
+        "  \"$HOST:$REMOTE_PATH\"",
+    ]
+    .join("\n")
 }
 
-fn terminal_ssh_script(
-    settings: &NibiSettings,
-    remote_command: &str,
-    paths: &TerminalActionPaths,
-) -> String {
-    let target = format!(
-        "{}@{}",
-        settings.nibi_username.trim(),
-        settings.manual_login_host()
-    );
-    format!(
-        "$ErrorActionPreference = 'Continue'\n\
-         Write-Host 'FluorCast NIBI action: complete password and Duo when prompted.'\n\
-         ssh -i {key} -o IdentitiesOnly=yes {target} {remote_command} 1> {stdout} 2> {stderr}\n\
-         $exitCode = if ($null -eq $LASTEXITCODE) {{ 1 }} else {{ $LASTEXITCODE }}\n\
-         $exitCode | Out-File -Encoding utf8 {exit_code}\n\
-         '{{\"action_id\":{action_id},\"exit_code\":' + $exitCode + '}}' | Out-File -Encoding utf8 {result_json}\n\
-         Write-Host \"FluorCast action finished with exit code $exitCode. You may close this window.\"\n",
-        key = powershell_single_quote(settings.private_key_path()),
-        target = powershell_single_quote(&target),
-        remote_command = powershell_single_quote(remote_command),
-        stdout = powershell_single_quote(&paths.stdout_path),
-        stderr = powershell_single_quote(&paths.stderr_path),
-        exit_code = powershell_single_quote(&paths.exit_code_path),
-        result_json = powershell_single_quote(&paths.result_json_path),
-        action_id = json_string_literal(&paths.action_id),
-    )
-}
-
-fn terminal_scp_script(
-    settings: &NibiSettings,
-    source: &str,
-    destination: &str,
-    paths: &TerminalActionPaths,
-) -> String {
-    format!(
-        "$ErrorActionPreference = 'Continue'\n\
-         Write-Host 'FluorCast NIBI file action: complete password and Duo when prompted.'\n\
-         scp -i {key} -o IdentitiesOnly=yes {source} {destination} 1> {stdout} 2> {stderr}\n\
-         $exitCode = if ($null -eq $LASTEXITCODE) {{ 1 }} else {{ $LASTEXITCODE }}\n\
-         $exitCode | Out-File -Encoding utf8 {exit_code}\n\
-         '{{\"action_id\":{action_id},\"exit_code\":' + $exitCode + '}}' | Out-File -Encoding utf8 {result_json}\n\
-         Write-Host \"FluorCast file action finished with exit code $exitCode. You may close this window.\"\n",
-        key = powershell_single_quote(settings.private_key_path()),
-        source = powershell_single_quote(source),
-        destination = powershell_single_quote(destination),
-        stdout = powershell_single_quote(&paths.stdout_path),
-        stderr = powershell_single_quote(&paths.stderr_path),
-        exit_code = powershell_single_quote(&paths.exit_code_path),
-        result_json = powershell_single_quote(&paths.result_json_path),
-        action_id = json_string_literal(&paths.action_id),
-    )
-}
-
-fn run_terminal_action_script(paths: &TerminalActionPaths, script: &str) -> Result<(), String> {
-    std::fs::write(&paths.command_path, script)
-        .map_err(|error| format!("Could not write terminal action script: {error}"))?;
-    let launch = format!(
-        "Start-Process -Wait -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{})",
-        powershell_single_quote(&paths.command_path)
-    );
-    let status = Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", &launch])
-        .status()
-        .map_err(|error| format!("Could not open PowerShell terminal action: {error}"))?;
-    if status.code().is_none() {
-        return Err("PowerShell terminal action ended without an exit code.".to_string());
-    }
-    Ok(())
-}
-
-fn read_terminal_action_output(paths: &TerminalActionPaths) -> Result<CommandOutput, String> {
-    let stdout = read_optional_text_file(&paths.stdout_path)?;
-    let stderr = read_optional_text_file(&paths.stderr_path)?;
-    let exit_code_text = read_optional_text_file(&paths.exit_code_path)?;
-    let status = exit_code_text
-        .trim_start_matches('\u{feff}')
-        .trim()
-        .parse::<i32>()
-        .unwrap_or(1);
-    Ok(CommandOutput {
-        status,
-        stdout: stdout.trim().to_string(),
-        stderr: stderr.trim().to_string(),
-        timed_out: false,
-    })
-}
-
-fn read_optional_text_file(path: &str) -> Result<String, String> {
-    match std::fs::read_to_string(path) {
-        Ok(value) => Ok(value),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(format!(
-            "Could not read terminal action file {path}: {error}"
-        )),
-    }
-}
-
-fn path_to_string(path: &PathBuf) -> Result<String, String> {
-    path.to_str()
-        .map(|value| value.to_string())
-        .ok_or_else(|| "Terminal action path is not valid UTF-8.".to_string())
+fn manual_mfa_scp_download_script() -> String {
+    [
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        "",
+        "REMOTE_PATH=\"$1\"",
+        "LOCAL_WINDOWS_PATH=\"$2\"",
+        "HOST=\"$3\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "LOCAL_WSL_PATH=\"$(wslpath -a \"$LOCAL_WINDOWS_PATH\")\"",
+        "",
+        "test -S \"$CTL\"",
+        "mkdir -p \"$(dirname \"$LOCAL_WSL_PATH\")\"",
+        "scp \\",
+        "  -o ControlPath=\"$CTL\" \\",
+        "  -o ControlMaster=no \\",
+        "  -o BatchMode=yes \\",
+        "  -o PasswordAuthentication=no \\",
+        "  -o KbdInteractiveAuthentication=no \\",
+        "  \"$HOST:$REMOTE_PATH\" \\",
+        "  \"$LOCAL_WSL_PATH\"",
+    ]
+    .join("\n")
 }
 
 fn persistent_shell_slot() -> &'static Mutex<Option<PersistentShell>> {
@@ -1939,6 +1851,9 @@ fn validate_remote_command_spec(command_spec: &RemoteCommandSpecInput) -> Result
         "fluorcast-python-version" if command_spec.args.len() == 1 => {
             validate_remote_path(&command_spec.args[0], "Python executable path")
         }
+        "fluorcast-upload-smoke-test" if command_spec.args.len() == 1 => {
+            validate_remote_path(&command_spec.args[0], "Remote jobs path")
+        }
         "cat" if command_spec.args.len() == 1 => {
             validate_remote_path(&command_spec.args[0], "Remote log path")
         }
@@ -2022,6 +1937,10 @@ fn structured_remote_command_to_shell(
         )),
         "fluorcast-python-version" => Ok(format!(
             "{} --version",
+            shell_quote(&command_spec.args[0])
+        )),
+        "fluorcast-upload-smoke-test" => Ok(format!(
+            "smoke_dir={} && mkdir -p \"$smoke_dir\" && smoke_file=\"$smoke_dir/.fluorcast-smoke-$$.txt\" && printf '%s\\n' FLUORCAST_SMOKE_OK > \"$smoke_file\" && test \"$(cat \"$smoke_file\")\" = FLUORCAST_SMOKE_OK && rm -f \"$smoke_file\"",
             shell_quote(&command_spec.args[0])
         )),
         "cat" => Ok(format!("cat {}", shell_quote(&command_spec.args[0]))),
@@ -2109,32 +2028,6 @@ fn build_robot_remote_invocation(
     })
 }
 
-fn build_manual_mfa_remote_invocation(
-    settings: &NibiSettings,
-    remote_command: &str,
-) -> Result<SshInvocation, String> {
-    validate_manual_login_settings(settings)?;
-    let commands = build_manual_mfa_session_commands(settings)?;
-    let script = format!(
-        "{}\nssh -S \"$ctl\" -o BatchMode=yes \"$host\" {}",
-        wsl_prelude(
-            &commands.control_path,
-            &commands.wsl_key_path,
-            &commands.host
-        ),
-        shell_quote(remote_command)
-    );
-    Ok(SshInvocation {
-        program: "wsl.exe".to_string(),
-        args: vec![
-            "-e".to_string(),
-            "bash".to_string(),
-            "-lc".to_string(),
-            script,
-        ],
-    })
-}
-
 struct UploadTarget {
     program: String,
     args: Vec<String>,
@@ -2164,34 +2057,6 @@ fn build_robot_scp_target(
     })
 }
 
-fn build_manual_mfa_scp_target(
-    settings: &NibiSettings,
-    local_path: &str,
-    remote_path: &str,
-) -> Result<UploadTarget, String> {
-    validate_manual_login_settings(settings)?;
-    let commands = build_manual_mfa_session_commands(settings)?;
-    let wsl_local_path = windows_path_to_wsl_mount(local_path);
-    Ok(UploadTarget {
-        program: "wsl.exe".to_string(),
-        args: vec![
-            "-e".to_string(),
-            "bash".to_string(),
-            "-lc".to_string(),
-            format!(
-                "{}\nscp -o BatchMode=yes -o ControlPath=\"$ctl\" {} \"$host:{}\"",
-                wsl_prelude(
-                    &commands.control_path,
-                    &commands.wsl_key_path,
-                    &commands.host
-                ),
-                shell_quote(&wsl_local_path),
-                remote_path
-            ),
-        ],
-    })
-}
-
 fn build_robot_download_target(
     settings: &NibiSettings,
     remote_path: &str,
@@ -2212,34 +2077,6 @@ fn build_robot_download_target(
                 remote_path
             ),
             local_path.to_string(),
-        ],
-    })
-}
-
-fn build_manual_mfa_download_target(
-    settings: &NibiSettings,
-    remote_path: &str,
-    local_path: &str,
-) -> Result<UploadTarget, String> {
-    validate_manual_login_settings(settings)?;
-    let commands = build_manual_mfa_session_commands(settings)?;
-    let wsl_local_path = windows_path_to_wsl_mount(local_path);
-    Ok(UploadTarget {
-        program: "wsl.exe".to_string(),
-        args: vec![
-            "-e".to_string(),
-            "bash".to_string(),
-            "-lc".to_string(),
-            format!(
-                "{}\nscp -o BatchMode=yes -o ControlPath=\"$ctl\" \"$host:{}\" {}",
-                wsl_prelude(
-                    &commands.control_path,
-                    &commands.wsl_key_path,
-                    &commands.host
-                ),
-                remote_path,
-                shell_quote(&wsl_local_path)
-            ),
         ],
     })
 }
@@ -2339,6 +2176,8 @@ fn manual_mfa_remote_command_script() -> String {
         "  -S \"$CTL\" \\",
         "  -o ControlMaster=no \\",
         "  -o BatchMode=yes \\",
+        "  -o PasswordAuthentication=no \\",
+        "  -o KbdInteractiveAuthentication=no \\",
         "  \"$HOST\" \\",
         "  \"$REMOTE_COMMAND\"",
     ]
@@ -2700,7 +2539,7 @@ fn write_wsl_script(path: &str, content: &str, distro: &str) -> Result<(), Strin
         "SCRIPT_PATH=\"$SCRIPT_DIR/$SCRIPT_NAME\"",
         "mkdir -p \"$SCRIPT_DIR\"",
         "printf '%s' \"$CONTENT_B64\" | base64 -d > \"$SCRIPT_PATH\"",
-        "chmod +x \"$SCRIPT_PATH\"",
+        "chmod 700 \"$SCRIPT_PATH\"",
         "printf 'SCRIPT_PATH=%s\\n' \"$SCRIPT_PATH\"",
     ]
     .join("\n");
@@ -2724,7 +2563,97 @@ fn write_wsl_script(path: &str, content: &str, distro: &str) -> Result<(), Strin
     }
 }
 
-fn launch_manual_mfa_terminal(commands: ManualMfaSessionCommands) -> ManualMfaTerminalLaunchResult {
+fn resolve_wsl_home(distro: &str) -> Result<String, String> {
+    let output = run_wsl_bash_script(
+        distro,
+        "printf '%s\\n' \"$HOME\"",
+        &[],
+        Duration::from_secs(5),
+    )
+    .map_err(|error| format!("Could not resolve WSL HOME: {error}"))?;
+    if output.status == 0 {
+        let home = output.stdout.trim();
+        if home.starts_with('/') && !home.contains('\n') {
+            return Ok(home.to_string());
+        }
+    }
+    Err(format!(
+        "Could not resolve WSL HOME.\n{}\n{}",
+        output.stdout, output.stderr
+    ))
+}
+
+fn start_script_path_for_wsl_home(wsl_home: &str) -> String {
+    format!(
+        "{}/.fluorcast/scripts/start-nibi-login.sh",
+        wsl_home.trim_end_matches('/')
+    )
+}
+
+fn verify_wsl_login_script(distro: &str, script_path: &str) -> Result<(), String> {
+    let output = run_wsl_bash_script(
+        distro,
+        [
+            "SCRIPT_PATH=\"$1\"",
+            "if [[ ! -e \"$SCRIPT_PATH\" ]]; then",
+            "  printf 'SCRIPT_CHECK=missing\\n'",
+            "  exit 30",
+            "fi",
+            "if [[ ! -f \"$SCRIPT_PATH\" ]]; then",
+            "  printf 'SCRIPT_CHECK=not_file\\n'",
+            "  exit 31",
+            "fi",
+            "if [[ ! -r \"$SCRIPT_PATH\" ]]; then",
+            "  printf 'SCRIPT_CHECK=not_readable\\n'",
+            "  exit 32",
+            "fi",
+            "if [[ ! -x \"$SCRIPT_PATH\" ]]; then",
+            "  printf 'SCRIPT_CHECK=not_executable\\n'",
+            "  exit 33",
+            "fi",
+            "printf 'SCRIPT_CHECK=ready\\n'",
+        ]
+        .join("\n")
+        .as_str(),
+        &[script_path.to_string()],
+        Duration::from_secs(5),
+    )
+    .map_err(|error| format!("Could not verify WSL login script: {error}"))?;
+    if output.status == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Generated WSL login script is not ready.\n{}\n{}",
+            output.stdout, output.stderr
+        ))
+    }
+}
+
+fn build_windows_terminal_login_args(
+    distro: &str,
+    script_path: &str,
+    host: &str,
+    key: &str,
+) -> Vec<String> {
+    vec![
+        "new-tab".to_string(),
+        "--title".to_string(),
+        "FluorCast NIBI Login".to_string(),
+        "wsl.exe".to_string(),
+        "-d".to_string(),
+        wsl_distro_name(distro),
+        "--".to_string(),
+        "bash".to_string(),
+        "--".to_string(),
+        script_path.to_string(),
+        host.to_string(),
+        key.to_string(),
+    ]
+}
+
+fn launch_manual_mfa_terminal(
+    mut commands: ManualMfaSessionCommands,
+) -> ManualMfaTerminalLaunchResult {
     let wsl_ok = command_available("wsl.exe");
     let wt_ok = command_available("wt.exe");
     let powershell_ok = command_available("powershell.exe");
@@ -2798,31 +2727,80 @@ fn launch_manual_mfa_terminal(commands: ManualMfaSessionCommands) -> ManualMfaTe
         };
     }
 
-    if wt_ok {
-        let mut args = vec![
-            "new-tab".to_string(),
-            "--title".to_string(),
-            "FluorCast NIBI Login".to_string(),
-            "wsl.exe".to_string(),
-        ];
-        if !commands.wsl_distro.trim().is_empty() {
-            args.extend(["-d".to_string(), commands.wsl_distro.clone()]);
+    let resolved_home = match resolve_wsl_home(&commands.wsl_distro) {
+        Ok(home) => home,
+        Err(error_message) => {
+            return ManualMfaTerminalLaunchResult {
+                launched: false,
+                method: TerminalLaunchMethod::Manual,
+                message: manual_message,
+                error_message,
+                timestamp,
+                command_preview: commands.manual_wsl_login_command.clone(),
+                generated_script_path: commands.start_script_path.clone(),
+                script_file_exists: false,
+                launch_method_attempted: "resolve_wsl_home".to_string(),
+                launch_error_code: String::new(),
+                manual_wsl_command: commands.manual_wsl_login_command.clone(),
+                commands,
+                windows_terminal_available: wt_ok,
+                powershell_available: powershell_ok,
+                wsl_available: true,
+                distro_available: true,
+            };
         }
-        args.extend([
-            "--".to_string(),
-            "bash".to_string(),
-            "-c".to_string(),
-            "exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\"".to_string(),
-            "--".to_string(),
-            commands.host.clone(),
-            commands.wsl_key_path.clone(),
-        ]);
+    };
+    let resolved_start_script_path = start_script_path_for_wsl_home(&resolved_home);
+    commands.start_script_path = resolved_start_script_path.clone();
+    commands.manual_wsl_login_command = wsl_command_line(
+        &commands.wsl_distro,
+        &resolved_start_script_path,
+        &commands.host,
+        &commands.wsl_key_path,
+    );
+    commands.windows_terminal_command = windows_terminal_command(
+        &commands.wsl_distro,
+        &resolved_start_script_path,
+        &commands.host,
+        &commands.wsl_key_path,
+    );
+
+    if let Err(error_message) =
+        verify_wsl_login_script(&commands.wsl_distro, &resolved_start_script_path)
+    {
+        return ManualMfaTerminalLaunchResult {
+            launched: false,
+            method: TerminalLaunchMethod::Manual,
+            message: manual_message,
+            error_message,
+            timestamp,
+            command_preview: commands.manual_wsl_login_command.clone(),
+            generated_script_path: commands.start_script_path.clone(),
+            script_file_exists: false,
+            launch_method_attempted: "script_verification".to_string(),
+            launch_error_code: String::new(),
+            manual_wsl_command: commands.manual_wsl_login_command.clone(),
+            commands,
+            windows_terminal_available: wt_ok,
+            powershell_available: powershell_ok,
+            wsl_available: true,
+            distro_available: true,
+        };
+    }
+
+    if wt_ok {
+        let args = build_windows_terminal_login_args(
+            &commands.wsl_distro,
+            &resolved_start_script_path,
+            &commands.host,
+            &commands.wsl_key_path,
+        );
         match Command::new("wt.exe").args(&args).spawn() {
             Ok(_) => {
                 return ManualMfaTerminalLaunchResult {
                     launched: true,
                     method: TerminalLaunchMethod::WindowsTerminal,
-                    message: "Windows Terminal opened. Complete password/Duo there, then click Test authenticated session.".to_string(),
+                    message: "NIBI login terminal opened. Complete password and Duo, then press Test authenticated session.".to_string(),
                     error_message: String::new(),
                     timestamp,
                     command_preview: commands.windows_terminal_command.clone(),
@@ -2839,81 +2817,45 @@ fn launch_manual_mfa_terminal(commands: ManualMfaSessionCommands) -> ManualMfaTe
                 };
             }
             Err(error) => {
-                // Fall through to PowerShell visible-window launch.
-                let _ = error;
+                return ManualMfaTerminalLaunchResult {
+                    launched: false,
+                    method: TerminalLaunchMethod::Manual,
+                    message: terminal_command_not_found_message(&error.to_string()),
+                    error_message: format!("Could not spawn wt.exe: {error}"),
+                    timestamp,
+                    command_preview: commands.windows_terminal_command.clone(),
+                    generated_script_path: commands.start_script_path.clone(),
+                    script_file_exists: true,
+                    launch_method_attempted: "windows_terminal".to_string(),
+                    launch_error_code: terminal_launch_error_code(&error.to_string()),
+                    manual_wsl_command: commands.manual_wsl_login_command.clone(),
+                    commands,
+                    windows_terminal_available: true,
+                    powershell_available: powershell_ok,
+                    wsl_available: true,
+                    distro_available: true,
+                };
             }
         }
     }
 
-    if powershell_ok {
-        let ps_command = format!(
-            "Start-Process powershell.exe -ArgumentList '-NoExit','-Command',{}",
-            powershell_single_quote(&wsl_command_line(
-                &commands.wsl_distro,
-                &commands.host,
-                &commands.wsl_key_path
-            ))
-        );
-        match Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", &ps_command])
-            .spawn()
-        {
-            Ok(_) => ManualMfaTerminalLaunchResult {
-                launched: true,
-                method: TerminalLaunchMethod::Powershell,
-                message: "PowerShell opened. Complete password/Duo there, then click Test authenticated session.".to_string(),
-                error_message: String::new(),
-                timestamp,
-                command_preview: commands.powershell_launch_command.clone(),
-                generated_script_path: commands.start_script_path.clone(),
-                script_file_exists: wsl_path_exists(&commands.start_script_path),
-                launch_method_attempted: "powershell".to_string(),
-                launch_error_code: String::new(),
-                manual_wsl_command: commands.manual_wsl_login_command.clone(),
-                commands,
-                windows_terminal_available: wt_ok,
-                powershell_available: true,
-                wsl_available: true,
-                distro_available: true,
-            },
-            Err(error) => ManualMfaTerminalLaunchResult {
-                launched: false,
-                method: TerminalLaunchMethod::Manual,
-                message: terminal_command_not_found_message(&error.to_string()),
-                error_message: format!("Process launch failed: {error}"),
-                timestamp,
-                command_preview: commands.manual_wsl_login_command.clone(),
-                generated_script_path: commands.start_script_path.clone(),
-                script_file_exists: wsl_path_exists(&commands.start_script_path),
-                launch_method_attempted: "powershell".to_string(),
-                launch_error_code: terminal_launch_error_code(&error.to_string()),
-                manual_wsl_command: commands.manual_wsl_login_command.clone(),
-                commands,
-                windows_terminal_available: wt_ok,
-                powershell_available: true,
-                wsl_available: true,
-                distro_available: true,
-            },
-        }
-    } else {
-        ManualMfaTerminalLaunchResult {
-            launched: false,
-            method: TerminalLaunchMethod::Manual,
-            message: manual_message,
-            error_message: "powershell.exe was not found.".to_string(),
-            timestamp,
-            command_preview: commands.manual_wsl_login_command.clone(),
-            generated_script_path: commands.start_script_path.clone(),
-            script_file_exists: wsl_path_exists(&commands.start_script_path),
-            launch_method_attempted: if wt_ok { "windows_terminal" } else { "manual" }.to_string(),
-            launch_error_code: String::new(),
-            manual_wsl_command: commands.manual_wsl_login_command.clone(),
-            commands,
-            windows_terminal_available: wt_ok,
-            powershell_available: false,
-            wsl_available: true,
-            distro_available: true,
-        }
+    ManualMfaTerminalLaunchResult {
+        launched: false,
+        method: TerminalLaunchMethod::Manual,
+        message: manual_message,
+        error_message: "wt.exe was not found.".to_string(),
+        timestamp,
+        command_preview: commands.manual_wsl_login_command.clone(),
+        generated_script_path: commands.start_script_path.clone(),
+        script_file_exists: true,
+        launch_method_attempted: "windows_terminal".to_string(),
+        launch_error_code: String::new(),
+        manual_wsl_command: commands.manual_wsl_login_command.clone(),
+        commands,
+        windows_terminal_available: false,
+        powershell_available: powershell_ok,
+        wsl_available: true,
+        distro_available: true,
     }
 }
 
@@ -3558,17 +3500,24 @@ fn validate_wsl_private_key_path_setting(value: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("WSL private key path is required.".to_string());
     }
-    if !trimmed.starts_with('/') {
-        return Err("WSL private key path must be an absolute POSIX path.".to_string());
+    let supported_prefix =
+        trimmed.starts_with('/') || trimmed.starts_with("$HOME/") || trimmed.starts_with("~/");
+    if !supported_prefix {
+        return Err("WSL private key path must be /home, $HOME/, or ~/.".to_string());
     }
     if trimmed.to_ascii_lowercase().ends_with(".pub") {
         return Err("Choose the private SSH key file, not the .pub public key.".to_string());
     }
-    if trimmed
-        .chars()
-        .any(|character| character.is_control() || "\"';&|`$<>\\\t".contains(character))
-    {
-        return Err("WSL private key path contains unsupported characters.".to_string());
+    for (index, character) in trimmed.chars().enumerate() {
+        let allowed_home_marker = character == '$' && index == 0 && trimmed.starts_with("$HOME/");
+        let allowed_tilde_marker = character == '~' && index == 0 && trimmed.starts_with("~/");
+        if character.is_control()
+            || "\"';&|`<>\\\t".contains(character)
+            || (character == '$' && !allowed_home_marker)
+            || (character == '~' && !allowed_tilde_marker)
+        {
+            return Err("WSL private key path contains unsupported characters.".to_string());
+        }
     }
     Ok(())
 }
@@ -3583,7 +3532,7 @@ fn wsl_distro_name(distro: &str) -> String {
 }
 
 fn default_manual_mfa_provider() -> String {
-    "terminal_action".to_string()
+    "controlmaster".to_string()
 }
 
 fn default_normal_login_host() -> String {
@@ -3694,39 +3643,38 @@ fn timestamp_now() -> String {
     format!("{seconds}")
 }
 
-fn wsl_command_line(distro: &str, host: &str, key: &str) -> String {
-    let launcher = "exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\"";
+fn wsl_command_line(distro: &str, script_path: &str, host: &str, key: &str) -> String {
     if distro.trim().is_empty() {
         format!(
-            "wsl.exe -- bash -c {} -- {} {}",
-            powershell_single_quote(launcher),
+            "wsl.exe -- bash -- {} {} {}",
+            powershell_single_quote(script_path),
             powershell_single_quote(host),
             powershell_single_quote(key)
         )
     } else {
         format!(
-            "wsl.exe -d {} -- bash -c {} -- {} {}",
+            "wsl.exe -d {} -- bash -- {} {} {}",
             powershell_single_quote(distro.trim()),
-            powershell_single_quote(launcher),
+            powershell_single_quote(script_path),
             powershell_single_quote(host),
             powershell_single_quote(key)
         )
     }
 }
 
-fn windows_terminal_command(distro: &str, host: &str, key: &str) -> String {
+fn windows_terminal_command(distro: &str, script_path: &str, host: &str, key: &str) -> String {
     let command = if distro.trim().is_empty() {
         format!(
-            "wt.exe new-tab --title \"FluorCast NIBI Login\" wsl.exe -- bash -c {} -- {} {}",
-            powershell_single_quote("exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\""),
+            "wt.exe new-tab --title \"FluorCast NIBI Login\" wsl.exe -- bash -- {} {} {}",
+            powershell_single_quote(script_path),
             powershell_single_quote(host),
             powershell_single_quote(key)
         )
     } else {
         format!(
-            "wt.exe new-tab --title \"FluorCast NIBI Login\" wsl.exe -d {} -- bash -c {} -- {} {}",
+            "wt.exe new-tab --title \"FluorCast NIBI Login\" wsl.exe -d {} -- bash -- {} {} {}",
             powershell_single_quote(distro.trim()),
-            powershell_single_quote("exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\""),
+            powershell_single_quote(script_path),
             powershell_single_quote(host),
             powershell_single_quote(key)
         )
@@ -3734,12 +3682,8 @@ fn windows_terminal_command(distro: &str, host: &str, key: &str) -> String {
     redact_session_command(&command, CANONICAL_WSL_CONTROL_SOCKET_PATH, key)
 }
 
-fn powershell_launch_command(distro: &str, host: &str, key: &str) -> String {
-    let command = format!(
-        "powershell.exe -NoProfile -Command \"Start-Process powershell.exe -ArgumentList '-NoExit', '-Command', '{}'\"",
-        wsl_command_line(distro, host, key).replace('\'', "''")
-    );
-    redact_session_command(&command, CANONICAL_WSL_CONTROL_SOCKET_PATH, key)
+fn powershell_launch_command(_distro: &str, _host: &str, _key: &str) -> String {
+    "PowerShell fallback is disabled for Manual MFA terminal launch; FluorCast spawns wt.exe directly.".to_string()
 }
 
 fn terminal_launch_error_code(message: &str) -> String {
@@ -3759,19 +3703,6 @@ fn terminal_command_not_found_message(message: &str) -> String {
         "Could not open the login terminal automatically. Open WSL and run:\nbash ~/.fluorcast/scripts/start-nibi-login.sh"
             .to_string()
     }
-}
-
-fn wsl_prelude(control_path: &str, key: &str, host: &str) -> String {
-    format!(
-        "ctl={}\nkey={}\nhost={}",
-        wsl_assignment_quote(control_path),
-        wsl_assignment_quote(key),
-        wsl_assignment_quote(host)
-    )
-}
-
-fn wsl_assignment_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn redact_session_command(command: &str, control_path: &str, key: &str) -> String {
@@ -3808,17 +3739,6 @@ fn map_manual_mfa_error(message: &str) -> String {
         "FluorCast did not find the reusable SSH session. Start login from FluorCast and keep the session alive.".to_string()
     } else {
         message.to_string()
-    }
-}
-
-fn windows_path_to_wsl_mount(path: &str) -> String {
-    let trimmed = path.trim().replace('\\', "/");
-    let bytes = trimmed.as_bytes();
-    if bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'/' {
-        let drive = (bytes[0] as char).to_ascii_lowercase();
-        format!("/mnt/{drive}/{}", &trimmed[3..])
-    } else {
-        "/mnt/c/Users/<you>/.ssh/id_ed25519".to_string()
     }
 }
 
@@ -4017,64 +3937,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_terminal_action_powershell_ssh_command() {
-        let paths = TerminalActionPaths {
-            action_id: "ssh_123".to_string(),
-            work_dir: "C:\\Temp\\fluorcast-terminal-actions\\ssh_123".to_string(),
-            command_path: "C:\\Temp\\fluorcast-terminal-actions\\ssh_123\\command.ps1".to_string(),
-            stdout_path: "C:\\Temp\\fluorcast-terminal-actions\\ssh_123\\stdout.txt".to_string(),
-            stderr_path: "C:\\Temp\\fluorcast-terminal-actions\\ssh_123\\stderr.txt".to_string(),
-            exit_code_path: "C:\\Temp\\fluorcast-terminal-actions\\ssh_123\\exit_code.txt"
-                .to_string(),
-            result_json_path: "C:\\Temp\\fluorcast-terminal-actions\\ssh_123\\result.json"
-                .to_string(),
-        };
-        let script = terminal_ssh_script(
-            &settings(),
-            "sbatch --parsable '/project/run.sbatch' '/jobs/input.json' '/jobs/output.json'",
-            &paths,
-        );
-
-        assert!(script.contains("ssh -i 'C:\\Users\\Alice\\.ssh\\fluorcast_nibi_ed25519' -o IdentitiesOnly=yes 'alice@nibi.alliancecan.ca'"));
-        assert!(script.contains("'sbatch --parsable ''/project/run.sbatch'' ''/jobs/input.json'' ''/jobs/output.json'''"));
-        assert!(script.contains("1> 'C:\\Temp\\fluorcast-terminal-actions\\ssh_123\\stdout.txt'"));
-        assert!(script.contains("2> 'C:\\Temp\\fluorcast-terminal-actions\\ssh_123\\stderr.txt'"));
-        assert!(script.contains("$LASTEXITCODE"));
-        assert!(!script.contains("Read-Host"));
-        assert!(!script.to_ascii_lowercase().contains("passcode"));
-    }
-
-    #[test]
-    fn builds_terminal_action_powershell_scp_command() {
-        let paths = TerminalActionPaths {
-            action_id: "scp_123".to_string(),
-            work_dir: "C:\\Temp\\fluorcast-terminal-actions\\scp_123".to_string(),
-            command_path: "C:\\Temp\\fluorcast-terminal-actions\\scp_123\\command.ps1".to_string(),
-            stdout_path: "C:\\Temp\\fluorcast-terminal-actions\\scp_123\\stdout.txt".to_string(),
-            stderr_path: "C:\\Temp\\fluorcast-terminal-actions\\scp_123\\stderr.txt".to_string(),
-            exit_code_path: "C:\\Temp\\fluorcast-terminal-actions\\scp_123\\exit_code.txt"
-                .to_string(),
-            result_json_path: "C:\\Temp\\fluorcast-terminal-actions\\scp_123\\result.json"
-                .to_string(),
-        };
-        let script = terminal_scp_script(
-            &settings(),
-            "alice@nibi.alliancecan.ca:/home/alice/scratch/fluorcast-jobs/job-1/output.json",
-            "C:\\Temp\\fluorcast-job-1-output.json",
-            &paths,
-        );
-
-        assert!(script.contains(
-            "scp -i 'C:\\Users\\Alice\\.ssh\\fluorcast_nibi_ed25519' -o IdentitiesOnly=yes"
-        ));
-        assert!(script.contains(
-            "'alice@nibi.alliancecan.ca:/home/alice/scratch/fluorcast-jobs/job-1/output.json'"
-        ));
-        assert!(script.contains("'C:\\Temp\\fluorcast-job-1-output.json'"));
-        assert!(script.contains("exit_code.txt"));
-    }
-
-    #[test]
     fn builds_manual_mfa_login_command_with_control_master() {
         let commands = build_manual_mfa_session_commands(&settings()).unwrap();
 
@@ -4092,7 +3954,12 @@ mod tests {
             .contains("CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\""));
         assert!(commands.login_command.contains("HOST=\"$1\""));
         assert!(commands.login_command.contains("KEY=\"$2\""));
-        assert!(commands.login_command.contains("[[ \"$KEY\" != /* ]]"));
+        assert!(commands
+            .login_command
+            .contains("'$HOME'/*) KEY=\"$HOME/${KEY#\\$HOME/}\""));
+        assert!(commands
+            .login_command
+            .contains("'~'/*) KEY=\"$HOME/${KEY#~/}\""));
         assert!(commands.login_command.contains("ssh -fMN"));
         assert!(commands.login_command.contains("-o ControlMaster=yes"));
         assert!(commands.login_command.contains("-o ControlPath=\"$CTL\""));
@@ -4120,20 +3987,18 @@ mod tests {
         assert!(!commands.login_command.contains("alice@nibi.alliancecan.ca"));
         assert!(commands.windows_terminal_command.contains("wt.exe new-tab"));
         assert!(commands.windows_terminal_command.contains(
-            "wsl.exe -d 'Ubuntu' -- bash -c 'exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\"'"
+            "wsl.exe -d 'Ubuntu' -- bash -- '$HOME/.fluorcast/scripts/start-nibi-login.sh'"
         ));
+        assert!(!commands.windows_terminal_command.contains("bash -c"));
+        assert!(!commands.windows_terminal_command.contains("$@"));
         assert!(!commands.windows_terminal_command.contains("ssh -fMN"));
         assert!(!commands
             .windows_terminal_command
             .contains("An active FluorCast NIBI session already exists."));
         assert!(commands
             .powershell_launch_command
-            .contains("Start-Process powershell.exe"));
-        assert!(commands
-            .powershell_launch_command
-            .contains("exec \"$HOME/.fluorcast/scripts/start-nibi-login.sh\" \"$@\""));
+            .contains("PowerShell fallback is disabled"));
         assert!(!commands.powershell_launch_command.contains("ssh -fMN"));
-        assert!(commands.powershell_launch_command.contains("-NoExit"));
         assert!(!commands
             .redacted_login_command_preview
             .contains("/home/alice/.ssh/fluorcast_nibi_ed25519"));
@@ -4191,12 +4056,75 @@ mod tests {
             .contains("ssh -S \"$CTL\" -O exit \"$HOST\""));
         assert!(commands
             .clean_script_content
-            .contains("CLEAN_RESULT=SESSION_REMOVED"));
+            .contains("CLEAN_RESULT=HEALTHY_SESSION_CLOSED"));
+        assert!(commands
+            .clean_script_content
+            .contains("CLEAN_RESULT=STALE_SOCKET_REMOVED"));
         assert!(commands.clean_script_content.contains("rm -f \"$CTL\""));
         assert!(!commands.clean_script_content.contains("cm-alice-nibi.sock"));
         assert!(commands
             .background_command_template
-            .contains("ControlMaster=no -o BatchMode=yes"));
+            .contains("ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no"));
+    }
+
+    #[test]
+    fn windows_terminal_login_args_are_separate_and_do_not_forward_shell_args() {
+        let args = build_windows_terminal_login_args(
+            "Ubuntu",
+            "/home/alice/.fluorcast/scripts/start-nibi-login.sh",
+            "alice@nibi.alliancecan.ca",
+            "/home/alice/.ssh/fluorcast_nibi_ed25519",
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "new-tab",
+                "--title",
+                "FluorCast NIBI Login",
+                "wsl.exe",
+                "-d",
+                "Ubuntu",
+                "--",
+                "bash",
+                "--",
+                "/home/alice/.fluorcast/scripts/start-nibi-login.sh",
+                "alice@nibi.alliancecan.ca",
+                "/home/alice/.ssh/fluorcast_nibi_ed25519",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "-c" || arg.contains("$@")));
+    }
+
+    #[test]
+    fn wsl_private_key_validation_accepts_safe_home_forms() {
+        assert!(
+            validate_wsl_private_key_path_setting("/home/alice/.ssh/fluorcast_nibi_ed25519")
+                .is_ok()
+        );
+        assert!(validate_wsl_private_key_path_setting("$HOME/.ssh/fluorcast_nibi_ed25519").is_ok());
+        assert!(validate_wsl_private_key_path_setting("~/.ssh/fluorcast_nibi_ed25519").is_ok());
+        assert!(validate_wsl_private_key_path_setting("relative/key").is_err());
+        assert!(validate_wsl_private_key_path_setting("$HOME/.ssh/key$bad").is_err());
+    }
+
+    #[test]
+    fn manual_mfa_file_transfers_use_wsl_scp_with_control_socket() {
+        let upload = manual_mfa_scp_upload_script();
+        let download = manual_mfa_scp_download_script();
+
+        for script in [upload, download] {
+            assert!(script.contains("wslpath -a"));
+            assert!(script.contains("CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\""));
+            assert!(script.contains("-o ControlPath=\"$CTL\""));
+            assert!(script.contains("-o ControlMaster=no"));
+            assert!(script.contains("-o BatchMode=yes"));
+            assert!(script.contains("-o PasswordAuthentication=no"));
+            assert!(script.contains("-o KbdInteractiveAuthentication=no"));
+            assert!(!script.contains("-i \"$KEY\""));
+            assert!(!script.contains("ssh.exe"));
+            assert!(!script.contains("scp.exe"));
+        }
     }
 
     #[test]

@@ -14,17 +14,19 @@ import { joinRemoteChildPath } from "./uploadPredictionInput";
 
 export type SlurmPollingStatus =
   | "submitted_to_slurm"
+  | "queued"
   | "running"
   | "completed"
   | "failed"
   | "cancelled"
-  | "timeout"
+  | "timed_out"
   | "login_required"
   | "robot_auth_failed"
   | "connection_failed"
   | "output_missing"
   | "output_invalid"
-  | "download_failed";
+  | "download_failed"
+  | "unknown";
 
 export type SlurmPollingResult = {
   jobId: string;
@@ -63,7 +65,7 @@ const defaultPersistence: SlurmPollingPersistence = {
 };
 
 function activeStatus(status: SlurmPollingStatus) {
-  return status === "submitted_to_slurm" || status === "running";
+  return status === "submitted_to_slurm" || status === "queued" || status === "running";
 }
 
 function connectionFailureStatus(settings: NibiSettings, remoteExecutor: RemoteExecutor): SlurmPollingResult | null {
@@ -130,7 +132,7 @@ function isSacctUnavailable(result: { exit_code: number; stdout: string; stderr:
 function mapSlurmState(state: string, exitCode?: string): SlurmPollingStatus {
   const normalized = state.trim().toUpperCase().split(/\s+/)[0];
   if (["PENDING", "CONFIGURING", "REQUEUED", "RESIZING", "SUSPENDED"].includes(normalized)) {
-    return "submitted_to_slurm";
+    return "queued";
   }
   if (["RUNNING", "COMPLETING", "STAGE_OUT"].includes(normalized)) {
     return "running";
@@ -142,9 +144,12 @@ function mapSlurmState(state: string, exitCode?: string): SlurmPollingStatus {
     return "cancelled";
   }
   if (normalized === "TIMEOUT" || normalized === "DEADLINE") {
-    return "timeout";
+    return "timed_out";
   }
-  return "failed";
+  if (["FAILED", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL"].includes(normalized)) {
+    return "failed";
+  }
+  return "unknown";
 }
 
 async function readRemoteLog(
@@ -265,6 +270,10 @@ export async function downloadPredictionOutput(
   persistence: SlurmPollingPersistence = defaultPersistence,
 ): Promise<SlurmPollingResult> {
   try {
+    const [stdoutLog, stderrLog] = await Promise.all([
+      readRemoteLog(job, "stdout.log", settings, remoteExecutor),
+      readRemoteLog(job, "stderr.log", settings, remoteExecutor),
+    ]);
     const localPath = await localOutputPath(job.id);
     await remoteExecutor.downloadFile(remoteOutputPath(job), localPath, trimNibiSettings(settings));
     const outputJson = await invoke<string>("read_prediction_output_file", { localPath });
@@ -272,6 +281,8 @@ export async function downloadPredictionOutput(
     await persistence.saveResult(job.id, output, output.completed_at);
     await persistence.updateJobStatus(job.id, "completed", {
       completedAt: output.completed_at,
+      slurmStdout: stdoutLog,
+      slurmStderr: stderrLog,
       errorMessage: undefined,
     });
     await persistence.addJobEvent(job.id, "slurm_completed", "Downloaded and saved output.json.", output.completed_at);
@@ -381,30 +392,51 @@ export async function pollSlurmJobStatus(
     if (await checkRemoteOutputExists(job, settings, remoteExecutor)) {
       return downloadPredictionOutput(job, settings, remoteExecutor, persistence);
     }
+    const [stdoutLog, stderrLog] = await Promise.all([
+      readRemoteLog(job, "stdout.log", settings, remoteExecutor),
+      readRemoteLog(job, "stderr.log", settings, remoteExecutor),
+    ]);
     const error = sacctUnavailable
       ? classifyRemoteCommandFailure(sacct, "slurm_poll")
       : appError("output_missing");
+    const details = buildFailureDetails({
+      state: sacctRow?.state,
+      exitCode: sacctRow?.exitCode,
+      remoteJobDir: job.remote_job_dir,
+      submittedCommand: job.submitted_command,
+      stdout: stdoutLog,
+      stderr: stderrLog,
+    }) || error.technicalDetails;
     const result: SlurmPollingResult = {
       jobId: job.id,
       slurmJobId: job.remote_slurm_id,
       status: "output_missing",
       message: error.message,
-      technicalDetails: error.technicalDetails,
+      technicalDetails: details,
       appError: error,
       slurmState: sacctRow?.state,
     };
-    await persistPollingStatus(job, result, persistence);
+    const completedAt = new Date().toISOString();
+    await persistence.updateJobStatus(job.id, result.status, {
+      completedAt,
+      slurmState: sacctRow?.state,
+      slurmExitCode: sacctRow?.exitCode,
+      slurmStdout: stdoutLog,
+      slurmStderr: stderrLog,
+      errorMessage: [result.message, result.technicalDetails].filter(Boolean).join("\n\n"),
+    });
+    await persistence.addJobEvent(job.id, `slurm_${result.status}`, result.message, completedAt);
     return result;
   }
 
   if (mappedStatus) {
-    const [stdoutLog, stderrLog] = ["failed", "cancelled", "timeout"].includes(mappedStatus)
+    const [stdoutLog, stderrLog] = ["failed", "cancelled", "timed_out", "unknown"].includes(mappedStatus)
       ? await Promise.all([
         readRemoteLog(job, "stdout.log", settings, remoteExecutor),
         readRemoteLog(job, "stderr.log", settings, remoteExecutor),
       ])
       : ["", ""];
-    const failureDetails = ["failed", "cancelled", "timeout"].includes(mappedStatus)
+    const failureDetails = ["failed", "cancelled", "timed_out", "unknown"].includes(mappedStatus)
       ? buildFailureDetails({
         state: sacctRow?.state,
         exitCode: sacctRow?.exitCode,

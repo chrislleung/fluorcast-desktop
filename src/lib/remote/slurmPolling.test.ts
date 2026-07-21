@@ -129,12 +129,13 @@ describe("Slurm polling helpers", () => {
   });
 
   it("maps Slurm states to app statuses", () => {
-    expect(mapSlurmStateToJobStatus("PENDING")).toBe("submitted_to_slurm");
+    expect(mapSlurmStateToJobStatus("PENDING")).toBe("queued");
     expect(mapSlurmStateToJobStatus("RUNNING")).toBe("running");
     expect(mapSlurmStateToJobStatus("COMPLETED", "0:0")).toBe("completed");
     expect(mapSlurmStateToJobStatus("CANCELLED")).toBe("cancelled");
-    expect(mapSlurmStateToJobStatus("TIMEOUT")).toBe("timeout");
+    expect(mapSlurmStateToJobStatus("TIMEOUT")).toBe("timed_out");
     expect(mapSlurmStateToJobStatus("FAILED", "1:0")).toBe("failed");
+    expect(mapSlurmStateToJobStatus("MYSTERY")).toBe("unknown");
   });
 
   it("generates the remote output exists command", () => {

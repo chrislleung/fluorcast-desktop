@@ -20,12 +20,8 @@ describe("JobsPage recovery actions", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
-  it("shows reconnect panel for login-required Manual MFA jobs", () => {
+  it("points login-required Manual MFA jobs back to Settings", () => {
     const reconnect = vi.fn();
-    const testSession = vi.fn();
-    const startLogin = vi.fn();
-    const copyLogin = vi.fn();
-    const openDiagnostics = vi.fn();
     render(
       <JobsPage
         jobs={[{
@@ -41,24 +37,15 @@ describe("JobsPage recovery actions", () => {
         }}
         onOpenResult={vi.fn()}
         onReconnect={reconnect}
-        onCopyManualMfaLoginCommand={copyLogin}
-        onOpenManualMfaDiagnostics={openDiagnostics}
-        onStartManualMfaLogin={startLogin}
-        onTestManualMfaSession={testSession}
       />,
     );
 
     expect(screen.getByText("NIBI login required")).toBeInTheDocument();
-    expect(screen.getByText(/Start the login from FluorCast or test the app session below/i)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Copy app login command" }));
-    expect(copyLogin).toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Open Manual MFA diagnostics" }));
-    expect(openDiagnostics).toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Test app session" }));
-    expect(testSession).toHaveBeenCalledWith(expect.objectContaining({ status: "login_required" }));
-    fireEvent.click(screen.getByRole("button", { name: "Start manual NIBI login" }));
-    expect(startLogin).toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Go to Settings" }));
+    expect(screen.getByText(/Open Settings to start or test the NIBI session/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy app login command" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Test app session" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start manual NIBI login" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
     expect(reconnect).toHaveBeenCalled();
   });
 

@@ -137,11 +137,33 @@ describe("NIBI settings validation", () => {
     });
 
     expect(errors).toMatchObject({
-      wsl_ssh_private_key_path: "Path contains unsupported shell metacharacters.",
+      wsl_ssh_private_key_path: "WSL private key path contains unsupported shell metacharacters.",
       remote_project_path: "Path contains unsupported shell metacharacters.",
       remote_jobs_path: "Path contains unsupported shell metacharacters.",
       python_environment_path: "Path contains unsupported shell metacharacters.",
     });
+  });
+
+  it("accepts supported WSL private-key home path forms", () => {
+    for (const wslPath of [
+      "/home/cl/.ssh/fluorcast_nibi_ed25519",
+      "$HOME/.ssh/fluorcast_nibi_ed25519",
+      "~/.ssh/fluorcast_nibi_ed25519",
+    ]) {
+      expect(validateNibiSettings({
+        ...defaultNibiSettings,
+        connection_mode: "interactive_mfa",
+        nibi_username: "chrisl",
+        wsl_ssh_private_key_path: wslPath,
+      }).wsl_ssh_private_key_path).toBeUndefined();
+    }
+
+    expect(validateNibiSettings({
+      ...defaultNibiSettings,
+      connection_mode: "interactive_mfa",
+      nibi_username: "chrisl",
+      wsl_ssh_private_key_path: "relative/key",
+    }).wsl_ssh_private_key_path).toBe("WSL private key path must be /home, $HOME/, or ~/.");
   });
 
   it("detects common absolute path forms", () => {
@@ -232,17 +254,19 @@ describe("NIBI settings validation", () => {
     expect(request).toContain("download completed output files");
   });
 
-  it("does not expose old user-specific NIBI paths in user-facing docs", () => {
+  it("keeps setup docs generic while the manual QA checklist carries the workstation acceptance values", () => {
     const docs = [
       readFileSync(join(process.cwd(), "README.md"), "utf8"),
       readFileSync(join(process.cwd(), "docs", "nibi-setup.md"), "utf8"),
-      readFileSync(join(process.cwd(), "docs", "manual-qa-checklist.md"), "utf8"),
     ].join("\n");
+    const manualChecklist = readFileSync(join(process.cwd(), "docs", "manual-qa-checklist.md"), "utf8");
 
     expect(docs).not.toContain("chrisl");
     expect(docs).not.toContain("ChemFluor_Project");
     expect(docs).not.toContain("/home/chrisl");
     expect(docs).not.toContain("scratch/ChemFluor_Project");
+    expect(manualChecklist).toContain("/home/chrisl/scratch/FluorCast");
+    expect(manualChecklist).toContain("/home/cl/.ssh/fluorcast_nibi_ed25519");
   });
 
   it("trims values before persistence or validation", () => {

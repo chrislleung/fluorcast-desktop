@@ -178,12 +178,28 @@ export function NewPredictionPage({
 
         const connectionStatus = remoteExecutor.getConnectionStatus(nibiSettings);
         if (nibiSettings.connection_mode === "interactive_mfa" && connectionStatus.state !== "authenticated") {
-          setSubmitStatus(appErrorMessages.interactive_login_required);
+          const message = appErrorMessages.interactive_login_required;
+          const blockedJob: StoredPredictionJob = {
+            ...submittingJob,
+            status: "login_required",
+            error_message: message,
+          };
+          setUploadedJob(blockedJob);
+          setSubmitStatus(message);
+          await onJobChange?.(blockedJob);
           onOpenSettings?.();
           return;
         }
         if (nibiSettings.connection_mode === "robot_automation" && !nibiSettings.robot_access_verified) {
-          setSubmitStatus(appErrorMessages.robot_access_not_ready);
+          const message = appErrorMessages.robot_access_not_ready;
+          const blockedJob: StoredPredictionJob = {
+            ...submittingJob,
+            status: "robot_access_required",
+            error_message: message,
+          };
+          setUploadedJob(blockedJob);
+          setSubmitStatus(message);
+          await onJobChange?.(blockedJob);
           onOpenSettings?.();
           return;
         }
@@ -207,11 +223,6 @@ export function NewPredictionPage({
           remote_output_path: uploadResult.remote_output_path,
         };
         setUploadedJob(uploaded);
-        if (nibiSettings.connection_mode === "interactive_mfa" && nibiSettings.manual_mfa_provider === "terminal_action") {
-          setSubmitStatus("Input uploaded. Open Jobs and click Submit to Slurm.");
-          await onJobChange?.(uploaded);
-          return;
-        }
         setSubmitStatus("Uploaded input.json to NIBI; submitting Slurm job.");
         await onJobChange?.(uploaded);
 

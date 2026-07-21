@@ -75,32 +75,32 @@ describe("remote executor factory", () => {
     expect(result.stderr).toContain("Manual MFA login is not authenticated");
   });
 
-  it("terminal-action manual MFA runs through visible terminal command boundary without reusable session auth", async () => {
+  it("legacy terminal-action Manual MFA settings do not bypass session auth", async () => {
+    vi.mocked(invoke).mockClear();
     const executor = createRemoteExecutor("interactive_mfa");
     const settings = {
       ...defaultNibiSettings,
       connection_mode: "interactive_mfa" as const,
-      manual_mfa_provider: "terminal_action" as const,
+      manual_mfa_provider: "terminal_action",
       nibi_username: "alice",
       ssh_private_key_path: "C:\\Users\\Alice\\.ssh\\fluorcast_nibi",
-    };
+    } as unknown as typeof defaultNibiSettings;
 
     expect(executor.getConnectionStatus(settings)).toMatchObject({
-      state: "authenticated",
-      label: "Terminal action ready",
+      state: "authentication_required",
+      label: "Login required",
     });
 
-    await executor.runCommand({
+    const result = await executor.runCommand({
       label: "Submit prediction Slurm job",
       executable: "sbatch",
       args: ["--parsable", "/project/slurm/run_prediction_job.sbatch", "/jobs/job-1/input.json", "/jobs/job-1/output.json"],
       settings,
     });
 
-    expect(invoke).toHaveBeenCalledWith("run_nibi_remote_command", expect.objectContaining({
-      mode: "interactive_mfa",
-      settings: expect.objectContaining({ manual_mfa_provider: "terminal_action" }),
-    }));
+    expect(result.exit_code).toBe(1);
+    expect(result.stderr).toContain("Manual MFA login is not authenticated");
+    expect(invoke).not.toHaveBeenCalledWith("run_nibi_remote_command", expect.anything());
   });
 
   it("robot executor uses robot host, not normal login host", () => {

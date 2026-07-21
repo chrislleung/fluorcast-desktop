@@ -202,7 +202,7 @@ export function buildManualMfaSessionCommands(
   const checkScriptPath = `${scriptDir}/check-nibi-session.sh`;
   const endScriptPath = `${scriptDir}/end-nibi-session.sh`;
   const cleanScriptPath = `${scriptDir}/clean-nibi-session.sh`;
-  const manualWslLoginCommand = `wsl.exe -d ${quoteWindowsArg(distro)} -- bash -c ${quoteWindowsArg(`exec "$HOME/.fluorcast/scripts/start-nibi-login.sh" "$@"`)} -- ${quoteWindowsArg(target)} ${quoteWindowsArg(key)}`;
+  const manualWslLoginCommand = `wsl.exe -d ${quoteWindowsArg(distro)} -- bash -- ${quoteWindowsArg(startScriptPath)} ${quoteWindowsArg(target)} ${quoteWindowsArg(key)}`;
   const wslSetupKeyCommands = "Debug only: create or copy the private key inside WSL, then enter its absolute Linux path in FluorCast.";
   const clean = [
     "#!/usr/bin/env bash",
@@ -225,11 +225,19 @@ export function buildManualMfaSessionCommands(
     "",
     'if [[ -S "$CTL" ]] && ssh -S "$CTL" -O check "$HOST" >/dev/null 2>&1; then',
     '  ssh -S "$CTL" -O exit "$HOST" >/dev/null 2>&1 || true',
+    '  rm -f "$CTL"',
+    "  printf 'CLEAN_RESULT=HEALTHY_SESSION_CLOSED\\n'",
+    "  exit 0",
     "fi",
     "",
-    'rm -f "$CTL"',
+    'if [[ -S "$CTL" ]]; then',
+    '  rm -f "$CTL"',
+    "  printf 'CLEAN_RESULT=STALE_SOCKET_REMOVED\\n'",
+    "  exit 0",
+    "fi",
     "",
-    "printf 'CLEAN_RESULT=SESSION_REMOVED\\n'",
+    "printf 'CLEAN_RESULT=CLEANUP_FAILED\\n'",
+    "exit 14",
   ].join("\n");
   const start = [
     "#!/usr/bin/env bash",
@@ -242,10 +250,16 @@ export function buildManualMfaSessionCommands(
     'mkdir -p "$HOME/.fluorcast/ssh"',
     'chmod 700 "$HOME/.fluorcast/ssh"',
     "",
-    'if [[ "$KEY" != /* ]]; then',
-    '  echo "WSL private key path must be an absolute POSIX path."',
-    "  exit 20",
-    "fi",
+    'case "$KEY" in',
+    "  '$HOME'/*) KEY=\"$HOME/${KEY#\\$HOME/}\" ;;",
+    "  '~'/*) KEY=\"$HOME/${KEY#~/}\" ;;",
+    "  /*) ;;",
+    "  *)",
+    '    echo "WSL private key path must be /home, $HOME/, or ~/."',
+    "    exit 20",
+    "    ;;",
+    "esac",
+    "",
     'if [[ ! -e "$KEY" ]]; then',
     '  echo "WSL private key was not found."',
     "  exit 21",
@@ -261,8 +275,11 @@ export function buildManualMfaSessionCommands(
     "",
     'if [[ -S "$CTL" ]] && ssh -S "$CTL" -O check "$HOST" >/dev/null 2>&1; then',
     '  echo "An active FluorCast NIBI session already exists."',
+    'elif [[ -e "$CTL" && ! -S "$CTL" ]]; then',
+    '  echo "ControlPath exists but is not a socket. Clean stale WSL session first."',
+    "  exit 24",
     "else",
-    '  rm -f "$CTL"',
+    '  [[ ! -e "$CTL" || -S "$CTL" ]] && rm -f "$CTL"',
     "  ssh -fMN \\",
     '    -S "$CTL" \\',
     '    -i "$KEY" \\',
@@ -350,7 +367,7 @@ export function buildManualMfaSessionCommands(
     'HOST="$1"',
     'REMOTE_COMMAND="$2"',
     'CTL="$HOME/.fluorcast/ssh/cm-nibi.sock"',
-    'ssh -S "$CTL" -o ControlMaster=no -o BatchMode=yes "$HOST" "$REMOTE_COMMAND"',
+    'ssh -S "$CTL" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "$HOST" "$REMOTE_COMMAND"',
   ].join("\n");
 
   return {
@@ -599,28 +616,22 @@ export function buildWslBackgroundCommand(settings: NibiSettings, remoteCommand:
     `HOST=${shellQuote(commands.host)}`,
     `REMOTE_COMMAND=${shellQuote(remoteCommand)}`,
     'CTL="$HOME/.fluorcast/ssh/cm-nibi.sock"',
-    'ssh -S "$CTL" -o ControlMaster=no -o BatchMode=yes "$HOST" "$REMOTE_COMMAND"',
+    'ssh -S "$CTL" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no "$HOST" "$REMOTE_COMMAND"',
   ].join("\n");
 }
 
 export function buildWindowsTerminalCommand(distro: string, host: string, key: string): string {
-  const launcher = 'exec "$HOME/.fluorcast/scripts/start-nibi-login.sh" "$@"';
   const wsl = distro.trim()
-    ? `wsl.exe -d ${quoteWindowsArg(distro.trim())} -- bash -c ${quoteWindowsArg(launcher)} -- ${quoteWindowsArg(host)} ${quoteWindowsArg(key)}`
-    : `wsl.exe -- bash -c ${quoteWindowsArg(launcher)} -- ${quoteWindowsArg(host)} ${quoteWindowsArg(key)}`;
+    ? `wsl.exe -d ${quoteWindowsArg(distro.trim())} -- bash -- ${quoteWindowsArg("$HOME/.fluorcast/scripts/start-nibi-login.sh")} ${quoteWindowsArg(host)} ${quoteWindowsArg(key)}`
+    : `wsl.exe -- bash -- ${quoteWindowsArg("$HOME/.fluorcast/scripts/start-nibi-login.sh")} ${quoteWindowsArg(host)} ${quoteWindowsArg(key)}`;
   return redactSessionCommand(`wt.exe new-tab --title "FluorCast NIBI Login" ${wsl}`, CANONICAL_WSL_CONTROL_SOCKET_PATH, key);
 }
 
 export function buildPowerShellLaunchCommand(distro: string, host: string, key: string): string {
-  const launcher = 'exec "$HOME/.fluorcast/scripts/start-nibi-login.sh" "$@"';
-  const wsl = distro.trim()
-    ? `wsl.exe -d ${quoteWindowsArg(distro.trim())} -- bash -c ${quoteWindowsArg(launcher)} -- ${quoteWindowsArg(host)} ${quoteWindowsArg(key)}`
-    : `wsl.exe -- bash -c ${quoteWindowsArg(launcher)} -- ${quoteWindowsArg(host)} ${quoteWindowsArg(key)}`;
-  return redactSessionCommand(
-    `powershell.exe -NoProfile -Command "Start-Process powershell.exe -ArgumentList '-NoExit', '-Command', '${wsl.replaceAll("'", "''")}'"`,
-    CANONICAL_WSL_CONTROL_SOCKET_PATH,
-    key,
-  );
+  void distro;
+  void host;
+  void key;
+  return "PowerShell fallback is disabled for Manual MFA terminal launch; FluorCast spawns wt.exe directly.";
 }
 
 function shellQuote(value: string) {

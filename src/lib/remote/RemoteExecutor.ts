@@ -159,16 +159,6 @@ export class InteractiveMfaRemoteExecutor extends BaseRemoteExecutor {
       };
     }
 
-    if (trimmed.manual_mfa_provider === "terminal_action") {
-      return {
-        mode: "interactive_mfa",
-        state: "authenticated",
-        label: "Terminal action ready",
-        message: "Manual MFA mode runs each NIBI action in a visible PowerShell window. Complete password and Duo when prompted.",
-        host: trimmed.normal_login_host,
-      };
-    }
-
     if (trimmed.manual_login_verified) {
       return {
         mode: "interactive_mfa",
@@ -194,7 +184,7 @@ export class InteractiveMfaRemoteExecutor extends BaseRemoteExecutor {
 
   async runCommand(commandSpec: RemoteCommandSpec): Promise<RemoteCommandResult> {
     const settings = commandSpec.settings as NibiSettings | undefined;
-    if (!this.isAuthenticated && settings?.manual_mfa_provider !== "terminal_action") {
+    if (!this.isAuthenticated) {
       return {
         exit_code: 1,
         stdout: "",
@@ -212,7 +202,7 @@ export class InteractiveMfaRemoteExecutor extends BaseRemoteExecutor {
   }
 
   async uploadFile(localPath: string, remotePath: string, settings?: NibiSettings): Promise<void> {
-    if (!this.isAuthenticated && settings?.manual_mfa_provider !== "terminal_action") {
+    if (!this.isAuthenticated) {
       throw new RemoteExecutionError(
         "Log into NIBI first",
         "manual_session_not_authenticated",
@@ -227,7 +217,7 @@ export class InteractiveMfaRemoteExecutor extends BaseRemoteExecutor {
   }
 
   async downloadFile(remotePath: string, localPath: string, settings?: NibiSettings): Promise<void> {
-    if (!this.isAuthenticated && settings?.manual_mfa_provider !== "terminal_action") {
+    if (!this.isAuthenticated) {
       throw new RemoteExecutionError(
         "Log into NIBI first",
         "manual_session_not_authenticated",

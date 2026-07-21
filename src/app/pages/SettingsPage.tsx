@@ -496,7 +496,7 @@ export function SettingsPage({
     }
     startManualMfaLaunchInFlightRef.current = true;
     setIsManualMfaWorking(true);
-    setManualMfaStatus("");
+    setManualMfaStatus("Opening NIBI login terminal...");
     try {
       const launch = await invoke<ManualMfaTerminalLaunchResult>("open_manual_mfa_login", {
         settings: trimNibiSettings(values),

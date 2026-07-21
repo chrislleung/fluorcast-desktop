@@ -17,6 +17,7 @@ export type DuplicateCheckStatus =
   | "idle"
   | "uploading"
   | "submitted_to_slurm"
+  | "queued"
   | "running"
   | "completed"
   | "login_required"
@@ -220,7 +221,7 @@ export async function runDuplicateCheck(
     if (activeRow) {
       const status = mapSlurmStateToJobStatus(activeRow.state);
       await emitStatus(options, {
-        status: status === "running" ? "running" : "submitted_to_slurm",
+        status: status === "running" ? "running" : status === "queued" ? "queued" : "submitted_to_slurm",
         message: `Duplicate-check Slurm job ${activeRow.jobId} is ${activeRow.state}.`,
         remoteJobDir,
         slurmJobId,
@@ -250,7 +251,7 @@ export async function runDuplicateCheck(
       await emitStatus(options, result);
       return result;
     }
-    if (slurmStatus && !["submitted_to_slurm", "running"].includes(slurmStatus)) {
+    if (slurmStatus && !["submitted_to_slurm", "queued", "running"].includes(slurmStatus)) {
       const result: DuplicateCheckResult = {
         status: "failed",
         message: `Duplicate-check Slurm job ${slurmJobId} ended with state ${sacctRow?.state}.`,

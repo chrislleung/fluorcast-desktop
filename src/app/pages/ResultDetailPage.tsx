@@ -25,6 +25,29 @@ function derivedPredictionLabel(prediction: PredictionItem) {
   return "Not applicable";
 }
 
+function getStokesShiftRows(predictions: PredictionItem[]) {
+  const byModel = new Map<string, { absorption?: number; emission?: number; unit?: string }>();
+  for (const prediction of predictions) {
+    if (prediction.unit !== "nm") continue;
+    const row = byModel.get(prediction.model) ?? {};
+    if (prediction.property === "absorption_wavelength") {
+      row.absorption = prediction.value;
+      row.unit = prediction.unit;
+    }
+    if (prediction.property === "emission_wavelength") {
+      row.emission = prediction.value;
+      row.unit = prediction.unit;
+    }
+    byModel.set(prediction.model, row);
+  }
+  return Array.from(byModel.entries())
+    .flatMap(([model, row]) => (
+      row.absorption !== undefined && row.emission !== undefined
+        ? [{ model, value: row.emission - row.absorption, unit: row.unit ?? "nm" }]
+        : []
+    ));
+}
+
 export function ResultDetailPage({ output }: ResultDetailPageProps) {
   const rawJson = JSON.stringify(output, null, 2);
 
@@ -61,6 +84,7 @@ export function ResultDetailPage({ output }: ResultDetailPageProps) {
   }
 
   const confidenceLabel = getApplicabilityConfidenceLabel(output.applicability_domain);
+  const stokesShiftRows = getStokesShiftRows(output.predictions);
 
   return (
     <section className="result-detail" aria-label="Prediction result detail">
@@ -121,6 +145,35 @@ export function ResultDetailPage({ output }: ResultDetailPageProps) {
           </table>
         </div>
       </section>
+
+      {stokesShiftRows.length > 0 ? (
+        <section className="result-section">
+          <div className="section-heading">
+            <h2>Stokes shift</h2>
+            <span>{stokesShiftRows.length} values</span>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Model name</th>
+                  <th>Shift</th>
+                  <th>Unit</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stokesShiftRows.map((shift) => (
+                  <tr key={shift.model}>
+                    <td>{shift.model}</td>
+                    <td>{formatPredictionValue(shift.value, shift.unit)}</td>
+                    <td>{shift.unit}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
 
       <section className="result-section">
         <div className="section-heading">
