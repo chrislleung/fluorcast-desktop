@@ -93,6 +93,26 @@ describe("NewPredictionPage", () => {
     expect(Number.isNaN(Date.parse(validatedInput.requested_at))).toBe(false);
   });
 
+  it("keeps Hybrid full available with the local hybrid_full selection value", () => {
+    render(<NewPredictionPage />);
+
+    expect(screen.getByRole("option", { name: "Hybrid full" })).toHaveValue("hybrid_full");
+    fireEvent.change(screen.getByLabelText(/Molecule SMILES/i), {
+      target: { value: "C1=CC=CC=C1" },
+    });
+    fireEvent.change(screen.getByLabelText(/Solvent SMILES/i), {
+      target: { value: "O" },
+    });
+    fireEvent.change(screen.getByLabelText(/Model choice/i), {
+      target: { value: "hybrid_full" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Run mock prediction/i }));
+
+    const preview = screen.getByLabelText("Generated input JSON");
+    const inputJson = JSON.parse(preview.querySelector("pre")?.textContent ?? "");
+    expect(inputJson.model_choice).toBe("hybrid_full");
+  });
+
   it("transitions a submitted mock job to completed and opens the stored result", async () => {
     const handleOpenResult = vi.fn();
     render(<NewPredictionPage onOpenResult={handleOpenResult} />);

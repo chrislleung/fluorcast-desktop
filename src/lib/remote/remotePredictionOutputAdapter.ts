@@ -2,6 +2,7 @@ import {
   PredictionJobValidationError,
   validatePredictionJobOutput,
   type PredictionItem,
+  type PredictionJobFailureOutput,
   type PredictionJobOutput,
   type PredictionJobSuccessOutput,
 } from "../schemas";
@@ -27,6 +28,10 @@ export type RemoteOutputImportDiagnostics = {
   adapterStatus: "not_started" | "success" | "invalid";
   canonicalSchemaStatus: "not_started" | "valid" | "invalid";
   persistenceStatus: "not_started" | "complete";
+  remoteErrorCode?: string;
+  remoteErrorMessage?: string;
+  remoteTraceback?: string;
+  remoteWarnings?: string[];
 };
 
 type AdaptFlatRemoteOutputOptions = {
@@ -40,6 +45,15 @@ type FlatRemoteOutput = {
   canonical_molecule_smiles: string;
   canonical_solvent_smiles: string;
   predictions: PredictionItem[];
+  warnings: string[];
+};
+
+type StructuredRemoteFailure = {
+  status: "failed";
+  job_id?: string;
+  error_code: string;
+  error_message: string;
+  traceback?: string;
   warnings: string[];
 };
 
@@ -105,6 +119,37 @@ function parseWarnings(value: unknown, path: string): string[] {
     throw new PredictionJobValidationError(`${path} must be an array`);
   }
   return value.map((warning, index) => nonEmptyString(warning, `${path}[${index}]`));
+}
+
+function parseStructuredRemoteFailure(value: unknown): StructuredRemoteFailure {
+  const output = record(value, "remote_output");
+  exactKeys(
+    output,
+    [
+      "status",
+      "job_id",
+      "error_code",
+      "error_message",
+      "traceback",
+      "warnings",
+    ],
+    "remote_output",
+  );
+  if (output.status !== "failed") {
+    throw new PredictionJobValidationError('remote_output.status must be "failed"');
+  }
+  return {
+    status: "failed",
+    ...(output.job_id === undefined ? {} : {
+      job_id: nonEmptyString(output.job_id, "remote_output.job_id"),
+    }),
+    error_code: nonEmptyString(output.error_code, "remote_output.error_code"),
+    error_message: nonEmptyString(output.error_message, "remote_output.error_message"),
+    ...(output.traceback === undefined ? {} : {
+      traceback: nonEmptyString(output.traceback, "remote_output.traceback"),
+    }),
+    warnings: parseWarnings(output.warnings, "remote_output.warnings"),
+  };
 }
 
 function parseRemotePrediction(value: unknown, path: string): PredictionItem {
@@ -250,6 +295,41 @@ export function adaptFlatRemotePredictionOutput(
   };
 }
 
+export function adaptStructuredRemoteFailureOutput(
+  value: unknown,
+  options: AdaptFlatRemoteOutputOptions,
+): { output: PredictionJobFailureOutput; diagnostics: RemoteOutputImportDiagnostics } {
+  const remoteOutput = parseStructuredRemoteFailure(value);
+  if (remoteOutput.job_id && remoteOutput.job_id !== options.localJobId) {
+    throw new PredictionJobValidationError("remote_output.job_id must match the local job ID");
+  }
+  const completion = deriveCompletionTimestamp(options.completion);
+  const canonical = validatePredictionJobOutput({
+    job_id: options.localJobId,
+    status: "failed",
+    completed_at: completion.completedAt,
+    predictions: [],
+    error: `${remoteOutput.error_code}:\n${remoteOutput.error_message}`,
+  });
+  if (canonical.status !== "failed") {
+    throw new PredictionJobValidationError("adapter produced a non-failure canonical output");
+  }
+  return {
+    output: canonical,
+    diagnostics: {
+      jsonSyntaxStatus: "valid",
+      remoteSchemaStatus: "valid",
+      adapterStatus: "success",
+      canonicalSchemaStatus: "valid",
+      persistenceStatus: "not_started",
+      remoteErrorCode: remoteOutput.error_code,
+      remoteErrorMessage: remoteOutput.error_message,
+      ...(remoteOutput.traceback ? { remoteTraceback: remoteOutput.traceback } : {}),
+      ...(remoteOutput.warnings.length > 0 ? { remoteWarnings: remoteOutput.warnings } : {}),
+    },
+  };
+}
+
 export function parseRemoteOutputJsonForImport(
   outputJson: string,
   options: AdaptFlatRemoteOutputOptions,
@@ -273,7 +353,9 @@ export function parseRemoteOutputJsonForImport(
   }
 
   try {
-    const result = adaptFlatRemotePredictionOutput(parsed, options);
+    const result = record(parsed, "remote_output").status === "failed"
+      ? adaptStructuredRemoteFailureOutput(parsed, options)
+      : adaptFlatRemotePredictionOutput(parsed, options);
     return result;
   } catch (error) {
     diagnostics.remoteSchemaStatus = "invalid";

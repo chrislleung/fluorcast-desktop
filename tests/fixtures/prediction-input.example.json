@@ -3,6 +3,6 @@
   "user_id": "local_user",
   "molecule_smiles": "CCOc1ccc2nc(S(N)(=O)=O)sc2c1",
   "solvent_smiles": "CCO",
-  "model_choice": "fluorcast-default",
+  "model_choice": "all",
   "requested_at": "2026-07-03T14:30:00.000Z"
 }

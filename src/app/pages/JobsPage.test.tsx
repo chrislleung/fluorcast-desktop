@@ -67,6 +67,41 @@ describe("JobsPage recovery actions", () => {
     expect(openRobotSetup).toHaveBeenCalled();
   });
 
+  it("keeps historical hybrid_full jobs readable", () => {
+    render(
+      <JobsPage
+        jobs={[{
+          ...baseJob,
+          model_choice: "hybrid_full",
+        }]}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("hybrid_full")).toBeInTheDocument();
+  });
+
+  it("shows structured INVALID_MODEL_CHOICE safely with traceback in details", () => {
+    render(
+      <JobsPage
+        jobs={[{
+          ...baseJob,
+          status: "failed",
+          error_message: [
+            "INVALID_MODEL_CHOICE:\nmodel_choice must be one of: all, extratrees, gbdt, graph_model_later, histgb, hybrid, rf",
+            "REMOTE_TRACEBACK=\nTraceback (most recent call last):\nValueError: invalid model choice",
+          ].join("\n\n"),
+        }]}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByText(/INVALID_MODEL_CHOICE/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/model_choice must be one of/).length).toBeGreaterThan(0);
+    expect(screen.getByText("Failure details")).toBeInTheDocument();
+    expect(screen.getByText(/REMOTE_TRACEBACK=/)).toBeInTheDocument();
+  });
+
   it("shows refresh action for missing output jobs", () => {
     const refresh = vi.fn();
     render(

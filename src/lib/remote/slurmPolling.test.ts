@@ -464,6 +464,7 @@ describe("Slurm polling helpers", () => {
           stderr: "slurm_load_jobs error: Invalid job id specified",
         }),
         commandResult({ stdout: "18234414|FAILED|1:0|" }),
+        commandResult({ exit_code: 1 }),
         commandResult({ stdout: "stdout text" }),
         commandResult({ stdout: "stderr text" }),
       ]),
@@ -849,6 +850,7 @@ describe("Slurm polling helpers", () => {
       executor([
         commandResult({ stdout: "" }),
         commandResult({ stdout: "12345|FAILED|1:0" }),
+        commandResult({ exit_code: 1 }),
         commandResult({ stdout: "starting job\n" }),
         commandResult({ stdout: "FLUORCAST_INPUT_JSON must point to the input JSON\n" }),
       ]),
@@ -865,6 +867,48 @@ describe("Slurm polling helpers", () => {
       slurmStdout: "starting job\n",
       slurmStderr: "FLUORCAST_INPUT_JSON must point to the input JSON\n",
       errorMessage: expect.stringContaining("stderr.log"),
+    }));
+  });
+
+  it("surfaces structured INVALID_MODEL_CHOICE output from a failed Slurm job", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "prediction_output_temp_file_path") return "C:\\Temp\\fluorcast-invalid-choice-output.json";
+      if (command === "read_prediction_output_file") {
+        return JSON.stringify({
+          status: "failed",
+          job_id: "job-1",
+          error_code: "INVALID_MODEL_CHOICE",
+          error_message: "model_choice must be one of: all, extratrees, gbdt, graph_model_later, histgb, hybrid, rf",
+          traceback: "Traceback (most recent call last):\nValueError: invalid model choice",
+          warnings: [],
+        });
+      }
+      if (command === "prediction_output_file_modified_at") return "1780000000000";
+      return null;
+    });
+    const store = persistence();
+
+    const result = await pollSlurmJobStatus(
+      job,
+      settings,
+      executor([
+        commandResult({ stdout: "" }),
+        commandResult({ stdout: "12345|FAILED|1:0|2026-07-22T11:22:03" }),
+        commandResult({ exit_code: 0 }),
+        commandResult({ exit_code: 0 }),
+        commandResult({ stdout: "stdout text" }),
+        commandResult({ stdout: "stderr text" }),
+      ]),
+      store,
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.message).toBe("INVALID_MODEL_CHOICE:\nmodel_choice must be one of: all, extratrees, gbdt, graph_model_later, histgb, hybrid, rf");
+    expect(result.status).not.toBe("connection_failed");
+    expect(result.technicalDetails).toContain("REMOTE_ERROR_CODE=INVALID_MODEL_CHOICE");
+    expect(result.technicalDetails).toContain("REMOTE_TRACEBACK=");
+    expect(store.updateJobStatus).toHaveBeenCalledWith("job-1", "failed", expect.objectContaining({
+      errorMessage: expect.stringContaining("INVALID_MODEL_CHOICE"),
     }));
   });
 });

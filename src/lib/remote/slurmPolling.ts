@@ -394,6 +394,10 @@ function downloadDiagnostics(params: {
     `ADAPTER_STATUS=${diagnostics.adapterStatus}`,
     `CANONICAL_SCHEMA_STATUS=${diagnostics.canonicalSchemaStatus}`,
     `PERSISTENCE_STATUS=${diagnostics.persistenceStatus}`,
+    params.importDiagnostics?.remoteErrorCode ? `REMOTE_ERROR_CODE=${params.importDiagnostics.remoteErrorCode}` : "",
+    params.importDiagnostics?.remoteErrorMessage ? `REMOTE_ERROR_MESSAGE=${params.importDiagnostics.remoteErrorMessage}` : "",
+    params.importDiagnostics?.remoteWarnings?.length ? `REMOTE_WARNINGS=\n${params.importDiagnostics.remoteWarnings.join("\n")}` : "",
+    params.importDiagnostics?.remoteTraceback ? `REMOTE_TRACEBACK=\n${params.importDiagnostics.remoteTraceback}` : "",
     params.error instanceof Error ? params.error.message : params.error ? String(params.error) : "",
   ].filter(Boolean).join("\n");
 }
@@ -496,32 +500,41 @@ export async function downloadPredictionOutput(
       ? await tryLocalImport()
       : null;
     if (existingImport) {
-      const updated = await persistence.updateJobStatus(job.id, "completed", {
+      const importedStatus = existingImport.output.status === "failed" ? "failed" : "completed";
+      const importedDetails = downloadDiagnostics({
+        remotePath: outputPath,
+        localPath,
+        importDiagnostics: existingImport.diagnostics,
+      });
+      const updated = await persistence.updateJobStatus(job.id, importedStatus, {
         completedAt: existingImport.output.completed_at,
-        errorMessage: undefined,
+        errorMessage: existingImport.output.status === "failed"
+          ? [existingImport.output.error, importedDetails].filter(Boolean).join("\n\n")
+          : undefined,
       });
       diagnostics?.recordRowStatusWrite({
         localJobId: job.id,
         oldStatus: job.status,
-        newStatus: "completed",
+        newStatus: importedStatus,
         writerFunction: "downloadPredictionOutput.existingImport",
         reason: "existing_output_imported",
         appliedOrIgnored: updated ? "applied" : "ignored",
       });
-      await persistence.addJobEvent(job.id, "slurm_completed", "Imported downloaded output.json.", existingImport.output.completed_at);
+      await persistence.addJobEvent(
+        job.id,
+        existingImport.output.status === "failed" ? "slurm_failed" : "slurm_completed",
+        existingImport.output.status === "failed" ? existingImport.output.error : "Imported downloaded output.json.",
+        existingImport.output.completed_at,
+      );
       diagnostics?.record("REMOTE_SCHEMA_STATUS", { status: existingImport.diagnostics.remoteSchemaStatus });
       diagnostics?.record("ADAPTER_STATUS", { status: existingImport.diagnostics.adapterStatus });
       diagnostics?.record("PERSISTENCE_STATUS", { status: existingImport.diagnostics.persistenceStatus });
       return {
         jobId: job.id,
         slurmJobId: job.remote_slurm_id,
-        status: "completed",
-        message: "Prediction output imported and saved.",
-        technicalDetails: downloadDiagnostics({
-          remotePath: outputPath,
-          localPath,
-          importDiagnostics: existingImport.diagnostics,
-        }),
+        status: importedStatus,
+        message: existingImport.output.status === "failed" ? existingImport.output.error : "Prediction output imported and saved.",
+        technicalDetails: importedDetails,
         output: existingImport.output,
         slurmState: schedulerState.state,
         slurmExitCode: schedulerState.exitCode,
@@ -569,35 +582,44 @@ export async function downloadPredictionOutput(
       },
     });
     const output = imported.output;
-    const updated = await persistence.updateJobStatus(job.id, "completed", {
+    const importedStatus = output.status === "failed" ? "failed" : "completed";
+    const importedDetails = downloadDiagnostics({
+      remotePath: outputPath,
+      localPath,
+      remoteOutputExists: true,
+      importDiagnostics: imported.diagnostics,
+    });
+    const updated = await persistence.updateJobStatus(job.id, importedStatus, {
       completedAt: output.completed_at,
       slurmStdout: stdoutLog,
       slurmStderr: stderrLog,
-      errorMessage: undefined,
+      errorMessage: output.status === "failed"
+        ? [output.error, importedDetails].filter(Boolean).join("\n\n")
+        : undefined,
     });
     diagnostics?.recordRowStatusWrite({
       localJobId: job.id,
       oldStatus: job.status,
-      newStatus: "completed",
+      newStatus: importedStatus,
       writerFunction: "downloadPredictionOutput",
       reason: "downloaded_output_imported",
       appliedOrIgnored: updated ? "applied" : "ignored",
     });
-    await persistence.addJobEvent(job.id, "slurm_completed", "Downloaded and saved output.json.", output.completed_at);
+    await persistence.addJobEvent(
+      job.id,
+      output.status === "failed" ? "slurm_failed" : "slurm_completed",
+      output.status === "failed" ? output.error : "Downloaded and saved output.json.",
+      output.completed_at,
+    );
     diagnostics?.record("REMOTE_SCHEMA_STATUS", { status: imported.diagnostics.remoteSchemaStatus });
     diagnostics?.record("ADAPTER_STATUS", { status: imported.diagnostics.adapterStatus });
     diagnostics?.record("PERSISTENCE_STATUS", { status: imported.diagnostics.persistenceStatus });
     return {
       jobId: job.id,
       slurmJobId: job.remote_slurm_id,
-      status: "completed",
-      message: "Prediction output downloaded and saved.",
-      technicalDetails: downloadDiagnostics({
-        remotePath: outputPath,
-        localPath,
-        remoteOutputExists: true,
-        importDiagnostics: imported.diagnostics,
-      }),
+      status: importedStatus,
+      message: output.status === "failed" ? output.error : "Prediction output downloaded and saved.",
+      technicalDetails: importedDetails,
       output,
       slurmState: schedulerState.state,
       slurmExitCode: schedulerState.exitCode,
@@ -827,6 +849,22 @@ export async function pollSlurmJobStatus(
   }
 
   if (mappedStatus) {
+    if (["failed", "cancelled", "timed_out", "unknown"].includes(mappedStatus)) {
+      const failedJobOutputExists = await checkRemoteOutputExists(job, settings, remoteExecutor, diagnostics);
+      if (failedJobOutputExists) {
+        const downloaded = await downloadPredictionOutput(job, settings, remoteExecutor, persistence, {
+          state: sacctRow?.state,
+          exitCode: sacctRow?.exitCode,
+          end: sacctRow?.end,
+        }, diagnostics);
+        if (downloaded.status !== "output_missing") {
+          return {
+            ...downloaded,
+            schedulerConfirmed: Boolean(sacctRow),
+          };
+        }
+      }
+    }
     const [stdoutLog, stderrLog] = ["failed", "cancelled", "timed_out", "unknown"].includes(mappedStatus)
       ? await Promise.all([
         readRemoteLog(job, "stdout.log", settings, remoteExecutor),

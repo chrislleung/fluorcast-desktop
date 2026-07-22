@@ -102,6 +102,10 @@ function failureDetails(job: StoredPredictionJob) {
   ].filter(Boolean).join("\n\n");
 }
 
+function safeFailureSummary(job: StoredPredictionJob) {
+  return job.error_message?.split(/\n\n/)[0] ?? "Failed";
+}
+
 export function JobsPage({
   jobs,
   manualMfaSession,
@@ -382,7 +386,7 @@ export function JobsPage({
                         || job.status === "timeout"
                         || job.status === "unknown" ? (
                         <>
-                          <span>{job.error_message ?? "Failed"}</span>
+                          <span>{safeFailureSummary(job)}</span>
                           {failureDetails(job) ? (
                             <details className="remote-check-details">
                               <summary>Failure details</summary>

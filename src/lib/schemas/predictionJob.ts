@@ -35,8 +35,40 @@ export type PredictionJobInput = {
   user_id: string;
   molecule_smiles: string;
   solvent_smiles: string;
-  model_choice: string;
+  model_choice: DesktopModelChoice;
   requested_at: string;
+};
+
+export const desktopModelChoices = [
+  "all",
+  "extratrees",
+  "gbdt",
+  "graph",
+  "histgb",
+  "rf",
+  "hybrid_full",
+] as const;
+
+export type DesktopModelChoice = (typeof desktopModelChoices)[number];
+
+export function isDesktopModelChoice(value: string): value is DesktopModelChoice {
+  return desktopModelChoices.includes(value as DesktopModelChoice);
+}
+
+export const remoteModelChoices = [
+  "all",
+  "extratrees",
+  "gbdt",
+  "graph_model_later",
+  "histgb",
+  "hybrid",
+  "rf",
+] as const;
+
+export type RemoteModelChoice = (typeof remoteModelChoices)[number];
+
+export type RemotePredictionJobInput = Omit<PredictionJobInput, "model_choice"> & {
+  model_choice: RemoteModelChoice;
 };
 
 type PredictionJobOutputBase = {
@@ -138,6 +170,61 @@ function isoDate(value: unknown, path: string): string {
   return date;
 }
 
+function desktopModelChoice(value: unknown, path: string): DesktopModelChoice {
+  const choice = nonEmptyString(value, path);
+  if (!isDesktopModelChoice(choice)) {
+    throw new PredictionJobValidationError(
+      `${path} must be one of: ${desktopModelChoices.join(", ")}`,
+    );
+  }
+  return choice as DesktopModelChoice;
+}
+
+function remoteModelChoice(value: unknown, path: string): RemoteModelChoice {
+  const choice = nonEmptyString(value, path);
+  if (!remoteModelChoices.includes(choice as RemoteModelChoice)) {
+    throw new PredictionJobValidationError(
+      `${path} must serialize to one of: ${remoteModelChoices.join(", ")}`,
+    );
+  }
+  return choice as RemoteModelChoice;
+}
+
+export function toRemoteModelChoice(choice: DesktopModelChoice): RemoteModelChoice {
+  switch (choice) {
+    case "hybrid_full":
+      return "hybrid";
+    case "graph":
+      return "graph_model_later";
+    default:
+      return remoteModelChoice(choice, "input.model_choice");
+  }
+}
+
+export function toRemotePredictionJobInput(input: PredictionJobInput): RemotePredictionJobInput {
+  return {
+    ...input,
+    model_choice: toRemoteModelChoice(input.model_choice),
+  };
+}
+
+export function validateRemotePredictionJobInput(value: unknown): RemotePredictionJobInput {
+  const input = record(value, "input");
+  exactKeys(
+    input,
+    ["job_id", "user_id", "molecule_smiles", "solvent_smiles", "model_choice", "requested_at"],
+    "input",
+  );
+  return {
+    job_id: nonEmptyString(input.job_id, "input.job_id"),
+    user_id: nonEmptyString(input.user_id, "input.user_id"),
+    molecule_smiles: nonEmptyString(input.molecule_smiles, "input.molecule_smiles"),
+    solvent_smiles: nonEmptyString(input.solvent_smiles, "input.solvent_smiles"),
+    model_choice: remoteModelChoice(input.model_choice, "input.model_choice"),
+    requested_at: isoDate(input.requested_at, "input.requested_at"),
+  };
+}
+
 function exactKeys(value: Record<string, unknown>, allowed: string[], path: string) {
   const extra = Object.keys(value).find((key) => !allowed.includes(key));
   if (extra) {
@@ -234,7 +321,7 @@ export const predictionJobInputSchema = schema<PredictionJobInput>((value) => {
     user_id: nonEmptyString(input.user_id, "input.user_id"),
     molecule_smiles: nonEmptyString(input.molecule_smiles, "input.molecule_smiles"),
     solvent_smiles: nonEmptyString(input.solvent_smiles, "input.solvent_smiles"),
-    model_choice: nonEmptyString(input.model_choice, "input.model_choice"),
+    model_choice: desktopModelChoice(input.model_choice, "input.model_choice"),
     requested_at: isoDate(input.requested_at, "input.requested_at"),
   };
 });
@@ -404,7 +491,7 @@ export function validateDuplicateCheckOutput(value: unknown): DuplicateCheckOutp
 export type CreatePredictionJobInputOptions = {
   molecule_smiles: string;
   solvent_smiles: string;
-  model_choice: string;
+  model_choice: DesktopModelChoice;
 };
 
 export function createPredictionJobInput(

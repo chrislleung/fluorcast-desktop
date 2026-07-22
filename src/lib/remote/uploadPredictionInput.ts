@@ -1,7 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { NibiSettings } from "../../features/settings";
 import { trimNibiSettings } from "../../features/settings";
-import type { PredictionJobInput } from "../schemas";
+import {
+  toRemoteModelChoice,
+  toRemotePredictionJobInput,
+  validateRemotePredictionJobInput,
+  type PredictionJobInput,
+  type RemotePredictionJobInput,
+} from "../schemas";
 import { appError } from "./errors";
 import type { RemoteExecutor } from "./RemoteExecutor";
 import { RemoteExecutionError } from "./types";
@@ -81,7 +87,7 @@ export function canonicalSlurmMarkerPath(remoteJobDir: string) {
   return joinRemoteChildPath(remoteJobDir, "slurm_job_id.txt");
 }
 
-async function writeTemporaryInputFile(jobInput: PredictionJobInput): Promise<string> {
+async function writeTemporaryInputFile(jobInput: RemotePredictionJobInput): Promise<string> {
   return invoke<string>("write_prediction_input_temp_file", {
     jobId: jobInput.job_id,
     inputJson: JSON.stringify(jobInput, null, 2),
@@ -104,6 +110,8 @@ export async function uploadPredictionInput(
   persistence?: PredictionUploadPersistence,
 ): Promise<PredictionInputUploadResult> {
   const trimmed = trimNibiSettings(settings);
+  const remoteModelChoice = toRemoteModelChoice(jobInput.model_choice);
+  const remoteJobInput = validateRemotePredictionJobInput(toRemotePredictionJobInput(jobInput));
   const remote_job_dir = joinRemoteJobPath(trimmed.remote_jobs_path, jobInput.job_id);
   const submission_id = jobInput.job_id;
   const remote_input_path = joinRemoteChildPath(remote_job_dir, "input.json");
@@ -119,7 +127,12 @@ export async function uploadPredictionInput(
     created_at: jobInput.requested_at,
     submission_id,
   });
-  await recordEvent(persistence, jobInput.job_id, "created_input_json", "created input JSON");
+  await recordEvent(
+    persistence,
+    jobInput.job_id,
+    "created_input_json",
+    `created input JSON\nDESKTOP_MODEL_CHOICE=${jobInput.model_choice}\nREMOTE_MODEL_CHOICE=${remoteModelChoice}`,
+  );
 
   if (
     mode === "interactive_mfa"
@@ -143,7 +156,7 @@ export async function uploadPredictionInput(
   }
 
   try {
-    const localInputPath = await writeTemporaryInputFile(jobInput);
+    const localInputPath = await writeTemporaryInputFile(remoteJobInput);
     const createDirectoryResult = await remoteExecutor.runCommand({
       label: "Create remote prediction job directory",
       executable: "mkdir",

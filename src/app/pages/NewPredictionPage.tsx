@@ -3,8 +3,10 @@ import { useMemo, useRef, useState } from "react";
 import {
   createDuplicateCheckInput,
   createPredictionJobInput,
+  isDesktopModelChoice,
   validatePredictionJobInput,
   type DuplicateCheckOutput,
+  type DesktopModelChoice,
   type PredictionJobInput,
 } from "../../lib/schemas";
 import {
@@ -121,6 +123,8 @@ export function NewPredictionPage({
     }
     if (formValues.model_choice.trim().length === 0) {
       nextErrors.model_choice = "Model choice is required.";
+    } else if (!isDesktopModelChoice(formValues.model_choice)) {
+      nextErrors.model_choice = "Model choice is not supported.";
     }
     return nextErrors;
   }
@@ -149,7 +153,7 @@ export function NewPredictionPage({
     const input = createPredictionJobInput({
       molecule_smiles: values.molecule_smiles.trim(),
       solvent_smiles: values.solvent_smiles.trim(),
-      model_choice: values.model_choice,
+      model_choice: values.model_choice as DesktopModelChoice,
     });
 
     const validatedInput = validatePredictionJobInput(input);

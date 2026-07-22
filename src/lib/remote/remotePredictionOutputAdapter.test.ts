@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import flatRemoteOutput from "../../../tests/fixtures/remote-output.flat-success.example.json";
 import { validatePredictionJobOutput } from "../schemas";
 import {
+  adaptStructuredRemoteFailureOutput,
   adaptFlatRemotePredictionOutput,
   deriveCompletionTimestamp,
   parseRemoteOutputJsonForImport,
@@ -111,6 +112,50 @@ describe("remote prediction output adapter", () => {
         },
       });
     }
+  });
+
+  it("imports structured remote failures with safe code and message", () => {
+    const { output, diagnostics } = adaptStructuredRemoteFailureOutput({
+      status: "failed",
+      job_id: localJobId,
+      error_code: "INVALID_MODEL_CHOICE",
+      error_message: "model_choice must be one of: all, extratrees, gbdt, graph_model_later, histgb, hybrid, rf",
+      traceback: "Traceback (most recent call last):\nValueError: bad model choice",
+      warnings: [],
+    }, {
+      localJobId,
+      completion: { importTime: "2026-07-22T12:00:00.000Z" },
+    });
+
+    expect(output).toMatchObject({
+      job_id: localJobId,
+      status: "failed",
+      predictions: [],
+      error: "INVALID_MODEL_CHOICE:\nmodel_choice must be one of: all, extratrees, gbdt, graph_model_later, histgb, hybrid, rf",
+    });
+    expect(diagnostics).toMatchObject({
+      remoteSchemaStatus: "valid",
+      adapterStatus: "success",
+      remoteErrorCode: "INVALID_MODEL_CHOICE",
+      remoteErrorMessage: "model_choice must be one of: all, extratrees, gbdt, graph_model_later, histgb, hybrid, rf",
+      remoteTraceback: expect.stringContaining("Traceback"),
+    });
+  });
+
+  it("parses structured remote failures through the JSON import boundary", () => {
+    const { output } = parseRemoteOutputJsonForImport(JSON.stringify({
+      status: "failed",
+      error_code: "INVALID_MODEL_CHOICE",
+      error_message: "model_choice must be one of: all, extratrees, gbdt, graph_model_later, histgb, hybrid, rf",
+      traceback: "technical traceback",
+      warnings: [],
+    }), {
+      localJobId,
+      completion: { importTime: "2026-07-22T12:00:00.000Z" },
+    });
+
+    expect(output.status).toBe("failed");
+    expect(output.error).toContain("INVALID_MODEL_CHOICE");
   });
 
   it("derives completion metadata in the trusted order", () => {

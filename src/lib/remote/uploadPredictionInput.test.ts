@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 import { defaultNibiSettings } from "../../features/settings";
 import type { PredictionJobInput } from "../schemas";
 import type { RemoteExecutor } from "./RemoteExecutor";
@@ -139,6 +140,98 @@ describe("uploadPredictionInput", () => {
       remote_input_path: "/home/alice/scratch/fluorcast-jobs/job-1/input.json",
       remote_output_path: "/home/alice/scratch/fluorcast-jobs/job-1/output.json",
     });
+  });
+
+  it("serializes hybrid_full to the remote hybrid model choice only in input.json", async () => {
+    const selectedExecutor = executor("robot_automation", true);
+    const hybridInput: PredictionJobInput = {
+      ...input,
+      model_choice: "hybrid_full",
+    };
+    const persistence = {
+      saveJob: vi.fn(),
+      updateJobStatus: vi.fn(),
+      addJobEvent: vi.fn(),
+    };
+
+    await uploadPredictionInput(
+      hybridInput,
+      {
+        ...defaultNibiSettings,
+        backend_mode: "nibi",
+        connection_mode: "robot_automation",
+        robot_access_verified: true,
+      },
+      selectedExecutor,
+      persistence,
+    );
+
+    expect(persistence.saveJob).toHaveBeenCalledWith(expect.objectContaining({
+      model_choice: "hybrid_full",
+    }));
+    const tempFileCall = vi.mocked(invoke).mock.calls.find(([command]) => command === "write_prediction_input_temp_file");
+    const inputJson = (tempFileCall?.[1] as { inputJson: string } | undefined)?.inputJson ?? "";
+    expect(JSON.parse(inputJson)).toMatchObject({
+      job_id: "job-1",
+      user_id: "local_user",
+      molecule_smiles: "CCO",
+      solvent_smiles: "O",
+      model_choice: "hybrid",
+      requested_at: "2026-07-17T12:00:00.000Z",
+    });
+    expect(inputJson).not.toContain("hybrid_full");
+    expect(persistence.addJobEvent).toHaveBeenCalledWith(
+      "job-1",
+      "created_input_json",
+      expect.stringContaining("DESKTOP_MODEL_CHOICE=hybrid_full\nREMOTE_MODEL_CHOICE=hybrid"),
+    );
+  });
+
+  it("keeps supported non-hybrid model choices unchanged in remote input.json", async () => {
+    for (const model_choice of ["all", "extratrees", "gbdt", "histgb", "rf"] as const) {
+      vi.clearAllMocks();
+      await uploadPredictionInput(
+        { ...input, model_choice },
+        {
+          ...defaultNibiSettings,
+          backend_mode: "nibi",
+          connection_mode: "robot_automation",
+          robot_access_verified: true,
+        },
+        executor("robot_automation", true),
+      );
+      const tempFileCall = vi.mocked(invoke).mock.calls.find(([command]) => command === "write_prediction_input_temp_file");
+      const inputJson = (tempFileCall?.[1] as { inputJson: string } | undefined)?.inputJson ?? "";
+      expect(JSON.parse(inputJson).model_choice).toBe(model_choice);
+    }
+  });
+
+  it("fails unsupported local model choices before upload", async () => {
+    const selectedExecutor = executor("robot_automation", true);
+    const persistence = {
+      saveJob: vi.fn(),
+      updateJobStatus: vi.fn(),
+      addJobEvent: vi.fn(),
+    };
+
+    await expect(uploadPredictionInput(
+      { ...input, model_choice: "unsupported" } as unknown as PredictionJobInput,
+      {
+        ...defaultNibiSettings,
+        backend_mode: "nibi",
+        connection_mode: "robot_automation",
+        robot_access_verified: true,
+      },
+      selectedExecutor,
+      persistence,
+    )).rejects.toThrow(/model_choice/);
+
+    expect(invoke).not.toHaveBeenCalledWith("write_prediction_input_temp_file", expect.anything());
+    expect(selectedExecutor.uploadFile).not.toHaveBeenCalled();
+    expect(selectedExecutor.runCommand).not.toHaveBeenCalledWith(expect.objectContaining({
+      executable: "sbatch",
+    }));
+    expect(persistence.saveJob).not.toHaveBeenCalled();
   });
 
   it("records status and event updates for a successful upload", async () => {
