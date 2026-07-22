@@ -177,4 +177,46 @@ describe("uploadPredictionInput", () => {
       "uploaded_input_json",
     ]);
   });
+
+  it("maps remote directory creation failure to upload exit 42 details", async () => {
+    const selectedExecutor = executor("interactive_mfa", true);
+    vi.mocked(selectedExecutor.runCommand).mockResolvedValueOnce({
+      exit_code: 13,
+      stdout: "mkdir stdout",
+      stderr: "mkdir stderr",
+      duration_ms: 1,
+      command_label: "Create remote prediction job directory",
+      redacted_command_preview: "mkdir -p <remote_job_dir>",
+    });
+    const persistence = {
+      saveJob: vi.fn(),
+      updateJobStatus: vi.fn(),
+      addJobEvent: vi.fn(),
+    };
+
+    await expect(uploadPredictionInput(
+      input,
+      {
+        ...defaultNibiSettings,
+        backend_mode: "nibi",
+        connection_mode: "interactive_mfa",
+        remote_jobs_path: "/home/alice/scratch/fluorcast-jobs",
+      },
+      selectedExecutor,
+      persistence,
+    )).rejects.toThrow("UPLOAD_FAILURE_CODE=42");
+
+    expect(persistence.updateJobStatus).toHaveBeenCalledWith("job-1", "upload_failed", expect.objectContaining({
+      errorMessage: expect.stringContaining("UPLOAD_FAILURE_CODE=42"),
+    }));
+    expect(persistence.updateJobStatus).toHaveBeenCalledWith("job-1", "upload_failed", expect.objectContaining({
+      errorMessage: expect.stringContaining("EXIT_CODE=13"),
+    }));
+    expect(persistence.updateJobStatus).toHaveBeenCalledWith("job-1", "upload_failed", expect.objectContaining({
+      errorMessage: expect.stringContaining("STDOUT=mkdir stdout"),
+    }));
+    expect(persistence.updateJobStatus).toHaveBeenCalledWith("job-1", "upload_failed", expect.objectContaining({
+      errorMessage: expect.stringContaining("STDERR=mkdir stderr"),
+    }));
+  });
 });

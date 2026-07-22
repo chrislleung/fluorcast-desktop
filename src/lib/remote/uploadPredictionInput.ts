@@ -147,7 +147,13 @@ export async function uploadPredictionInput(
     });
     if (createDirectoryResult.exit_code !== 0) {
       throw new RemoteExecutionError(
-        createDirectoryResult.stderr || "Could not create remote job directory.",
+        [
+          "UPLOAD_FAILURE_CODE=42",
+          `REMOTE_DESTINATION=${remote_job_dir}`,
+          `EXIT_CODE=${createDirectoryResult.exit_code}`,
+          `STDOUT=${createDirectoryResult.stdout}`,
+          `STDERR=${createDirectoryResult.stderr || "Could not create remote job directory."}`,
+        ].join("\n"),
         "remote_directory_create_failed",
       );
     }

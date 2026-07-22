@@ -140,6 +140,34 @@ describe("JobsPage recovery actions", () => {
     expect(screen.getByText("Technical details")).toBeInTheDocument();
   });
 
+  it("shows safe upload failure diagnostics for failed uploads", () => {
+    render(
+      <JobsPage
+        jobs={[{
+          ...baseJob,
+          status: "upload_failed",
+          remote_slurm_id: undefined,
+          error_message: [
+            "UPLOAD_FAILURE_CODE=43",
+            "ORIGINAL_WINDOWS_PATH=C:\\Temp\\fluorcast input.json",
+            "NORMALIZED_WINDOWS_PATH=C:/Temp/fluorcast input.json",
+            "CONVERTED_WSL_PATH=/mnt/c/Temp/fluorcast input.json",
+            "WSLPATH_EXIT_CODE=0",
+            "SCP_EXIT_CODE=1",
+            "STDOUT=",
+            "STDERR=scp failed",
+          ].join("\n"),
+        }]}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Upload failed")).toBeInTheDocument();
+    expect(screen.getAllByText(/UPLOAD_FAILURE_CODE=43/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/SCP_EXIT_CODE=1/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/STDERR=scp failed/).length).toBeGreaterThan(0);
+  });
+
   it("allows uploaded login-required jobs to retry after session is authenticated", () => {
     const submit = vi.fn();
     render(

@@ -554,7 +554,11 @@ pub fn upload_nibi_file(
     local_path: String,
     remote_path: String,
 ) -> Result<(), String> {
-    validate_local_upload_path(&local_path)?;
+    if mode == "interactive_mfa" {
+        validate_local_upload_path_shape(&local_path)?;
+    } else {
+        validate_local_upload_path(&local_path)?;
+    }
     validate_remote_path(&remote_path, "Remote upload path")?;
     if mode == "interactive_mfa" && settings.uses_persistent_shell() {
         validate_remote_path_under_jobs(&remote_path, &settings.remote_jobs_path)?;
@@ -1536,21 +1540,85 @@ fn upload_file_via_wsl_scp(
     validate_manual_login_settings(settings)?;
     validate_remote_path_under_jobs(remote_path, &settings.remote_jobs_path)?;
     let commands = build_manual_mfa_session_commands(settings)?;
-    let output = run_wsl_bash_script(
-        &commands.wsl_distro,
-        &manual_mfa_scp_upload_script(),
-        &[
-            local_path.to_string(),
-            commands.host,
-            remote_path.to_string(),
-        ],
+    if !Path::new(local_path).is_file() {
+        return Err(upload_missing_local_file_diagnostics(
+            local_path,
+            remote_path,
+            &commands.host,
+        ));
+    }
+    let invocation = build_manual_mfa_scp_upload_invocation(&commands, local_path, remote_path);
+    let output = run_program_with_stdin_timeout(
+        &invocation.program,
+        &invocation.args,
+        &invocation.stdin,
         WSL_SCRIPT_TIMEOUT,
-    )?;
+    )
+    .map_err(|error| format!("Could not run WSL bash script: {error}"))?;
     if output.status == 0 {
         Ok(())
     } else {
         Err(output.combined())
     }
+}
+
+fn normalize_windows_path_for_wsl_argument(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn safe_diagnostic_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\r' | '\n' | '\0' => ' ',
+            _ => character,
+        })
+        .collect()
+}
+
+fn upload_missing_local_file_diagnostics(
+    local_path: &str,
+    remote_path: &str,
+    host: &str,
+) -> String {
+    let normalized_path = normalize_windows_path_for_wsl_argument(local_path);
+    [
+        "UPLOAD_FAILURE_CODE=41".to_string(),
+        format!(
+            "ORIGINAL_WINDOWS_PATH={}",
+            safe_diagnostic_value(local_path)
+        ),
+        format!(
+            "NORMALIZED_WINDOWS_PATH={}",
+            safe_diagnostic_value(&normalized_path)
+        ),
+        "LOCAL_FILE_EXISTS=0".to_string(),
+        format!(
+            "REMOTE_DESTINATION={}",
+            safe_diagnostic_value(&format!("{host}:{remote_path}"))
+        ),
+        "WSLPATH_EXIT_CODE=".to_string(),
+        "SCP_EXIT_CODE=".to_string(),
+        "STDOUT=".to_string(),
+        "STDERR=Local temporary input file was missing before WSL SCP upload.".to_string(),
+    ]
+    .join("\n")
+}
+
+fn build_manual_mfa_scp_upload_invocation(
+    commands: &ManualMfaSessionCommands,
+    local_path: &str,
+    remote_path: &str,
+) -> WslBashScriptInvocation {
+    build_wsl_bash_script_invocation(
+        &commands.wsl_distro,
+        &manual_mfa_scp_upload_script(),
+        &[
+            normalize_windows_path_for_wsl_argument(local_path),
+            commands.host.clone(),
+            remote_path.to_string(),
+        ],
+    )
 }
 
 fn download_file_via_wsl_scp(
@@ -1581,17 +1649,50 @@ fn download_file_via_wsl_scp(
 fn manual_mfa_scp_upload_script() -> String {
     [
         "#!/usr/bin/env bash",
-        "set -Eeuo pipefail",
+        "set -uo pipefail",
         "",
-        "LOCAL_WINDOWS_PATH=\"$1\"",
+        "WINDOWS_PATH=\"$1\"",
         "HOST=\"$2\"",
         "REMOTE_PATH=\"$3\"",
         "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
-        "LOCAL_WSL_PATH=\"$(wslpath -a \"$LOCAL_WINDOWS_PATH\")\"",
+        "sanitize_upload_diag() {",
+        "  printf '%s' \"$1\" | tr '\\r\\n' '  '",
+        "}",
+        "print_upload_diag() {",
+        "  printf 'UPLOAD_FAILURE_CODE=%s\\n' \"$1\"",
+        "  printf 'ORIGINAL_WINDOWS_PATH=%s\\n' \"$(sanitize_upload_diag \"$WINDOWS_PATH\")\"",
+        "  printf 'NORMALIZED_WINDOWS_PATH=%s\\n' \"$(sanitize_upload_diag \"$WINDOWS_PATH\")\"",
+        "  printf 'CONVERTED_WSL_PATH=%s\\n' \"$(sanitize_upload_diag \"${LOCAL_WSL_PATH:-}\")\"",
+        "  if [ -n \"${LOCAL_WSL_PATH:-}\" ] && [ -f \"$LOCAL_WSL_PATH\" ]; then",
+        "    printf 'LOCAL_FILE_EXISTS=1\\n'",
+        "  else",
+        "    printf 'LOCAL_FILE_EXISTS=0\\n'",
+        "  fi",
+        "  printf 'REMOTE_DESTINATION=%s\\n' \"$(sanitize_upload_diag \"$HOST:$REMOTE_PATH\")\"",
+        "  printf 'WSLPATH_EXIT_CODE=%s\\n' \"${WSLPATH_EXIT:-}\"",
+        "  printf 'SCP_EXIT_CODE=%s\\n' \"${SCP_EXIT:-}\"",
+        "  printf 'STDOUT=%s\\n' \"$(sanitize_upload_diag \"${SCP_STDOUT:-}\")\"",
+        "  printf 'STDERR=%s\\n' \"$(sanitize_upload_diag \"${UPLOAD_STDERR:-}\")\"",
+        "}",
+        "WSLPATH_STDERR_FILE=\"$(mktemp)\"",
+        "SCP_STDERR_FILE=\"$(mktemp)\"",
+        "trap 'rm -f \"$WSLPATH_STDERR_FILE\" \"$SCP_STDERR_FILE\"' EXIT",
+        "LOCAL_WSL_PATH=\"$(wslpath -a -u -- \"$WINDOWS_PATH\" 2>\"$WSLPATH_STDERR_FILE\")\"",
+        "WSLPATH_EXIT=$?",
+        "UPLOAD_STDERR=\"$(cat \"$WSLPATH_STDERR_FILE\")\"",
+        "SCP_EXIT=",
+        "SCP_STDOUT=",
+        "if [ \"$WSLPATH_EXIT\" -ne 0 ] || [ -z \"$LOCAL_WSL_PATH\" ]; then",
+        "  print_upload_diag 40",
+        "  exit 40",
+        "fi",
+        "if [ ! -f \"$LOCAL_WSL_PATH\" ]; then",
+        "  print_upload_diag 41",
+        "  exit 41",
+        "fi",
         "",
         "test -S \"$CTL\"",
-        "test -f \"$LOCAL_WSL_PATH\"",
-        "scp \\",
+        "SCP_STDOUT=\"$(scp \\",
         "  -B \\",
         "  -o ControlPath=\"$CTL\" \\",
         "  -o ControlMaster=no \\",
@@ -1600,7 +1701,14 @@ fn manual_mfa_scp_upload_script() -> String {
         "  -o KbdInteractiveAuthentication=no \\",
         "  \"$LOCAL_WSL_PATH\" \\",
         "  \"$HOST:$REMOTE_PATH\" \\",
-        "  < /dev/null",
+        "  < /dev/null 2>\"$SCP_STDERR_FILE\")\"",
+        "SCP_EXIT=$?",
+        "UPLOAD_STDERR=\"$(cat \"$SCP_STDERR_FILE\")\"",
+        "if [ \"$SCP_EXIT\" -ne 0 ]; then",
+        "  print_upload_diag 43",
+        "  exit 43",
+        "fi",
+        "print_upload_diag 0",
     ]
     .join("\n")
 }
@@ -3706,15 +3814,20 @@ fn validate_local_path(value: &str, label: &str) -> Result<(), String> {
 }
 
 fn validate_local_upload_path(value: &str) -> Result<(), String> {
+    validate_local_upload_path_shape(value)?;
+    if !Path::new(value.trim()).exists() {
+        return Err("Local upload file does not exist.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_local_upload_path_shape(value: &str) -> Result<(), String> {
     let path = Path::new(value.trim());
     if value.trim().is_empty() {
         return Err("Local upload path is required.".to_string());
     }
     if !path.is_absolute() {
         return Err("Local upload path must be absolute.".to_string());
-    }
-    if !path.exists() {
-        return Err("Local upload file does not exist.".to_string());
     }
     Ok(())
 }
@@ -4545,6 +4658,96 @@ mod tests {
             assert!(!script.contains("ssh.exe"));
             assert!(!script.contains("scp.exe"));
         }
+    }
+
+    #[test]
+    fn manual_mfa_upload_normalizes_windows_path_before_wsl_argument() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let invocation = build_manual_mfa_scp_upload_invocation(
+            &commands,
+            "C:\\Users\\Name\\File.json",
+            "/home/alice/scratch/fluorcast-jobs/job-1/input.json",
+        );
+
+        assert_eq!(invocation.args[6], "C:/Users/Name/File.json");
+        assert!(!invocation.args.iter().any(|arg| arg.contains("\\Users\\")));
+    }
+
+    #[test]
+    fn manual_mfa_upload_keeps_normalized_path_as_one_argument_with_spaces() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let invocation = build_manual_mfa_scp_upload_invocation(
+            &commands,
+            "C:\\Users\\Name\\OneDrive\\FluorCast Jobs\\input file.json",
+            "/home/alice/scratch/fluorcast-jobs/job-1/input.json",
+        );
+
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-d",
+                "Ubuntu",
+                "--",
+                "bash",
+                "-s",
+                "--",
+                "C:/Users/Name/OneDrive/FluorCast Jobs/input file.json",
+                "alice@nibi.alliancecan.ca",
+                "/home/alice/scratch/fluorcast-jobs/job-1/input.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn manual_mfa_upload_script_converts_normalized_argument_with_wslpath_only() {
+        let script = manual_mfa_scp_upload_script();
+
+        assert!(script.contains("WINDOWS_PATH=\"$1\""));
+        assert!(script.contains("wslpath -a -u -- \"$WINDOWS_PATH\""));
+        assert!(!script.contains("/mnt/c"));
+        assert!(!script.contains("bash -c"));
+        assert!(!script.contains("cmd /C"));
+        assert!(!script.contains("powershell"));
+    }
+
+    #[test]
+    fn manual_mfa_upload_missing_temp_file_maps_to_exit_41_diagnostics() {
+        let message = upload_missing_local_file_diagnostics(
+            "C:\\Temp\\missing input.json",
+            "/home/alice/scratch/fluorcast-jobs/job-1/input.json",
+            "alice@nibi.alliancecan.ca",
+        );
+
+        assert!(message.contains("UPLOAD_FAILURE_CODE=41"));
+        assert!(message.contains("ORIGINAL_WINDOWS_PATH=C:\\Temp\\missing input.json"));
+        assert!(message.contains("NORMALIZED_WINDOWS_PATH=C:/Temp/missing input.json"));
+        assert!(message.contains("LOCAL_FILE_EXISTS=0"));
+        assert!(message.contains("REMOTE_DESTINATION=alice@nibi.alliancecan.ca:/home/alice/scratch/fluorcast-jobs/job-1/input.json"));
+    }
+
+    #[test]
+    fn manual_mfa_upload_script_keeps_temp_input_until_scp_completes() {
+        let script = manual_mfa_scp_upload_script();
+        let scp_position = script.find("SCP_STDOUT=\"$(scp \\").unwrap();
+        let local_path_position = script.find("\"$LOCAL_WSL_PATH\" \\").unwrap();
+        let success_position = script.find("print_upload_diag 0").unwrap();
+
+        assert!(local_path_position > scp_position);
+        assert!(success_position > local_path_position);
+        assert!(!script.contains("rm -f \"$LOCAL_WSL_PATH\""));
+    }
+
+    #[test]
+    fn manual_mfa_upload_scp_uses_control_socket_batch_mode_and_dev_null() {
+        let script = manual_mfa_scp_upload_script();
+
+        assert!(script.contains("CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\""));
+        assert!(script.contains("scp \\\n  -B \\"));
+        assert!(script.contains("-o ControlPath=\"$CTL\""));
+        assert!(script.contains("-o ControlMaster=no"));
+        assert!(script.contains("-o BatchMode=yes"));
+        assert!(script.contains("< /dev/null"));
+        assert!(!script.contains("scp.exe"));
     }
 
     #[test]
