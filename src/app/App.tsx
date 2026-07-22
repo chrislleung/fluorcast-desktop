@@ -38,9 +38,14 @@ import {
   applyManualMfaSessionResult,
   cancelSlurmJob,
   pollSlurmJobStatus,
+  isAutoPollableSlurmJob,
   submitPredictionSlurmJob,
   type ManualMfaSessionResult,
   type ManualMfaSessionUiState,
+  SlurmPollingCoordinator,
+  type PollResultMeta,
+  type SlurmPollingCoordinatorDiagnostics,
+  type SlurmPollingCoordinatorOptions,
   type SlurmPollingResult,
 } from "../lib/remote";
 import { PredictionJobValidationError } from "../lib/schemas";
@@ -86,12 +91,28 @@ export function App() {
   const [databaseStatus, setDatabaseStatus] = useState<DatabaseStatus>("initializing");
   const [jobsState, dispatchJobs] = useReducer(jobsReducer, initialJobsState);
   const [latestPollingResult, setLatestPollingResult] = useState<SlurmPollingResult | null>(null);
+  const [pollingDiagnostics, setPollingDiagnostics] = useState<SlurmPollingCoordinatorDiagnostics | null>(null);
   const [manualMfaJobStatus, setManualMfaJobStatus] = useState("");
   const [lastJobsSessionProbeKey, setLastJobsSessionProbeKey] = useState("");
   const activeSlurmSubmissionsRef = useRef<Set<string>>(new Set());
-  const latestPollGenerationRef = useRef<Record<string, number>>({});
+  const pollingCoordinatorRef = useRef<SlurmPollingCoordinator | null>(null);
+  const nibiSettingsRef = useRef(nibiSettings);
+  const manualMfaSessionRef = useRef(manualMfaSession);
+  const selectedJobIdRef = useRef(selectedJobId);
+  const runRemoteRefreshRef = useRef<SlurmPollingCoordinatorOptions["runRemoteRefresh"]>(async () => {
+    throw new Error("Slurm polling coordinator was used before it was initialized.");
+  });
+  const handlePollingResultRef = useRef<NonNullable<SlurmPollingCoordinatorOptions["onResult"]>>(async () => undefined);
+  const handleStalePollingResultRef = useRef<NonNullable<SlurmPollingCoordinatorOptions["onStaleResult"]>>(async () => undefined);
+  const handlePollingErrorRef = useRef<NonNullable<SlurmPollingCoordinatorOptions["onError"]>>(async () => undefined);
 
   const selectedJob = selectedJobDetail ?? undefined;
+
+  useEffect(() => {
+    nibiSettingsRef.current = nibiSettings;
+    manualMfaSessionRef.current = manualMfaSession;
+    selectedJobIdRef.current = selectedJobId;
+  });
 
   const refreshJobsFromDatabase = useCallback(async () => {
     const persistedJobs = await listJobs();
@@ -269,6 +290,29 @@ export function App() {
     nibiSettings.connection_mode !== "interactive_mfa"
     || (manualMfaSession.status === "authenticated" && manualMfaSession.can_run_background_commands)
   ), [manualMfaSession, nibiSettings.connection_mode]);
+
+  const isManualMfaReadyForPolling = useCallback(() => {
+    const currentSettings = nibiSettingsRef.current;
+    const currentSession = manualMfaSessionRef.current;
+    return currentSettings.connection_mode !== "interactive_mfa"
+      || (currentSession.status === "authenticated" && currentSession.can_run_background_commands);
+  }, []);
+
+  const createPollingRemoteExecutor = useCallback((forceAuthenticated = false) => {
+    const currentSettings = nibiSettingsRef.current;
+    const currentSession = manualMfaSessionRef.current;
+    const remoteExecutor = createRemoteExecutor(currentSettings.connection_mode);
+    if (remoteExecutor instanceof InteractiveMfaRemoteExecutor) {
+      remoteExecutor.setAuthenticated(
+        forceAuthenticated
+        || (
+          currentSession.status === "authenticated"
+          && currentSession.can_run_background_commands
+        ),
+      );
+    }
+    return remoteExecutor;
+  }, []);
 
   const testManualMfaSessionForJobs = useCallback(async (options: { jobsPageBlocked?: boolean } = {}) => {
     if (nibiSettings.connection_mode !== "interactive_mfa") {

@@ -76,6 +76,24 @@ function activeStatus(status: SlurmPollingStatus) {
   return status === "submitted_to_slurm" || status === "queued" || status === "running";
 }
 
+function resultErrorMessage(result: SlurmPollingResult) {
+  return result.status === "completed"
+    ? undefined
+    : [
+      result.message,
+      result.technicalDetails,
+    ].filter(Boolean).join("\n\n");
+}
+
+function pollingStatusChanged(job: PersistedPredictionJob, result: SlurmPollingResult) {
+  const nextErrorMessage = resultErrorMessage(result);
+  return job.status !== result.status
+    || (result.slurmJobId !== undefined && job.remote_slurm_id !== result.slurmJobId)
+    || (result.slurmState !== undefined && job.slurm_state !== result.slurmState)
+    || (result.slurmExitCode !== undefined && job.slurm_exit_code !== result.slurmExitCode)
+    || job.error_message !== nextErrorMessage;
+}
+
 function connectionFailureStatus(settings: NibiSettings, remoteExecutor: RemoteExecutor): SlurmPollingResult | null {
   const status = remoteExecutor.getConnectionStatus(settings);
   if (remoteExecutor.getMode() === "interactive_mfa" && status.state !== "authenticated") {
@@ -261,6 +279,9 @@ async function persistPollingStatus(
   result: SlurmPollingResult,
   persistence: SlurmPollingPersistence,
 ) {
+  if (!pollingStatusChanged(job, result)) {
+    return;
+  }
   const completedAt = activeStatus(result.status) || result.status === "login_required" || result.status === "robot_auth_failed" || result.status === "connection_failed"
     ? undefined
     : new Date().toISOString();
@@ -268,10 +289,7 @@ async function persistPollingStatus(
     completedAt,
     slurmState: result.slurmState,
     slurmExitCode: result.slurmExitCode,
-    errorMessage: result.status === "completed" ? undefined : [
-      result.message,
-      result.technicalDetails,
-    ].filter(Boolean).join("\n\n"),
+    errorMessage: resultErrorMessage(result),
   });
   await persistence.addJobEvent(job.id, `slurm_${result.status}`, result.message, completedAt);
 }
@@ -431,6 +449,7 @@ export async function downloadPredictionOutput(
         output: existingImport.output,
         slurmState: schedulerState.state,
         slurmExitCode: schedulerState.exitCode,
+        schedulerConfirmed: Boolean(schedulerState.state),
       };
     }
     const exists = await checkRemoteOutputExists(job, settings, remoteExecutor);
@@ -445,6 +464,7 @@ export async function downloadPredictionOutput(
         appError: error,
         slurmState: schedulerState.state,
         slurmExitCode: schedulerState.exitCode,
+        schedulerConfirmed: Boolean(schedulerState.state),
       };
       await persistPollingStatus(job, result, persistence);
       return result;
@@ -490,6 +510,7 @@ export async function downloadPredictionOutput(
       output,
       slurmState: schedulerState.state,
       slurmExitCode: schedulerState.exitCode,
+      schedulerConfirmed: Boolean(schedulerState.state),
     };
   } catch (error) {
     const isJsonError = error instanceof SyntaxError
@@ -519,6 +540,7 @@ export async function downloadPredictionOutput(
       appError: appErrorResult,
       slurmState: schedulerState.state,
       slurmExitCode: schedulerState.exitCode,
+      schedulerConfirmed: Boolean(schedulerState.state),
     };
     await persistPollingStatus(job, result, persistence);
     return result;
@@ -584,6 +606,7 @@ export async function pollSlurmJobStatus(
       message: `Slurm job ${activeRow.jobId} is ${activeRow.state}.`,
       technicalDetails: activeRow.reason,
       slurmState: activeRow.state,
+      schedulerConfirmed: true,
     };
     await persistPollingStatus(job, result, persistence);
     return result;
@@ -607,7 +630,10 @@ export async function pollSlurmJobStatus(
       end: sacctRow?.end,
     });
     if (downloaded.status !== "output_missing") {
-      return downloaded;
+      return {
+        ...downloaded,
+        schedulerConfirmed: Boolean(sacctRow),
+      };
     }
     const [stdoutLog, stderrLog] = await Promise.all([
       readRemoteLog(job, "stdout.log", settings, remoteExecutor),
@@ -643,16 +669,18 @@ export async function pollSlurmJobStatus(
       slurmExitCode: sacctRow?.exitCode,
       schedulerConfirmed: Boolean(sacctRow),
     };
-    const completedAt = new Date().toISOString();
-    await persistence.updateJobStatus(job.id, result.status, {
-      completedAt,
-      slurmState: sacctRow?.state,
-      slurmExitCode: sacctRow?.exitCode,
-      slurmStdout: stdoutLog,
-      slurmStderr: stderrLog,
-      errorMessage: [result.message, result.technicalDetails].filter(Boolean).join("\n\n"),
-    });
-    await persistence.addJobEvent(job.id, `slurm_${result.status}`, result.message, completedAt);
+    if (pollingStatusChanged(job, result) || job.slurm_stdout !== stdoutLog || job.slurm_stderr !== stderrLog) {
+      const completedAt = new Date().toISOString();
+      await persistence.updateJobStatus(job.id, result.status, {
+        completedAt,
+        slurmState: sacctRow?.state,
+        slurmExitCode: sacctRow?.exitCode,
+        slurmStdout: stdoutLog,
+        slurmStderr: stderrLog,
+        errorMessage: [result.message, result.technicalDetails].filter(Boolean).join("\n\n"),
+      });
+      await persistence.addJobEvent(job.id, `slurm_${result.status}`, result.message, completedAt);
+    }
     return result;
   }
 
@@ -685,16 +713,18 @@ export async function pollSlurmJobStatus(
       slurmExitCode: sacctRow?.exitCode,
       schedulerConfirmed: Boolean(sacctRow),
     };
-    const completedAt = new Date().toISOString();
-    await persistence.updateJobStatus(job.id, result.status, {
-      completedAt,
-      slurmState: sacctRow?.state,
-      slurmExitCode: sacctRow?.exitCode,
-      slurmStdout: stdoutLog,
-      slurmStderr: stderrLog,
-      errorMessage: [result.message, result.technicalDetails].filter(Boolean).join("\n\n"),
-    });
-    await persistence.addJobEvent(job.id, `slurm_${result.status}`, result.message, completedAt);
+    if (pollingStatusChanged(job, result) || job.slurm_stdout !== stdoutLog || job.slurm_stderr !== stderrLog) {
+      const completedAt = new Date().toISOString();
+      await persistence.updateJobStatus(job.id, result.status, {
+        completedAt,
+        slurmState: sacctRow?.state,
+        slurmExitCode: sacctRow?.exitCode,
+        slurmStdout: stdoutLog,
+        slurmStderr: stderrLog,
+        errorMessage: [result.message, result.technicalDetails].filter(Boolean).join("\n\n"),
+      });
+      await persistence.addJobEvent(job.id, `slurm_${result.status}`, result.message, completedAt);
+    }
     return result;
   }
 

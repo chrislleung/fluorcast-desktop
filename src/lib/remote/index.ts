@@ -4,6 +4,7 @@ export * from "./errors";
 export * from "./manualMfaSession";
 export * from "./remoteEnvironmentChecks";
 export * from "./slurmPolling";
+export * from "./slurmPollingCoordinator";
 export * from "./slurmCancellation";
 export * from "./slurmSubmission";
 export * from "./types";
