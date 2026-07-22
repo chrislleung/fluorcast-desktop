@@ -7,6 +7,7 @@ type JobsPageProps = {
   manualMfaSession?: ManualMfaSessionUiState;
   manualMfaStatus?: string;
   nibiSettings?: NibiSettings;
+  refreshingJobIds?: string[];
   onOpenResult: (jobId: string) => void;
   onReconnect?: () => void;
   onOpenRobotSetup?: () => void;
@@ -97,6 +98,7 @@ export function JobsPage({
   manualMfaSession,
   manualMfaStatus,
   nibiSettings,
+  refreshingJobIds = [],
   onOpenResult,
   onReconnect,
   onOpenRobotSetup,
@@ -104,6 +106,8 @@ export function JobsPage({
   onCancelRemoteJob,
   onSubmitSlurmJob,
 }: JobsPageProps) {
+  const refreshingJobs = new Set(refreshingJobIds);
+
   function confirmAndCancel(job: StoredPredictionJob) {
     if (!job.remote_slurm_id) return;
     if (window.confirm(`Cancel Slurm job ${job.remote_slurm_id}?`)) {
@@ -191,10 +195,11 @@ export function JobsPage({
                           {onRefreshJobStatus ? (
                             <button
                               className="secondary-button compact-button"
+                              disabled={refreshingJobs.has(job.id)}
                               onClick={() => void onRefreshJobStatus(job)}
                               type="button"
                             >
-                              Resume monitoring
+                              {refreshingJobs.has(job.id) ? "Refreshing..." : "Resume monitoring"}
                             </button>
                           ) : null}
                           {job.error_message ? (
@@ -229,10 +234,11 @@ export function JobsPage({
                           {onRefreshJobStatus ? (
                             <button
                               className="secondary-button compact-button"
+                              disabled={refreshingJobs.has(job.id)}
                               onClick={() => void onRefreshJobStatus(job)}
                               type="button"
                             >
-                              Refresh status
+                              {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
                             </button>
                           ) : null}
                           {onCancelRemoteJob && job.remote_slurm_id ? (
@@ -283,10 +289,11 @@ export function JobsPage({
                       ) : job.status === "login_required" && isManualSessionReady(manualMfaSession) && canRefresh(job) && onRefreshJobStatus ? (
                         <button
                           className="secondary-button compact-button"
+                          disabled={refreshingJobs.has(job.id)}
                           onClick={() => void onRefreshJobStatus(job)}
                           type="button"
                         >
-                          Refresh status
+                          {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
                         </button>
                       ) : job.status === "login_required" ? (
                         <span>
@@ -305,20 +312,22 @@ export function JobsPage({
                       ) : job.status === "output_missing" && canRefresh(job) && onRefreshJobStatus ? (
                         <button
                           className="secondary-button compact-button"
+                          disabled={refreshingJobs.has(job.id)}
                           onClick={() => void onRefreshJobStatus(job)}
                           type="button"
                         >
-                          Download result
+                          {refreshingJobs.has(job.id) ? "Refreshing..." : "Download result"}
                         </button>
                       ) : job.status === "download_failed" && canRefresh(job) && onRefreshJobStatus ? (
                         <>
                           <span>{job.error_message ?? "The prediction completed, but FluorCast could not download output.json."}</span>
                           <button
                             className="secondary-button compact-button"
+                            disabled={refreshingJobs.has(job.id)}
                             onClick={() => void onRefreshJobStatus(job)}
                             type="button"
                           >
-                            Retry output download
+                            {refreshingJobs.has(job.id) ? "Refreshing..." : "Retry output download"}
                           </button>
                           {failureDetails(job) ? (
                             <details className="remote-check-details">
@@ -332,10 +341,11 @@ export function JobsPage({
                           <span>{job.error_message ?? "Remote output.json was downloaded but needs to be re-imported."}</span>
                           <button
                             className="secondary-button compact-button"
+                            disabled={refreshingJobs.has(job.id)}
                             onClick={() => void onRefreshJobStatus(job)}
                             type="button"
                           >
-                            Retry result import
+                            {refreshingJobs.has(job.id) ? "Refreshing..." : "Retry result import"}
                           </button>
                           {failureDetails(job) ? (
                             <details className="remote-check-details">
@@ -381,10 +391,11 @@ export function JobsPage({
                       ) : canRefresh(job) && onRefreshJobStatus ? (
                         <button
                           className="secondary-button compact-button"
+                          disabled={refreshingJobs.has(job.id)}
                           onClick={() => void onRefreshJobStatus(job)}
                           type="button"
                         >
-                          Refresh status
+                          {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
                         </button>
                       ) : canSubmitToSlurm(job) ? (
                         <span>Input uploaded. Submit to Slurm.</span>

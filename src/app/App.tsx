@@ -38,12 +38,10 @@ import {
   applyManualMfaSessionResult,
   cancelSlurmJob,
   pollSlurmJobStatus,
-  isAutoPollableSlurmJob,
   submitPredictionSlurmJob,
   type ManualMfaSessionResult,
   type ManualMfaSessionUiState,
   SlurmPollingCoordinator,
-  type PollResultMeta,
   type SlurmPollingCoordinatorDiagnostics,
   type SlurmPollingCoordinatorOptions,
   type SlurmPollingResult,
@@ -118,6 +116,56 @@ export function App() {
     const persistedJobs = await listJobs();
     dispatchJobs({ type: "set_jobs", jobs: persistedJobs });
   }, []);
+
+  const patchJobFromStatusUpdate = useCallback((
+    id: string,
+    status: StoredPredictionJob["status"],
+    options: Parameters<typeof updateJobStatus>[2] = {},
+  ) => {
+    const patch: Partial<StoredPredictionJob> = { status };
+    if (options.completedAt !== undefined) patch.completed_at = options.completedAt;
+    if (options.remoteSlurmId !== undefined) patch.remote_slurm_id = options.remoteSlurmId;
+    if (options.remoteJobDir !== undefined) patch.remote_job_dir = options.remoteJobDir;
+    if (options.remoteInputPath !== undefined) patch.remote_input_path = options.remoteInputPath;
+    if (options.remoteOutputPath !== undefined) patch.remote_output_path = options.remoteOutputPath;
+    if (options.submissionId !== undefined) patch.submission_id = options.submissionId;
+    if (options.submittedAt !== undefined) patch.submitted_at = options.submittedAt;
+    if (options.slurmState !== undefined) patch.slurm_state = options.slurmState;
+    if (options.slurmExitCode !== undefined) patch.slurm_exit_code = options.slurmExitCode;
+    if (options.slurmStdout !== undefined) patch.slurm_stdout = options.slurmStdout;
+    if (options.slurmStderr !== undefined) patch.slurm_stderr = options.slurmStderr;
+    if (options.submittedCommand !== undefined) patch.submitted_command = options.submittedCommand;
+    if ("errorMessage" in options) patch.error_message = options.errorMessage;
+
+    dispatchJobs({
+      type: "patch_job",
+      id,
+      patch,
+    });
+  }, []);
+
+  const pollingPersistenceRef = useRef<SlurmPollingCoordinatorOptions["persistence"]>({
+    updateJobStatus: async (jobId, status, options) => {
+      const updated = await updateJobStatus(jobId, status, options);
+      if (updated) {
+        patchJobFromStatusUpdate(jobId, status, options);
+      }
+      return updated;
+    },
+    saveResult: async (jobId, output, downloadedAt) => {
+      const saved = await saveResult(jobId, output, downloadedAt);
+      if (saved) {
+        dispatchJobs({
+          type: "complete_job",
+          id: jobId,
+          completed_at: downloadedAt ?? output.completed_at,
+          output,
+        });
+      }
+      return saved;
+    },
+    addJobEvent,
+  });
 
   useEffect(() => {
     function syncPageFromHash() {
@@ -267,6 +315,10 @@ export function App() {
     setCurrentPage("result");
   }
 
+  function isJobRefreshInFlight(jobId: string) {
+    return (pollingDiagnostics?.inFlightRequestCountByJob[jobId] ?? 0) > 0;
+  }
+
   const createSelectedRemoteExecutor = useCallback(() => {
     const remoteExecutor = createRemoteExecutor(nibiSettings.connection_mode);
     if (remoteExecutor instanceof InteractiveMfaRemoteExecutor) {
@@ -355,64 +407,64 @@ export function App() {
     }
   }, [manualMfaSession, nibiSettings]);
 
-  const refreshRemoteJob = useCallback(async (job: StoredPredictionJob) => {
-    const pollGeneration = (latestPollGenerationRef.current[job.id] ?? 0) + 1;
-    latestPollGenerationRef.current[job.id] = pollGeneration;
-    const isCurrentPoll = () => latestPollGenerationRef.current[job.id] === pollGeneration;
-    const guardedPersistence = {
-      updateJobStatus: async (...args: Parameters<typeof updateJobStatus>) => (
-        isCurrentPoll() ? updateJobStatus(...args) : true
-      ),
-      saveResult: async (...args: Parameters<typeof saveResult>) => (
-        isCurrentPoll() ? saveResult(...args) : true
-      ),
-      addJobEvent: async (...args: Parameters<typeof addJobEvent>) => (
-        isCurrentPoll() ? addJobEvent(...args) : true
-      ),
-    };
-    let remoteExecutor = createSelectedRemoteExecutor();
-    if (nibiSettings.connection_mode === "interactive_mfa" && !isManualMfaReady()) {
-        const ready = await testManualMfaSessionForJobs({ jobsPageBlocked: true });
-        if (!ready) {
-          await updateJobStatus(job.id, "login_required", {
-          errorMessage: "Open Settings, start the NIBI session, then press Test authenticated session before continuing.",
-        });
-          await addJobEvent(job.id, "manual_mfa_session_required", "Jobs page blocked because the Manual MFA session is not reusable.");
-          await refreshJobsFromDatabase();
-          return {
-            jobId: job.id,
-            slurmJobId: job.remote_slurm_id,
-            status: "login_required" as const,
-          message: "Open Settings, start the NIBI session, then press Test authenticated session before continuing.",
+  runRemoteRefreshRef.current = async (job, { generation, persistence, wrapExecutor }) => {
+    const currentSettings = nibiSettingsRef.current;
+    let remoteExecutor = createPollingRemoteExecutor();
+    if (currentSettings.connection_mode === "interactive_mfa" && !isManualMfaReadyForPolling()) {
+      const ready = await testManualMfaSessionForJobs({ jobsPageBlocked: true });
+      if (!ready) {
+        const message = "Open Settings, start the NIBI session, then press Test authenticated session before continuing.";
+        await persistence.updateJobStatus(job.id, "login_required", { errorMessage: message });
+        await persistence.addJobEvent(job.id, "manual_mfa_session_required", "Jobs page blocked because the Manual MFA session is not reusable.");
+        return {
+          jobId: job.id,
+          slurmJobId: job.remote_slurm_id,
+          status: "login_required",
+          message,
+          technicalDetails: `POLL_GENERATION=${generation}`,
         };
-        }
-      remoteExecutor = createAuthenticatedManualExecutor();
-    }
-    const result = await pollSlurmJobStatus(
-      job,
-      nibiSettings,
-      remoteExecutor,
-      guardedPersistence,
-    );
-    if (isCurrentPoll()) {
-      setLatestPollingResult({
-        ...result,
-        technicalDetails: [
-          `POLL_GENERATION=${pollGeneration}`,
-          result.technicalDetails,
-        ].filter(Boolean).join("\n"),
-      });
-      setManualMfaJobStatus(result.message);
-      await refreshJobsFromDatabase();
-      if (selectedJobId === job.id) {
-        const persistedJob = await getJobWithResult(job.id);
-        setSelectedJobDetail(persistedJob);
       }
-    } else {
-      await addJobEvent(job.id, "slurm_poll_stale_response_ignored", `STALE_RESPONSE_IGNORED=1\nPOLL_GENERATION=${pollGeneration}`);
+      remoteExecutor = createPollingRemoteExecutor(true);
     }
-    return result;
-  }, [createAuthenticatedManualExecutor, createSelectedRemoteExecutor, isManualMfaReady, nibiSettings, refreshJobsFromDatabase, selectedJobId, testManualMfaSessionForJobs]);
+    return pollSlurmJobStatus(
+      job,
+      currentSettings,
+      wrapExecutor(remoteExecutor),
+      persistence,
+    );
+  };
+
+  handlePollingResultRef.current = async (job, result, meta) => {
+    setLatestPollingResult({
+      ...result,
+      technicalDetails: [
+        `POLL_GENERATION=${meta.generation}`,
+        `POLL_STALE=${meta.stale ? 1 : 0}`,
+        result.technicalDetails,
+      ].filter(Boolean).join("\n"),
+    });
+    setManualMfaJobStatus(result.message);
+    if (selectedJobIdRef.current === job.id) {
+      const persistedJob = await getJobWithResult(job.id);
+      setSelectedJobDetail(persistedJob);
+    }
+  };
+
+  handleStalePollingResultRef.current = async (job, _result, meta) => {
+    await addJobEvent(job.id, "slurm_poll_stale_response_ignored", `STALE_RESPONSE_IGNORED=1\nPOLL_GENERATION=${meta.generation}`);
+  };
+
+  handlePollingErrorRef.current = async (_job, error) => {
+    setDatabaseError(error instanceof Error ? error.message : "Remote job polling failed.");
+  };
+
+  const refreshRemoteJob = useCallback(async (job: StoredPredictionJob) => {
+    return pollingCoordinatorRef.current?.refreshNow(job) ?? runRemoteRefreshRef.current(job, {
+      generation: 0,
+      persistence: pollingPersistenceRef.current,
+      wrapExecutor: (executor) => executor,
+    });
+  }, []);
 
   const submitRemoteSlurmJob = useCallback(async (job: StoredPredictionJob) => {
     const submissionId = job.submission_id ?? job.id;
@@ -483,6 +535,37 @@ export function App() {
   }, [createSelectedRemoteExecutor, nibiSettings, refreshJobsFromDatabase]);
 
   useEffect(() => {
+    const coordinator = new SlurmPollingCoordinator({
+      persistence: pollingPersistenceRef.current,
+      runRemoteRefresh: (...args) => runRemoteRefreshRef.current(...args),
+      onResult: (...args) => handlePollingResultRef.current(...args),
+      onStaleResult: (...args) => handleStalePollingResultRef.current(...args),
+      onError: (...args) => handlePollingErrorRef.current(...args),
+      onDiagnosticsChange: setPollingDiagnostics,
+    });
+    pollingCoordinatorRef.current = coordinator;
+
+    return () => {
+      coordinator.shutdown();
+      if (pollingCoordinatorRef.current === coordinator) {
+        pollingCoordinatorRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const coordinator = pollingCoordinatorRef.current;
+    if (!coordinator) {
+      return;
+    }
+    if (databaseStatus !== "ready") {
+      coordinator.syncJobs([]);
+      return;
+    }
+    coordinator.syncJobs(jobsState.jobs);
+  }, [databaseStatus, jobsState.jobs]);
+
+  useEffect(() => {
     if (
       databaseStatus !== "ready"
       || currentPage !== "jobs"
@@ -512,28 +595,6 @@ export function App() {
     nibiSettings,
     testManualMfaSessionForJobs,
   ]);
-
-  const refreshActiveRemoteJobs = useCallback(async () => {
-    for (const job of jobsState.jobs.filter(isPollableRemoteJob)) {
-      await refreshRemoteJob(job);
-    }
-  }, [jobsState.jobs, refreshRemoteJob]);
-
-  useEffect(() => {
-    if (databaseStatus !== "ready") {
-      return;
-    }
-    const activeJobs = jobsState.jobs.filter(isPollableRemoteJob);
-    if (activeJobs.length === 0) {
-      return;
-    }
-    const timer = window.setInterval(() => {
-      void refreshActiveRemoteJobs().catch((error: unknown) => {
-        setDatabaseError(error instanceof Error ? error.message : "Remote job polling failed.");
-      });
-    }, 15000);
-    return () => window.clearInterval(timer);
-  }, [databaseStatus, jobsState.jobs, refreshActiveRemoteJobs]);
 
   async function persistJobChange(job: StoredPredictionJob) {
     try {
@@ -696,11 +757,22 @@ export function App() {
       || job.status === "upload_waiting_for_login"
       || job.status === "connection_failed"
     ) {
+      const title = job.status === "uploaded_to_nibi"
+        ? "Uploaded to NIBI"
+        : job.status === "upload_waiting_for_login"
+          ? "Waiting for login"
+          : job.status === "queued_locally"
+            ? "Queued locally"
+            : job.status === "queued"
+              ? "Queued"
+              : job.status === "submitted_to_slurm"
+                ? "Submitted to Slurm"
+                : "Running";
       return (
         <div className="page narrow-page">
           <section className="empty-state loading-state">
             <span className="empty-icon" aria-hidden="true">...</span>
-            <h2>{job.status === "uploaded_to_nibi" ? "Uploaded to NIBI" : job.status === "slurm_submission_failed" ? "Slurm submission failed" : job.status === "upload_waiting_for_login" ? "Waiting for login" : job.status === "queued_locally" ? "Queued locally" : job.status === "queued" ? "Queued" : job.status === "submitted_to_slurm" ? "Submitted to Slurm" : job.status === "output_missing" ? "Waiting for output" : "Running"}</h2>
+            <h2>{title}</h2>
             <p>{job.error_message ?? (job.remote_slurm_id ? `Slurm job ${job.remote_slurm_id}` : "This prediction is still being prepared.")}</p>
           </section>
         </div>
@@ -746,11 +818,11 @@ export function App() {
             <p>{job.error_message ?? "The job finished, but output.json is not available yet."}</p>
             <button
               className="primary-button"
-              disabled={!job.remote_slurm_id}
+              disabled={!job.remote_slurm_id || isJobRefreshInFlight(job.id)}
               onClick={() => void refreshRemoteJob(job)}
               type="button"
             >
-              Refresh status
+              {isJobRefreshInFlight(job.id) ? "Refreshing..." : "Refresh status"}
             </button>
           </section>
         </div>
@@ -840,23 +912,15 @@ export function App() {
           />
         );
       case "jobs":
-        if (databaseStatus === "initializing") {
-          return (
-            <div className="page narrow-page">
-              <section className="empty-state loading-state">
-                <span className="empty-icon" aria-hidden="true">...</span>
-                <h2>Opening local database</h2>
-                <p>Loading persisted jobs from SQLite.</p>
-              </section>
-            </div>
-          );
-        }
         return (
           <JobsPage
             jobs={jobsState.jobs}
             manualMfaSession={manualMfaSession}
             manualMfaStatus={manualMfaJobStatus}
             nibiSettings={nibiSettings}
+            refreshingJobIds={Object.entries(pollingDiagnostics?.inFlightRequestCountByJob ?? {})
+              .filter(([, count]) => count > 0)
+              .map(([jobId]) => jobId)}
             onOpenResult={openResult}
             onOpenRobotSetup={() => navigate("settings")}
             onReconnect={() => navigate("settings")}
@@ -887,6 +951,7 @@ export function App() {
             activeJobsCount={jobsState.jobs.filter(isPollableRemoteJob).length}
             jobsPageLoginRequiredCount={jobsState.jobs.filter((job) => job.status === "login_required").length}
             latestPollingResult={latestPollingResult}
+            pollingDiagnostics={pollingDiagnostics}
             onJobsRefresh={(jobs) => dispatchJobs({ type: "set_jobs", jobs })}
             onOpenResult={openResult}
           />

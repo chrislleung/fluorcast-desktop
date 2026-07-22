@@ -9,7 +9,7 @@ import {
   type PersistenceProbeResult,
 } from "../../lib/db";
 import type { NibiSettings } from "../../features/settings";
-import type { ManualMfaSessionUiState, SlurmPollingResult } from "../../lib/remote";
+import type { ManualMfaSessionUiState, SlurmPollingCoordinatorDiagnostics, SlurmPollingResult } from "../../lib/remote";
 
 type DiagnosticsPageProps = {
   isDatabaseReady: boolean;
@@ -18,6 +18,7 @@ type DiagnosticsPageProps = {
   activeJobsCount?: number;
   jobsPageLoginRequiredCount?: number;
   latestPollingResult?: SlurmPollingResult | null;
+  pollingDiagnostics?: SlurmPollingCoordinatorDiagnostics | null;
   onOpenResult: (jobId: string) => void;
   onJobsRefresh: (jobs: JobWithResult[]) => void;
 };
@@ -34,6 +35,7 @@ export function DiagnosticsPage({
   activeJobsCount = 0,
   jobsPageLoginRequiredCount = 0,
   latestPollingResult,
+  pollingDiagnostics,
   onOpenResult,
   onJobsRefresh,
 }: DiagnosticsPageProps) {
@@ -146,6 +148,10 @@ export function DiagnosticsPage({
                 <div><span className="step-label">Jobs page blocked timestamp</span><code>{manualMfaSession.jobs_page_login_required_at || "None"}</code></div>
                 <div><span className="step-label">Latest Slurm job ID</span><code>{latestPollingResult?.slurmJobId ?? "None"}</code></div>
                 <div><span className="step-label">Latest polling result</span><strong>{latestPollingResult?.status ?? "None"}</strong></div>
+                <div><span className="step-label">Polling coordinator</span><strong>{pollingDiagnostics?.coordinatorCount ?? 0}</strong></div>
+                <div><span className="step-label">Active poll timers</span><strong>{pollingDiagnostics?.activeTimerCount ?? 0}</strong></div>
+                <div><span className="step-label">In-flight polls</span><strong>{pollingDiagnostics?.inFlightRemoteRequestCount ?? 0}</strong></div>
+                <div><span className="step-label">Polling session state</span><strong>{pollingDiagnostics?.authenticatedSessionState ?? "unknown"}</strong></div>
                 <div><span className="step-label">Selected Manual MFA SSH backend</span><strong>{nibiSettings.manual_mfa_ssh_backend}</strong></div>
                 <div><span className="step-label">Effective backend</span><strong>WSL</strong></div>
                 <div><span className="step-label">WSL available</span><strong>{boolLabel(manualMfaSession.wsl_available)}</strong></div>

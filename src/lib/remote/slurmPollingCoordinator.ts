@@ -324,7 +324,7 @@ export class SlurmPollingCoordinator {
     state.timer = this.setTimer(() => {
       state.timer = null;
       state.nextPollAt = undefined;
-      void this.startRefresh(jobId, "auto");
+      void this.startRefresh(jobId, "auto").catch(() => undefined);
     }, delayMs);
   }
 
