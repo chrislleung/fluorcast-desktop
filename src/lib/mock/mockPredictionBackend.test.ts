@@ -33,10 +33,10 @@ describe("mock prediction backend", () => {
   it("rejects malformed mock output through schema validation", () => {
     const malformedOutput = {
       ...mockPredictionOutputFixture,
-      predictions: [{ ...mockPredictionOutputFixture.predictions[0], value: "462.7" }],
+      predictions: [{ ...mockPredictionOutputFixture.predictions[0], predicted_emission_nm: "462.7" }],
     };
 
-    expect(() => validatePredictionJobOutput(malformedOutput)).toThrow(/value/);
+    expect(() => validatePredictionJobOutput(malformedOutput)).toThrow(/predicted_emission_nm/);
   });
 
   it("returns a deterministic mock duplicate-check output", () => {

@@ -116,10 +116,10 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /Open result/i }));
 
     expect(await screen.findByRole("heading", { name: "Prediction result" })).toBeInTheDocument();
-    expect(screen.getByText("Emission wavelength")).toBeInTheDocument();
-    expect(screen.getByText("Blue")).toBeInTheDocument();
-    expect(screen.getByText("Bright")).toBeInTheDocument();
-    expect(screen.getByText("High confidence")).toBeInTheDocument();
+    expect(screen.getAllByText("extratrees").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("mlp_large_alpha_1e-04").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("low-medium").length).toBeGreaterThan(0);
   });
 
   it("persists completed mock job results before marking the job completed", async () => {
@@ -162,7 +162,8 @@ describe("App", () => {
 
     expect(await screen.findByRole("heading", { name: "Prediction result" })).toBeInTheDocument();
     expect(dbMock.getJobWithResult).toHaveBeenCalledWith("job-1");
-    expect(screen.getByText("Emission wavelength")).toBeInTheDocument();
+    expect(screen.getAllByText("extratrees").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("mlp_large_alpha_1e-04").length).toBeGreaterThan(0);
   });
 
   it("keeps result routes loading while the database is not ready", async () => {

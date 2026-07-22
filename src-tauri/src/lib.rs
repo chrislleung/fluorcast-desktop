@@ -27,6 +27,7 @@ pub fn run() {
             nibi::download_nibi_file,
             nibi::upload_nibi_file,
             nibi::prediction_output_temp_file_path,
+            nibi::prediction_output_file_modified_at,
             nibi::read_prediction_output_file,
             nibi::write_prediction_input_temp_file
         ])

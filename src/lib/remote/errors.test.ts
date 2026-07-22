@@ -42,8 +42,10 @@ describe("remote AppError mapping", () => {
   });
 
   it("maps Slurm command failures separately from SSH failures", () => {
-    expect(classifyRemoteCommandFailure(result("squeue: command not found"), "slurm_poll").code)
-      .toBe("slurm_unavailable");
+    const slurmError = classifyRemoteCommandFailure(result("squeue: command not found"), "slurm_poll");
+    expect(slurmError.code).toBe("slurm_unavailable");
+    expect(slurmError.message).toBe("Slurm is unavailable from this session. Check the NIBI environment.");
+    expect(slurmError.message).not.toContain("allow-list");
     expect(classifyRemoteCommandFailure(result("ssh: connect to host nibi port 22: Connection timed out"), "ssh").code)
       .toBe("ssh_connection_failed");
   });

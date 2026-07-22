@@ -29,7 +29,7 @@ export const appErrorMessages: Record<AppErrorCode, string> = {
   ssh_connection_failed: "Could not connect to NIBI over SSH. Check your network, host, username, and SSH key settings.",
   remote_command_not_allowed: "The robot node rejected this command. The command may not be allowed by allowed_commands.sh.",
   remote_project_missing: "The remote FluorCast project path was not found. Check the project path in Settings.",
-  slurm_unavailable: "Slurm is unavailable from this session. Check the NIBI environment or robot command allow-list.",
+  slurm_unavailable: "Slurm is unavailable from this session. Check the NIBI environment.",
   sbatch_failed: "Slurm rejected the job submission.",
   job_failed: "The remote prediction job failed.",
   output_missing: "The job finished, but output.json is not available yet.",

@@ -310,13 +310,45 @@ export function JobsPage({
                         >
                           Download result
                         </button>
+                      ) : job.status === "download_failed" && canRefresh(job) && onRefreshJobStatus ? (
+                        <>
+                          <span>{job.error_message ?? "The prediction completed, but FluorCast could not download output.json."}</span>
+                          <button
+                            className="secondary-button compact-button"
+                            onClick={() => void onRefreshJobStatus(job)}
+                            type="button"
+                          >
+                            Retry output download
+                          </button>
+                          {failureDetails(job) ? (
+                            <details className="remote-check-details">
+                              <summary>Failure details</summary>
+                              <pre>{failureDetails(job)}</pre>
+                            </details>
+                          ) : null}
+                        </>
+                      ) : job.status === "output_invalid" && canRefresh(job) && onRefreshJobStatus ? (
+                        <>
+                          <span>{job.error_message ?? "Remote output.json was downloaded but needs to be re-imported."}</span>
+                          <button
+                            className="secondary-button compact-button"
+                            onClick={() => void onRefreshJobStatus(job)}
+                            type="button"
+                          >
+                            Retry result import
+                          </button>
+                          {failureDetails(job) ? (
+                            <details className="remote-check-details">
+                              <summary>Failure details</summary>
+                              <pre>{failureDetails(job)}</pre>
+                            </details>
+                          ) : null}
+                        </>
                       ) : job.status === "failed"
                         || job.status === "upload_failed"
                         || job.status === "cancelled"
                         || job.status === "timed_out"
                         || job.status === "timeout"
-                        || job.status === "output_invalid"
-                        || job.status === "download_failed"
                         || job.status === "unknown" ? (
                         <>
                           <span>{job.error_message ?? "Failed"}</span>

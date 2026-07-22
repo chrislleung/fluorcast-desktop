@@ -1,10 +1,8 @@
 {
-  "job_id": "job-01JFC8X2W3D4E5F6G7H8J9K0M",
-  "status": "succeeded",
-  "completed_at": "2026-07-03T14:34:12.000Z",
-  "completed_at_source": "import_time",
-  "canonical_molecule_smiles": "CCOc1ccc2nc(S(N)(=O)=O)sc2c1",
-  "canonical_solvent_smiles": "CCO",
+  "status": "success",
+  "job_id": "2e80b1b9-f65f-426a-a289-1466ab7f0abd",
+  "canonical_molecule_smiles": "CCO",
+  "canonical_solvent_smiles": "O",
   "predictions": [
     {
       "model_name": "extratrees",
@@ -29,7 +27,9 @@
       "nearest_training_smiles": "CCC",
       "confidence_label": "low-medium",
       "outside_applicability_domain": true,
-      "warnings": []
+      "warnings": [
+        "Absorption model unavailable for this variant."
+      ]
     }
   ],
   "warnings": [

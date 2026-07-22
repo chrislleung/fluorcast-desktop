@@ -85,6 +85,60 @@ describe("JobsPage recovery actions", () => {
     expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ status: "output_missing" }));
   });
 
+  it("shows retry output download for download failures without Slurm resubmission", () => {
+    const refresh = vi.fn();
+    const submit = vi.fn();
+    render(
+      <JobsPage
+        jobs={[{
+          ...baseJob,
+          status: "download_failed",
+          remote_slurm_id: "18217313",
+          remote_output_path: "/home/chrisl/scratch/fluorcast-jobs/7d676c1e-2a98-4f38-8ba7-5858182b6ade/output.json",
+          error_message: "The prediction completed, but FluorCast could not download output.json.",
+        }]}
+        onOpenResult={vi.fn()}
+        onRefreshJobStatus={refresh}
+        onSubmitSlurmJob={submit}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Retry Slurm submission" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry output download" }));
+    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({
+      status: "download_failed",
+      remote_slurm_id: "18217313",
+    }));
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("shows retry result import for invalid output without Slurm resubmission", () => {
+    const refresh = vi.fn();
+    const submit = vi.fn();
+    render(
+      <JobsPage
+        jobs={[{
+          ...baseJob,
+          status: "output_invalid",
+          remote_slurm_id: "18226108",
+          remote_output_path: "/home/chrisl/scratch/fluorcast-jobs/2e80/output.json",
+          error_message: "JSON_SYNTAX_STATUS=valid\nREMOTE_SCHEMA_STATUS=invalid",
+        }]}
+        onOpenResult={vi.fn()}
+        onRefreshJobStatus={refresh}
+        onSubmitSlurmJob={submit}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Retry Slurm submission" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry result import" }));
+    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({
+      status: "output_invalid",
+      remote_slurm_id: "18226108",
+    }));
+    expect(submit).not.toHaveBeenCalled();
+  });
+
   it("does not show remote folder as the result action for uploaded jobs", () => {
     render(
       <JobsPage

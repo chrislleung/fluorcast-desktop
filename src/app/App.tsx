@@ -89,6 +89,7 @@ export function App() {
   const [manualMfaJobStatus, setManualMfaJobStatus] = useState("");
   const [lastJobsSessionProbeKey, setLastJobsSessionProbeKey] = useState("");
   const activeSlurmSubmissionsRef = useRef<Set<string>>(new Set());
+  const latestPollGenerationRef = useRef<Record<string, number>>({});
 
   const selectedJob = selectedJobDetail ?? undefined;
 
@@ -311,6 +312,20 @@ export function App() {
   }, [manualMfaSession, nibiSettings]);
 
   const refreshRemoteJob = useCallback(async (job: StoredPredictionJob) => {
+    const pollGeneration = (latestPollGenerationRef.current[job.id] ?? 0) + 1;
+    latestPollGenerationRef.current[job.id] = pollGeneration;
+    const isCurrentPoll = () => latestPollGenerationRef.current[job.id] === pollGeneration;
+    const guardedPersistence = {
+      updateJobStatus: async (...args: Parameters<typeof updateJobStatus>) => (
+        isCurrentPoll() ? updateJobStatus(...args) : true
+      ),
+      saveResult: async (...args: Parameters<typeof saveResult>) => (
+        isCurrentPoll() ? saveResult(...args) : true
+      ),
+      addJobEvent: async (...args: Parameters<typeof addJobEvent>) => (
+        isCurrentPoll() ? addJobEvent(...args) : true
+      ),
+    };
     let remoteExecutor = createSelectedRemoteExecutor();
     if (nibiSettings.connection_mode === "interactive_mfa" && !isManualMfaReady()) {
         const ready = await testManualMfaSessionForJobs({ jobsPageBlocked: true });
@@ -333,14 +348,24 @@ export function App() {
       job,
       nibiSettings,
       remoteExecutor,
-      { updateJobStatus, saveResult, addJobEvent },
+      guardedPersistence,
     );
-    setLatestPollingResult(result);
-    setManualMfaJobStatus(result.message);
-    await refreshJobsFromDatabase();
-    if (selectedJobId === job.id) {
-      const persistedJob = await getJobWithResult(job.id);
-      setSelectedJobDetail(persistedJob);
+    if (isCurrentPoll()) {
+      setLatestPollingResult({
+        ...result,
+        technicalDetails: [
+          `POLL_GENERATION=${pollGeneration}`,
+          result.technicalDetails,
+        ].filter(Boolean).join("\n"),
+      });
+      setManualMfaJobStatus(result.message);
+      await refreshJobsFromDatabase();
+      if (selectedJobId === job.id) {
+        const persistedJob = await getJobWithResult(job.id);
+        setSelectedJobDetail(persistedJob);
+      }
+    } else {
+      await addJobEvent(job.id, "slurm_poll_stale_response_ignored", `STALE_RESPONSE_IGNORED=1\nPOLL_GENERATION=${pollGeneration}`);
     }
     return result;
   }, [createAuthenticatedManualExecutor, createSelectedRemoteExecutor, isManualMfaReady, nibiSettings, refreshJobsFromDatabase, selectedJobId, testManualMfaSessionForJobs]);

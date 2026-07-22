@@ -31,8 +31,11 @@ describe("prediction job contract", () => {
   });
 
   it("rejects a malformed predictions array", () => {
-    const invalidOutput = { ...validSuccessOutput, predictions: [{ value: "462.7" }] };
-    expect(() => validatePredictionJobOutput(invalidOutput)).toThrow(/value/);
+    const invalidOutput = {
+      ...validSuccessOutput,
+      predictions: [{ ...validSuccessOutput.predictions[0], predicted_emission_nm: "462.7" }],
+    };
+    expect(() => validatePredictionJobOutput(invalidOutput)).toThrow(/predicted_emission_nm/);
   });
 
   it("creates a valid local-user request", () => {

@@ -516,6 +516,19 @@ pub fn read_prediction_output_file(local_path: String) -> Result<String, String>
 }
 
 #[tauri::command]
+pub fn prediction_output_file_modified_at(local_path: String) -> Result<String, String> {
+    validate_local_download_path(&local_path)?;
+    let modified = std::fs::metadata(&local_path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| format!("Could not read downloaded output.json metadata: {error}"))?;
+    let millis = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("Downloaded output.json mtime is before the Unix epoch: {error}"))?
+        .as_millis();
+    Ok(millis.to_string())
+}
+
+#[tauri::command]
 pub fn run_nibi_remote_command(
     mode: String,
     settings: NibiSettings,
@@ -1635,21 +1648,41 @@ fn download_file_via_wsl_scp(
     validate_manual_login_settings(settings)?;
     validate_remote_path_under_jobs(remote_path, &settings.remote_jobs_path)?;
     let commands = build_manual_mfa_session_commands(settings)?;
-    let output = run_wsl_bash_script(
-        &commands.wsl_distro,
-        &manual_mfa_scp_download_script(),
-        &[
-            remote_path.to_string(),
-            local_path.to_string(),
-            commands.host,
-        ],
+    let invocation = build_manual_mfa_scp_download_invocation(&commands, remote_path, local_path);
+    let normalized_path = normalize_windows_path_for_wsl_argument(local_path);
+    let output = run_program_with_stdin_timeout(
+        &invocation.program,
+        &invocation.args,
+        &invocation.stdin,
         WSL_SCRIPT_TIMEOUT,
-    )?;
+    )
+    .map_err(|error| format!("Could not run WSL bash script: {error}"))?;
     if output.status == 0 {
         Ok(())
     } else {
-        Err(output.combined())
+        Err(format!(
+            "ORIGINAL_WINDOWS_DESTINATION={}\nNORMALIZED_WINDOWS_DESTINATION={}\n{}",
+            safe_diagnostic_value(local_path),
+            safe_diagnostic_value(&normalized_path),
+            output.combined(),
+        ))
     }
+}
+
+fn build_manual_mfa_scp_download_invocation(
+    commands: &ManualMfaSessionCommands,
+    remote_path: &str,
+    local_path: &str,
+) -> WslBashScriptInvocation {
+    build_wsl_bash_script_invocation(
+        &commands.wsl_distro,
+        &manual_mfa_scp_download_script(),
+        &[
+            commands.host.clone(),
+            remote_path.to_string(),
+            normalize_windows_path_for_wsl_argument(local_path),
+        ],
+    )
 }
 
 fn manual_mfa_scp_upload_script() -> String {
@@ -1722,26 +1755,109 @@ fn manual_mfa_scp_upload_script() -> String {
 fn manual_mfa_scp_download_script() -> String {
     [
         "#!/usr/bin/env bash",
-        "set -Eeuo pipefail",
+        "set -uo pipefail",
         "",
-        "REMOTE_PATH=\"$1\"",
-        "LOCAL_WINDOWS_PATH=\"$2\"",
-        "HOST=\"$3\"",
+        "HOST=\"$1\"",
+        "REMOTE_OUTPUT_PATH=\"$2\"",
+        "WINDOWS_DESTINATION=\"$3\"",
         "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
-        "LOCAL_WSL_PATH=\"$(wslpath -a \"$LOCAL_WINDOWS_PATH\")\"",
-        "",
-        "test -S \"$CTL\"",
-        "mkdir -p \"$(dirname \"$LOCAL_WSL_PATH\")\"",
-        "scp \\",
+        "sanitize_download_diag() {",
+        "  printf '%s' \"$1\" | tr '\\r\\n' '  '",
+        "}",
+        "print_download_diag() {",
+        "  printf 'DOWNLOAD_FAILURE_CODE=%s\\n' \"$1\"",
+        "  printf 'REMOTE_OUTPUT_PATH=%s\\n' \"$(sanitize_download_diag \"$REMOTE_OUTPUT_PATH\")\"",
+        "  printf 'WINDOWS_DESTINATION=%s\\n' \"$(sanitize_download_diag \"$WINDOWS_DESTINATION\")\"",
+        "  printf 'CONVERTED_WSL_DESTINATION=%s\\n' \"$(sanitize_download_diag \"${LOCAL_WSL_DESTINATION:-}\")\"",
+        "  printf 'REMOTE_FILE_EXISTS=%s\\n' \"${REMOTE_FILE_EXISTS:-0}\"",
+        "  printf 'REMOTE_FILE_SIZE=%s\\n' \"${REMOTE_FILE_SIZE:-}\"",
+        "  printf 'WSLPATH_EXIT_CODE=%s\\n' \"${WSLPATH_EXIT:-}\"",
+        "  printf 'SCP_EXIT_CODE=%s\\n' \"${SCP_EXIT:-}\"",
+        "  if [ -n \"${LOCAL_WSL_DESTINATION:-}\" ] && [ -f \"$LOCAL_WSL_DESTINATION\" ]; then",
+        "    printf 'LOCAL_FILE_EXISTS=1\\n'",
+        "    printf 'LOCAL_FILE_SIZE=%s\\n' \"$(wc -c < \"$LOCAL_WSL_DESTINATION\" 2>/dev/null || printf '')\"",
+        "  else",
+        "    printf 'LOCAL_FILE_EXISTS=0\\n'",
+        "    printf 'LOCAL_FILE_SIZE=\\n'",
+        "  fi",
+        "  printf 'STDOUT=%s\\n' \"$(sanitize_download_diag \"${SCP_STDOUT:-}\")\"",
+        "  printf 'STDERR=%s\\n' \"$(sanitize_download_diag \"${DOWNLOAD_STDERR:-}\")\"",
+        "}",
+        "WSLPATH_STDERR_FILE=\"$(mktemp)\"",
+        "REMOTE_STDERR_FILE=\"$(mktemp)\"",
+        "SCP_STDERR_FILE=\"$(mktemp)\"",
+        "trap 'rm -f \"$WSLPATH_STDERR_FILE\" \"$REMOTE_STDERR_FILE\" \"$SCP_STDERR_FILE\"' EXIT",
+        "REMOTE_FILE_EXISTS=0",
+        "REMOTE_FILE_SIZE=",
+        "WSLPATH_EXIT=",
+        "SCP_EXIT=",
+        "SCP_STDOUT=",
+        "DOWNLOAD_STDERR=",
+        "if [ -z \"$HOST\" ] || [ -z \"$REMOTE_OUTPUT_PATH\" ] || [ -z \"$WINDOWS_DESTINATION\" ]; then",
+        "  DOWNLOAD_STDERR=\"Missing host, remote output path, or Windows destination.\"",
+        "  print_download_diag 44",
+        "  exit 44",
+        "fi",
+        "LOCAL_WSL_DESTINATION=\"$(wslpath -a -u -- \"$WINDOWS_DESTINATION\" 2>\"$WSLPATH_STDERR_FILE\")\"",
+        "WSLPATH_EXIT=$?",
+        "DOWNLOAD_STDERR=\"$(cat \"$WSLPATH_STDERR_FILE\")\"",
+        "if [ \"$WSLPATH_EXIT\" -ne 0 ] || [ -z \"$LOCAL_WSL_DESTINATION\" ]; then",
+        "  print_download_diag 44",
+        "  exit 44",
+        "fi",
+        "LOCAL_PARENT=\"$(dirname \"$LOCAL_WSL_DESTINATION\")\"",
+        "mkdir -p \"$LOCAL_PARENT\"",
+        "if [ -d \"$LOCAL_WSL_DESTINATION\" ]; then",
+        "  DOWNLOAD_STDERR=\"Converted local destination is a directory.\"",
+        "  print_download_diag 48",
+        "  exit 48",
+        "fi",
+        "if [ ! -S \"$CTL\" ]; then",
+        "  DOWNLOAD_STDERR=\"ControlPath is missing or is not a Unix socket.\"",
+        "  print_download_diag 42",
+        "  exit 42",
+        "fi",
+        "REMOTE_CHECK_COMMAND=\"test -f '$REMOTE_OUTPUT_PATH' && test ! -d '$REMOTE_OUTPUT_PATH' && wc -c < '$REMOTE_OUTPUT_PATH'\"",
+        "REMOTE_FILE_SIZE=\"$(ssh \\",
+        "  -n \\",
+        "  -o ControlPath=\"$CTL\" \\",
+        "  -o ControlMaster=no \\",
+        "  -o BatchMode=yes \\",
+        "  -o PasswordAuthentication=no \\",
+        "  -o KbdInteractiveAuthentication=no \\",
+        "  \"$HOST\" \\",
+        "  \"$REMOTE_CHECK_COMMAND\" \\",
+        "  2>\"$REMOTE_STDERR_FILE\")\"",
+        "REMOTE_CHECK_EXIT=$?",
+        "DOWNLOAD_STDERR=\"$(cat \"$REMOTE_STDERR_FILE\")\"",
+        "if [ \"$REMOTE_CHECK_EXIT\" -ne 0 ] || [ -z \"$REMOTE_FILE_SIZE\" ]; then",
+        "  REMOTE_FILE_EXISTS=0",
+        "  print_download_diag 46",
+        "  exit 46",
+        "fi",
+        "REMOTE_FILE_EXISTS=1",
+        "mkdir -p \"$LOCAL_PARENT\"",
+        "SCP_STDOUT=\"$(scp \\",
         "  -B \\",
         "  -o ControlPath=\"$CTL\" \\",
         "  -o ControlMaster=no \\",
         "  -o BatchMode=yes \\",
         "  -o PasswordAuthentication=no \\",
         "  -o KbdInteractiveAuthentication=no \\",
-        "  \"$HOST:$REMOTE_PATH\" \\",
-        "  \"$LOCAL_WSL_PATH\" \\",
-        "  < /dev/null",
+        "  \"$HOST:$REMOTE_OUTPUT_PATH\" \\",
+        "  \"$LOCAL_WSL_DESTINATION\" \\",
+        "  < /dev/null 2>\"$SCP_STDERR_FILE\")\"",
+        "SCP_EXIT=$?",
+        "DOWNLOAD_STDERR=\"$(cat \"$SCP_STDERR_FILE\")\"",
+        "if [ \"$SCP_EXIT\" -ne 0 ]; then",
+        "  print_download_diag 47",
+        "  exit 47",
+        "fi",
+        "if [ ! -f \"$LOCAL_WSL_DESTINATION\" ] || [ ! -s \"$LOCAL_WSL_DESTINATION\" ]; then",
+        "  print_download_diag 48",
+        "  exit 48",
+        "fi",
+        "print_download_diag 0",
     ]
     .join("\n")
 }
@@ -2048,7 +2164,10 @@ fn validate_remote_command_spec(command_spec: &RemoteCommandSpecInput) -> Result
         "sacct"
             if command_spec.args.len() == 5
                 && command_spec.args[0] == "-j"
-                && command_spec.args[2] == "--format=JobID,State,ExitCode"
+                && matches!(
+                    command_spec.args[2].as_str(),
+                    "--format=JobID,State,ExitCode" | "--format=JobID,State,ExitCode,End"
+                )
                 && command_spec.args[3] == "--parsable2"
                 && command_spec.args[4] == "--noheader" =>
         {
@@ -2120,8 +2239,9 @@ fn structured_remote_command_to_shell(
             shell_quote(&command_spec.args[1])
         )),
         "sacct" => Ok(format!(
-            "sacct -j {} --format=JobID,State,ExitCode --parsable2 --noheader",
-            shell_quote(&command_spec.args[1])
+            "sacct -j {} {} --parsable2 --noheader",
+            shell_quote(&command_spec.args[1]),
+            command_spec.args[2]
         )),
         "scancel" => Ok(format!("scancel {}", shell_quote(&command_spec.args[0]))),
         "sbatch" if command_spec.args.first().map(String::as_str) == Some("--parsable") => {
@@ -4798,7 +4918,10 @@ mod tests {
             assert!(script.contains("< /dev/null"));
             assert!(script.contains("-o PasswordAuthentication=no"));
             assert!(script.contains("-o KbdInteractiveAuthentication=no"));
-            assert!(script.contains("\"$HOST:$REMOTE_PATH\""));
+            assert!(
+                script.contains("\"$HOST:$REMOTE_PATH\"")
+                    || script.contains("\"$HOST:$REMOTE_OUTPUT_PATH\"")
+            );
             assert!(!script.contains("-i \"$KEY\""));
             assert!(!script.contains("ssh.exe"));
             assert!(!script.contains("scp.exe"));
@@ -4841,6 +4964,106 @@ mod tests {
                 "/home/alice/scratch/fluorcast-jobs/job-1/input.json",
             ]
         );
+    }
+
+    #[test]
+    fn manual_mfa_download_normalizes_windows_destination_before_wsl_argument() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let invocation = build_manual_mfa_scp_download_invocation(
+            &commands,
+            "/home/alice/scratch/fluorcast-jobs/job-1/output.json",
+            "C:\\Users\\Name\\AppData\\Local\\Temp\\result.json",
+        );
+
+        assert_eq!(invocation.args[6], "alice@nibi.alliancecan.ca");
+        assert_eq!(
+            invocation.args[7],
+            "/home/alice/scratch/fluorcast-jobs/job-1/output.json"
+        );
+        assert_eq!(
+            invocation.args[8],
+            "C:/Users/Name/AppData/Local/Temp/result.json"
+        );
+        assert!(!invocation.args.iter().any(|arg| arg.contains("\\Users\\")));
+    }
+
+    #[test]
+    fn manual_mfa_download_keeps_destination_as_one_argument_with_spaces() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let invocation = build_manual_mfa_scp_download_invocation(
+            &commands,
+            "/home/alice/scratch/fluorcast jobs/job 1/output.json",
+            "C:\\Users\\Name\\AppData\\Local\\Temp\\FluorCast Jobs\\output file.json",
+        );
+
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-d",
+                "Ubuntu",
+                "--",
+                "bash",
+                "-s",
+                "--",
+                "alice@nibi.alliancecan.ca",
+                "/home/alice/scratch/fluorcast jobs/job 1/output.json",
+                "C:/Users/Name/AppData/Local/Temp/FluorCast Jobs/output file.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn manual_mfa_download_script_converts_normalized_destination_with_wslpath_only() {
+        let script = manual_mfa_scp_download_script();
+
+        assert!(script.contains("HOST=\"$1\""));
+        assert!(script.contains("REMOTE_OUTPUT_PATH=\"$2\""));
+        assert!(script.contains("WINDOWS_DESTINATION=\"$3\""));
+        assert!(script.contains("wslpath -a -u -- \"$WINDOWS_DESTINATION\""));
+        assert!(script.contains("LOCAL_WSL_DESTINATION"));
+        assert!(!script.contains("/mnt/c"));
+        assert!(!script.contains("bash -c"));
+        assert!(!script.contains("cmd /C"));
+        assert!(!script.contains("powershell"));
+    }
+
+    #[test]
+    fn manual_mfa_download_checks_remote_output_before_scp_and_maps_exit_46() {
+        let script = manual_mfa_scp_download_script();
+        let remote_check_position = script.find("REMOTE_CHECK_COMMAND=").unwrap();
+        let scp_position = script.find("SCP_STDOUT=\"$(scp \\").unwrap();
+
+        assert!(remote_check_position < scp_position);
+        assert!(script.contains("test -f '$REMOTE_OUTPUT_PATH'"));
+        assert!(script.contains("print_download_diag 46"));
+        assert!(script.contains("REMOTE_FILE_EXISTS=%s"));
+        assert!(script.contains("REMOTE_FILE_SIZE=%s"));
+    }
+
+    #[test]
+    fn manual_mfa_download_scp_source_is_remote_destination_is_local_and_uses_dev_null() {
+        let script = manual_mfa_scp_download_script();
+
+        assert!(script.contains("scp \\\n  -B \\"));
+        assert!(script.contains("-o ControlPath=\"$CTL\""));
+        assert!(script.contains("-o ControlMaster=no"));
+        assert!(script.contains("-o BatchMode=yes"));
+        assert!(script.contains("\"$HOST:$REMOTE_OUTPUT_PATH\" \\"));
+        assert!(script.contains("\"$LOCAL_WSL_DESTINATION\" \\"));
+        assert!(script.contains("< /dev/null"));
+        assert!(script.contains("print_download_diag 47"));
+        assert!(script.contains("print_download_diag 48"));
+        assert!(!script.contains("scp.exe"));
+    }
+
+    #[test]
+    fn manual_mfa_download_keeps_temp_output_for_typescript_parse_and_persistence() {
+        let script = manual_mfa_scp_download_script();
+        let scp_position = script.find("SCP_STDOUT=\"$(scp \\").unwrap();
+        let success_position = script.find("print_download_diag 0").unwrap();
+
+        assert!(success_position > scp_position);
+        assert!(!script.contains("rm -f \"$LOCAL_WSL_DESTINATION\""));
     }
 
     #[test]
@@ -5277,6 +5500,21 @@ mod tests {
                     redacted_preview: None,
                 },
                 "sacct -j '12345' --format=JobID,State,ExitCode --parsable2 --noheader",
+            ),
+            (
+                RemoteCommandSpecInput {
+                    label: "Poll sacct with end time".to_string(),
+                    executable: "sacct".to_string(),
+                    args: vec![
+                        "-j".to_string(),
+                        "12345".to_string(),
+                        "--format=JobID,State,ExitCode,End".to_string(),
+                        "--parsable2".to_string(),
+                        "--noheader".to_string(),
+                    ],
+                    redacted_preview: None,
+                },
+                "sacct -j '12345' --format=JobID,State,ExitCode,End --parsable2 --noheader",
             ),
             (
                 RemoteCommandSpecInput {

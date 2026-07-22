@@ -1,8 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import validOutput from "../../../tests/fixtures/prediction-output.success.example.json";
+import flatRemoteOutput from "../../../tests/fixtures/remote-output.flat-success.example.json";
 import { defaultNibiSettings, type NibiSettings } from "../../features/settings";
 import type { PersistedPredictionJob } from "../db";
-import type { PredictionJobOutput } from "../schemas";
 import type { RemoteExecutor } from "./RemoteExecutor";
 import {
   buildRemoteOutputExistsCommand,
@@ -167,12 +166,17 @@ describe("Slurm polling helpers", () => {
     });
     const downloads: Array<[string, string]> = [];
 
-    await expect(downloadPredictionOutput(
+    const result = await downloadPredictionOutput(
       job,
       settings,
       executor([], { onDownload: (remotePath, localPath) => downloads.push([remotePath, localPath]) }),
       persistence(),
-    )).resolves.toMatchObject({ status: "output_invalid" });
+    );
+
+    expect(result).toMatchObject({ status: "output_invalid" });
+    expect(result.technicalDetails).toContain("DOWNLOAD_FAILURE_CODE=49");
+    expect(result.technicalDetails).toContain("JSON_SYNTAX_STATUS=invalid");
+    expect(result.technicalDetails).not.toContain("JSON_PARSE_STATUS=invalid");
 
     expect(downloads).toEqual([[
       "/home/alice/scratch/fluorcast-jobs/job-1/output.json",
@@ -185,8 +189,9 @@ describe("Slurm polling helpers", () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "prediction_output_temp_file_path") return "C:\\Temp\\fluorcast-job-1-output.json";
       if (command === "read_prediction_output_file") {
-        return JSON.stringify({ ...(validOutput as PredictionJobOutput), job_id: "job-1" });
+        return JSON.stringify({ ...flatRemoteOutput, job_id: "job-1" });
       }
+      if (command === "prediction_output_file_modified_at") return "1780000000000";
       return null;
     });
 
@@ -198,6 +203,50 @@ describe("Slurm polling helpers", () => {
     )).resolves.toMatchObject({ status: "completed" });
 
     expect(calls.slice(0, 2)).toEqual(["saveResult", "status:completed"]);
+  });
+
+  it("does not download when the remote output is not ready", async () => {
+    const downloads: Array<[string, string]> = [];
+    const result = await downloadPredictionOutput(
+      job,
+      settings,
+      executor([commandResult({ exit_code: 1 })], {
+        onDownload: (remotePath, localPath) => downloads.push([remotePath, localPath]),
+      }),
+      persistence(),
+    );
+
+    expect(result.status).toBe("output_missing");
+    expect(result.technicalDetails).toContain("DOWNLOAD_FAILURE_CODE=46");
+    expect(downloads).toEqual([]);
+  });
+
+  it("download failure preserves the Slurm ID and does not become Slurm unavailable", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "prediction_output_temp_file_path") return "C:\\Temp\\fluorcast-job-1-output.json";
+      return null;
+    });
+    const store = persistence();
+
+    const result = await downloadPredictionOutput(
+      { ...job, remote_slurm_id: "18217313" },
+      settings,
+      executor([], {
+        onDownload: () => {
+          throw new Error("DOWNLOAD_FAILURE_CODE=47\nSCP_EXIT_CODE=1\nSTDERR=scp failed");
+        },
+      }),
+      store,
+    );
+
+    expect(result.status).toBe("download_failed");
+    expect(result.slurmJobId).toBe("18217313");
+    expect(result.appError?.code).toBe("download_failed");
+    expect(result.message).toBe("Could not download remote output.json.");
+    expect(result.technicalDetails).not.toContain("Slurm is unavailable");
+    expect(store.updateJobStatus).toHaveBeenCalledWith("job-1", "download_failed", expect.objectContaining({
+      errorMessage: expect.stringContaining("SCP_EXIT_CODE=1"),
+    }));
   });
 
   it("allows login_required jobs to recover after re-authentication", async () => {
@@ -280,7 +329,7 @@ describe("Slurm polling helpers", () => {
     });
     expect(commands[1]).toMatchObject({
       executable: "sacct",
-      args: ["-j", "18215500", "--format=JobID,State,ExitCode", "--parsable2", "--noheader"],
+      args: ["-j", "18215500", "--format=JobID,State,ExitCode,End", "--parsable2", "--noheader"],
     });
   });
 
@@ -288,8 +337,9 @@ describe("Slurm polling helpers", () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === "prediction_output_temp_file_path") return "C:\\Temp\\fluorcast-83-output.json";
       if (command === "read_prediction_output_file") {
-        return JSON.stringify({ ...(validOutput as PredictionJobOutput), job_id: "83fa52c2-9f8d-4e89-a64f-eb8d69842b40" });
+        return JSON.stringify({ ...flatRemoteOutput, job_id: "83fa52c2-9f8d-4e89-a64f-eb8d69842b40" });
       }
+      if (command === "prediction_output_file_modified_at") return "1780000000000";
       return null;
     });
     const commands: RemoteCommandSpec[] = [];
@@ -323,6 +373,253 @@ describe("Slurm polling helpers", () => {
       expect.objectContaining({ executable: "cat", args: [`${remoteJobDir}/stderr.log`] }),
     ]));
     expect(downloads).toEqual([[`${remoteJobDir}/output.json`, "C:\\Temp\\fluorcast-83-output.json"]]);
+  });
+
+  it("recovers existing completed job 18231560 from sacct End and output.json without sbatch", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "prediction_output_temp_file_path") {
+        return "C:\\Temp\\fluorcast-fa4-output.json";
+      }
+      if (command === "read_prediction_output_file") {
+        return JSON.stringify({ ...flatRemoteOutput, job_id: "fa4a0a65-32c6-4516-9e3c-c60954d9be2e" });
+      }
+      if (command === "prediction_output_file_modified_at") return "1780000000000";
+      return null;
+    });
+    const commands: RemoteCommandSpec[] = [];
+    const downloads: Array<[string, string]> = [];
+    const store = persistence();
+    const remoteJobDir = "/home/chrisl/scratch/fluorcast-jobs/fa4a0a65-32c6-4516-9e3c-c60954d9be2e";
+
+    const result = await pollSlurmJobStatus(
+      {
+        ...job,
+        id: "fa4a0a65-32c6-4516-9e3c-c60954d9be2e",
+        status: "connection_failed",
+        remote_slurm_id: "18231560",
+        remote_job_dir: remoteJobDir,
+        remote_output_path: `${remoteJobDir}/output.json`,
+      },
+      settings,
+      executor([
+        commandResult({ stdout: "", stderr: "Master running (pid=1234)" }),
+        commandResult({ stdout: "18231560|COMPLETED|0:0|2026-07-22T11:22:03" }),
+        commandResult({ exit_code: 0 }),
+        commandResult({ stdout: "stdout text" }),
+        commandResult({ stdout: "stderr text" }),
+      ], {
+        onCommand: (command) => commands.push(command),
+        onDownload: (remotePath, localPath) => downloads.push([remotePath, localPath]),
+      }),
+      store,
+    );
+
+    expect(result).toMatchObject({
+      status: "completed",
+      slurmJobId: "18231560",
+      slurmState: "COMPLETED",
+      slurmExitCode: "0:0",
+    });
+    expect(commands.map((command) => command.executable)).toEqual([
+      "squeue",
+      "sacct",
+      "test",
+      "cat",
+      "cat",
+    ]);
+    expect(commands.some((command) => command.executable === "sbatch")).toBe(false);
+    expect(downloads).toEqual([[`${remoteJobDir}/output.json`, "C:\\Temp\\fluorcast-fa4-output.json"]]);
+    expect(store.saveResult).toHaveBeenCalledTimes(1);
+    expect(store.saveResult).toHaveBeenCalledWith(
+      "fa4a0a65-32c6-4516-9e3c-c60954d9be2e",
+      expect.objectContaining({
+        job_id: "fa4a0a65-32c6-4516-9e3c-c60954d9be2e",
+        status: "succeeded",
+        completed_at_source: "sacct",
+      }),
+      expect.any(String),
+    );
+  });
+
+  it("does not fail a successful command only because stderr contains Master running", async () => {
+    const result = await pollSlurmJobStatus(
+      job,
+      settings,
+      executor([
+        commandResult({
+          stdout: "12345|RUNNING|00:01:00|node-a",
+          stderr: "Master running (pid=1234)",
+        }),
+      ]),
+      persistence(),
+    );
+
+    expect(result.status).toBe("running");
+    expect(result.message).toBe("Slurm job 12345 is RUNNING.");
+  });
+
+  it("does not classify sacct exit 0 with no parent row as a connection failure", async () => {
+    const store = persistence();
+    const result = await pollSlurmJobStatus(
+      job,
+      settings,
+      executor([
+        commandResult({ stdout: "" }),
+        commandResult({ stdout: "" }),
+      ]),
+      store,
+    );
+
+    expect(result.status).toBe("output_missing");
+    expect(result.appError?.code).toBe("output_missing");
+    expect(result.technicalDetails).toContain("SACCT_EXIT=0");
+    expect(result.technicalDetails).toContain("SACCT_PARENT_STATE=");
+    expect(store.updateJobStatus).toHaveBeenCalledWith("job-1", "output_missing", expect.any(Object));
+  });
+
+  it("retries a completed job using its persisted remote output path", async () => {
+    let readAttempts = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "prediction_output_temp_file_path") return "C:\\Temp\\fluorcast-7d-output.json";
+      if (command === "read_prediction_output_file") {
+        readAttempts += 1;
+        if (readAttempts === 1) {
+          throw new Error("Could not read downloaded output.json: not found");
+        }
+        return JSON.stringify({ ...flatRemoteOutput, job_id: "7d676c1e-2a98-4f38-8ba7-5858182b6ade" });
+      }
+      if (command === "prediction_output_file_modified_at") return "1780000000000";
+      return null;
+    });
+    const commands: RemoteCommandSpec[] = [];
+    const downloads: Array<[string, string]> = [];
+
+    const result = await pollSlurmJobStatus(
+      {
+        ...job,
+        id: "7d676c1e-2a98-4f38-8ba7-5858182b6ade",
+        status: "download_failed",
+        remote_slurm_id: "18217313",
+        remote_job_dir: "/home/chrisl/scratch/fluorcast-jobs/7d676c1e-2a98-4f38-8ba7-5858182b6ade",
+        remote_output_path: "/home/chrisl/scratch/fluorcast-jobs/7d676c1e-2a98-4f38-8ba7-5858182b6ade/output.json",
+      },
+      settings,
+      executor([
+        commandResult({ stdout: "" }),
+        commandResult({ stdout: "18217313|COMPLETED|0:0" }),
+        commandResult({ exit_code: 0 }),
+        commandResult({ exit_code: 0 }),
+        commandResult({ stdout: "stdout text" }),
+        commandResult({ stdout: "stderr text" }),
+      ], {
+        onCommand: (command) => commands.push(command),
+        onDownload: (remotePath, localPath) => downloads.push([remotePath, localPath]),
+      }),
+      persistence(),
+    );
+
+    expect(result.status).toBe("completed");
+    expect(commands.some((command) => command.executable === "sbatch")).toBe(false);
+    expect(downloads).toEqual([[
+      "/home/chrisl/scratch/fluorcast-jobs/7d676c1e-2a98-4f38-8ba7-5858182b6ade/output.json",
+      "C:\\Temp\\fluorcast-7d-output.json",
+    ]]);
+  });
+
+  it("imports existing downloaded flat output without resubmitting or redownloading", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "prediction_output_temp_file_path") {
+        return "C:\\Users\\CL\\AppData\\Local\\Temp\\fluorcast-2e80b1b9-f65f-426a-a289-1466ab7f0abd-output.json";
+      }
+      if (command === "read_prediction_output_file") return JSON.stringify(flatRemoteOutput);
+      if (command === "prediction_output_file_modified_at") return "1780000000000";
+      return null;
+    });
+    const commands: RemoteCommandSpec[] = [];
+    const downloads: Array<[string, string]> = [];
+    const store = persistence();
+
+    const result = await downloadPredictionOutput(
+      {
+        ...job,
+        id: "2e80b1b9-f65f-426a-a289-1466ab7f0abd",
+        status: "output_invalid",
+        remote_slurm_id: "18226108",
+        remote_job_dir: "/home/chrisl/scratch/fluorcast-jobs/2e80b1b9-f65f-426a-a289-1466ab7f0abd",
+        remote_output_path: "/home/chrisl/scratch/fluorcast-jobs/2e80b1b9-f65f-426a-a289-1466ab7f0abd/output.json",
+      },
+      settings,
+      executor([], {
+        onCommand: (command) => commands.push(command),
+        onDownload: (remotePath, localPath) => downloads.push([remotePath, localPath]),
+      }),
+      store,
+    );
+
+    expect(result).toMatchObject({
+      status: "completed",
+      slurmJobId: "18226108",
+      output: expect.objectContaining({
+        job_id: "2e80b1b9-f65f-426a-a289-1466ab7f0abd",
+        status: "succeeded",
+      }),
+    });
+    expect(commands.some((command) => command.executable === "sbatch")).toBe(false);
+    expect(downloads).toEqual([]);
+    expect(store.saveResult).toHaveBeenCalledTimes(1);
+    expect(store.updateJobStatus).toHaveBeenCalledWith(
+      "2e80b1b9-f65f-426a-a289-1466ab7f0abd",
+      "completed",
+      expect.objectContaining({ errorMessage: undefined }),
+    );
+  });
+
+  it("preserves completed scheduler state when output download fails", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "prediction_output_temp_file_path") return "C:\\Temp\\fluorcast-7d-output.json";
+      return null;
+    });
+    const commands: RemoteCommandSpec[] = [];
+    const store = persistence();
+
+    const result = await pollSlurmJobStatus(
+      {
+        ...job,
+        id: "7d676c1e-2a98-4f38-8ba7-5858182b6ade",
+        status: "download_failed",
+        remote_slurm_id: "18217313",
+        remote_job_dir: "/home/chrisl/scratch/fluorcast-jobs/7d676c1e-2a98-4f38-8ba7-5858182b6ade",
+        remote_output_path: "/home/chrisl/scratch/fluorcast-jobs/7d676c1e-2a98-4f38-8ba7-5858182b6ade/output.json",
+      },
+      settings,
+      executor([
+        commandResult({ stdout: "" }),
+        commandResult({ stdout: "18217313|COMPLETED|0:0" }),
+        commandResult({ exit_code: 0 }),
+        commandResult({ exit_code: 0 }),
+        commandResult({ stdout: "stdout text" }),
+        commandResult({ stdout: "stderr text" }),
+      ], {
+        onCommand: (command) => commands.push(command),
+        onDownload: () => {
+          throw new Error("DOWNLOAD_FAILURE_CODE=47\nSCP_EXIT_CODE=1");
+        },
+      }),
+      store,
+    );
+
+    expect(result.status).toBe("download_failed");
+    expect(result.slurmJobId).toBe("18217313");
+    expect(result.slurmState).toBe("COMPLETED");
+    expect(commands.some((command) => command.executable === "sbatch")).toBe(false);
+    expect(store.updateJobStatus).toHaveBeenCalledWith(
+      "7d676c1e-2a98-4f38-8ba7-5858182b6ade",
+      "download_failed",
+      expect.objectContaining({
+        slurmState: "COMPLETED",
+        slurmExitCode: "0:0",
+      }),
+    );
   });
 
   it("preserves per-job stderr when a Slurm job fails", async () => {
