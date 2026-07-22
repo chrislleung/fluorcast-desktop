@@ -70,9 +70,15 @@ export function joinRemoteJobPath(remoteJobsPath: string, jobId: string) {
   return `${root}/${jobId}`;
 }
 
-export function joinRemoteChildPath(remoteJobDir: string, filename: "input.json" | "output.json" | "stdout.log" | "stderr.log") {
+export type RemoteJobChildFilename = "input.json" | "output.json" | "stdout.log" | "stderr.log" | "slurm_job_id.txt";
+
+export function joinRemoteChildPath(remoteJobDir: string, filename: RemoteJobChildFilename) {
   const normalizedJobDir = normalizeAbsoluteRemotePath(remoteJobDir, "Remote job directory");
   return `${normalizedJobDir}/${filename}`;
+}
+
+export function canonicalSlurmMarkerPath(remoteJobDir: string) {
+  return joinRemoteChildPath(remoteJobDir, "slurm_job_id.txt");
 }
 
 async function writeTemporaryInputFile(jobInput: PredictionJobInput): Promise<string> {

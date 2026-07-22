@@ -237,7 +237,7 @@ export function NewPredictionPage({
           status: submission.status,
           ...(submission.remoteSlurmId ? { remote_slurm_id: submission.remoteSlurmId } : {}),
           ...(submission.submittedAt ? { submitted_at: submission.submittedAt } : {}),
-          ...(submission.status === "submitted_to_slurm" ? {} : { error_message: [
+          ...(submission.status === "submitted_to_slurm" && !submission.technicalDetails ? {} : { error_message: [
             submission.message,
             submission.technicalDetails,
           ].filter(Boolean).join("\n\n") }),

@@ -256,6 +256,75 @@ describe("Slurm polling helpers", () => {
     expect(commands[0].settings).toMatchObject({ connection_mode: "interactive_mfa" });
   });
 
+  it("resumes monitoring existing Slurm job 18215500 with squeue then sacct", async () => {
+    const commands: RemoteCommandSpec[] = [];
+    const result = await pollSlurmJobStatus(
+      {
+        ...job,
+        id: "83fa52c2-9f8d-4e89-a64f-eb8d69842b40",
+        remote_slurm_id: "18215500",
+        remote_job_dir: "/home/chrisl/scratch/fluorcast-jobs/83fa52c2-9f8d-4e89-a64f-eb8d69842b40",
+      },
+      settings,
+      executor([
+        commandResult({ stdout: "" }),
+        commandResult({ stdout: "18215500|RUNNING|0:0" }),
+      ], { onCommand: (command) => commands.push(command) }),
+      persistence(),
+    );
+
+    expect(result.status).toBe("running");
+    expect(commands[0]).toMatchObject({
+      executable: "squeue",
+      args: ["-j", "18215500", "--noheader", "--format=%i|%T|%M|%R"],
+    });
+    expect(commands[1]).toMatchObject({
+      executable: "sacct",
+      args: ["-j", "18215500", "--format=JobID,State,ExitCode", "--parsable2", "--noheader"],
+    });
+  });
+
+  it("retrieves stdout stderr and output from the existing remote directory", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "prediction_output_temp_file_path") return "C:\\Temp\\fluorcast-83-output.json";
+      if (command === "read_prediction_output_file") {
+        return JSON.stringify({ ...(validOutput as PredictionJobOutput), job_id: "83fa52c2-9f8d-4e89-a64f-eb8d69842b40" });
+      }
+      return null;
+    });
+    const commands: RemoteCommandSpec[] = [];
+    const downloads: Array<[string, string]> = [];
+    const remoteJobDir = "/home/chrisl/scratch/fluorcast-jobs/83fa52c2-9f8d-4e89-a64f-eb8d69842b40";
+
+    const result = await pollSlurmJobStatus(
+      {
+        ...job,
+        id: "83fa52c2-9f8d-4e89-a64f-eb8d69842b40",
+        remote_slurm_id: "18215500",
+        remote_job_dir: remoteJobDir,
+      },
+      settings,
+      executor([
+        commandResult({ stdout: "" }),
+        commandResult({ stdout: "18215500|COMPLETED|0:0" }),
+        commandResult({ exit_code: 0 }),
+        commandResult({ stdout: "stdout text" }),
+        commandResult({ stdout: "stderr text" }),
+      ], {
+        onCommand: (command) => commands.push(command),
+        onDownload: (remotePath, localPath) => downloads.push([remotePath, localPath]),
+      }),
+      persistence(),
+    );
+
+    expect(result.status).toBe("completed");
+    expect(commands).toEqual(expect.arrayContaining([
+      expect.objectContaining({ executable: "cat", args: [`${remoteJobDir}/stdout.log`] }),
+      expect.objectContaining({ executable: "cat", args: [`${remoteJobDir}/stderr.log`] }),
+    ]));
+    expect(downloads).toEqual([[`${remoteJobDir}/output.json`, "C:\\Temp\\fluorcast-83-output.json"]]);
+  });
+
   it("preserves per-job stderr when a Slurm job fails", async () => {
     const store = persistence();
     const result = await pollSlurmJobStatus(

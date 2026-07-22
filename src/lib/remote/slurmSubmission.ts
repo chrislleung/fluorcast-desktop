@@ -4,7 +4,7 @@ import { trimNibiSettings } from "../../features/settings";
 import { updateJobStatus, addJobEvent } from "../db";
 import type { RemoteExecutor } from "./RemoteExecutor";
 import { appError, classifyRemoteCommandFailure, type AppError } from "./errors";
-import { joinRemoteChildPath } from "./uploadPredictionInput";
+import { canonicalSlurmMarkerPath, joinRemoteChildPath } from "./uploadPredictionInput";
 import { RemoteExecutionError } from "./types";
 
 export type SlurmSubmissionStatus =
@@ -88,6 +88,20 @@ function preflightFailureDetails(result: Awaited<ReturnType<RemoteExecutor["runC
   return buildTechnicalDetails(result.stdout, result.stderr) || result.redacted_command_preview;
 }
 
+function markerFailureMessage(result: Awaited<ReturnType<RemoteExecutor["runCommand"]>>) {
+  const text = [result.stdout, result.stderr].filter(Boolean).join("\n");
+  if (result.exit_code === 50 || text.includes("MARKER_ERROR=PATH_EMPTY")) {
+    return "Submitted - remote marker warning\n\nRemote marker path was empty.";
+  }
+  if (result.exit_code === 51 || text.includes("MARKER_ERROR=SLURM_ID_EMPTY")) {
+    return "Submitted - remote marker warning\n\nSlurm ID was empty while writing the marker.";
+  }
+  if (result.exit_code === 52 || text.includes("MARKER_ERROR=VERIFY_FAILED")) {
+    return "Submitted - remote marker warning\n\nRemote marker verification failed.";
+  }
+  return "Submitted - remote marker warning";
+}
+
 async function runPreflight(
   label: string,
   command: Parameters<RemoteExecutor["runCommand"]>[0],
@@ -111,7 +125,7 @@ async function readRemoteSlurmId(
   const result = await remoteExecutor.runCommand({
     label: "Read remote Slurm submission marker",
     executable: "cat",
-    args: [`${remoteJobDir}/slurm_job_id.txt`],
+    args: [canonicalSlurmMarkerPath(remoteJobDir)],
     settings: trimmed,
     redacted_preview: "cat <remote_job_dir>/slurm_job_id.txt",
   });
@@ -135,18 +149,17 @@ async function claimRemoteSubmission(
 
 async function writeRemoteSubmissionRecord(
   remoteJobDir: string,
-  submissionId: string,
-  jobId: string,
   slurmId: string,
   trimmed: NibiSettings,
   remoteExecutor: RemoteExecutor,
 ) {
+  const markerPath = canonicalSlurmMarkerPath(remoteJobDir);
   return remoteExecutor.runCommand({
     label: "Record remote Slurm submission",
     executable: "fluorcast-record-slurm-submission",
-    args: [remoteJobDir, submissionId, jobId, slurmId],
+    args: [markerPath, slurmId],
     settings: trimmed,
-    redacted_preview: "record <remote_job_dir>/slurm_job_id.txt and submission metadata",
+    redacted_preview: "record <remote_job_dir>/slurm_job_id.txt",
   });
 }
 
@@ -445,27 +458,58 @@ async function submitPredictionSlurmJobOnce(
   }
 
   const submittedAt = new Date().toISOString();
+  try {
+    await persistence.updateJobStatus(job.id, "submitted_to_slurm", {
+      remoteSlurmId,
+      remoteJobDir,
+      remoteOutputPath,
+      submissionId: submissionJob.submission_id,
+      submittedAt,
+      submittedCommand: sbatch.redacted_command_preview,
+      errorMessage: undefined,
+    });
+  } catch (error) {
+    return {
+      jobId: job.id,
+      status: "slurm_submission_failed",
+      message: "Submission accepted by Slurm, but local persistence failed",
+      remoteSlurmId,
+      submittedAt,
+      technicalDetails: error instanceof Error ? error.message : String(error),
+    };
+  }
+  await persistence.addJobEvent(job.id, "slurm_job_id_received", `Slurm job ID ${remoteSlurmId} received.`, submittedAt);
+  await persistence.addJobEvent(job.id, "submitted_to_slurm", `Slurm job ${remoteSlurmId} submitted.`, submittedAt);
+
   const record = await writeRemoteSubmissionRecord(
     remoteJobDir,
-    submissionJob.submission_id,
-    job.id,
     remoteSlurmId,
     trimmed,
     remoteExecutor,
   );
   if (record.exit_code !== 0) {
+    const warning = markerFailureMessage(record);
+    const details = [
+      warning,
+      `Canonical marker path: ${canonicalSlurmMarkerPath(remoteJobDir)}`,
+      `Marker write exit code: ${record.exit_code}`,
+      record.stdout ? `Marker stdout:\n${record.stdout.trim()}` : "",
+      record.stderr ? `Marker stderr:\n${record.stderr.trim()}` : "",
+      preflightFailureDetails(record),
+    ].filter(Boolean).join("\n\n");
     const result: SlurmSubmissionResult = {
       jobId: job.id,
-      status: "slurm_submission_failed",
-      message: "Slurm accepted the job, but FluorCast could not record the remote submission marker.",
+      status: "submitted_to_slurm",
+      message: "Submitted - remote marker warning",
       remoteSlurmId,
-      technicalDetails: preflightFailureDetails(record),
+      submittedAt,
+      technicalDetails: details,
     };
-    await persistence.updateJobStatus(job.id, result.status, {
+    await persistence.updateJobStatus(job.id, "submitted_to_slurm", {
       remoteSlurmId,
       submittedAt,
       submittedCommand: sbatch.redacted_command_preview,
-      errorMessage: [result.message, result.technicalDetails].filter(Boolean).join("\n\n"),
+      errorMessage: result.technicalDetails,
     });
     await persistence.addJobEvent(job.id, "slurm_submission_record_failed", result.message, submittedAt);
     return result;
@@ -477,13 +521,6 @@ async function submitPredictionSlurmJobOnce(
     remoteSlurmId,
     submittedAt,
   };
-  await persistence.updateJobStatus(job.id, result.status, {
-    remoteSlurmId,
-    submittedAt,
-    submittedCommand: sbatch.redacted_command_preview,
-    errorMessage: undefined,
-  });
-  await persistence.addJobEvent(job.id, result.status, result.message, submittedAt);
-  await persistence.addJobEvent(job.id, "slurm_job_id_received", `Slurm job ID ${remoteSlurmId} received.`, submittedAt);
+  await persistence.addJobEvent(job.id, "slurm_submission_recorded", `Slurm marker recorded at ${canonicalSlurmMarkerPath(remoteJobDir)}.`, submittedAt);
   return result;
 }

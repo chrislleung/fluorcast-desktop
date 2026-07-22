@@ -140,6 +140,30 @@ describe("JobsPage recovery actions", () => {
     expect(screen.getByText("Technical details")).toBeInTheDocument();
   });
 
+  it("shows resume monitoring instead of retry when a failed submission already has a Slurm ID", () => {
+    const submit = vi.fn();
+    const refresh = vi.fn();
+    render(
+      <JobsPage
+        jobs={[{
+          ...baseJob,
+          status: "slurm_submission_failed",
+          remote_slurm_id: "18215500",
+          error_message: "Submitted - remote marker warning",
+        }]}
+        onOpenResult={vi.fn()}
+        onSubmitSlurmJob={submit}
+        onRefreshJobStatus={refresh}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Retry Slurm submission" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Resume monitoring" }));
+    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ remote_slurm_id: "18215500" }));
+    expect(submit).not.toHaveBeenCalled();
+    expect(screen.getByText("Marker warning")).toBeInTheDocument();
+  });
+
   it("shows safe upload failure diagnostics for failed uploads", () => {
     render(
       <JobsPage

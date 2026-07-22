@@ -526,6 +526,12 @@ pub fn run_nibi_remote_command(
     }
 
     validate_remote_command_spec(&command_spec)?;
+    if mode == "interactive_mfa"
+        && !settings.uses_persistent_shell()
+        && command_spec.executable == "fluorcast-record-slurm-submission"
+    {
+        return run_manual_mfa_slurm_marker_result(&settings, &command_spec);
+    }
     let remote_command = structured_remote_command_to_shell(&command_spec)?;
     if mode == "interactive_mfa" {
         return run_manual_mfa_remote_command_result(
@@ -2018,11 +2024,12 @@ fn validate_remote_command_spec(command_spec: &RemoteCommandSpecInput) -> Result
         "cat" if command_spec.args.len() == 1 => {
             validate_remote_path(&command_spec.args[0], "Remote log path")
         }
-        "fluorcast-record-slurm-submission" if command_spec.args.len() == 4 => {
-            validate_remote_path(&command_spec.args[0], "Remote job directory")?;
-            validate_job_id(&command_spec.args[1])?;
-            validate_job_id(&command_spec.args[2])?;
-            validate_slurm_job_id(&command_spec.args[3])
+        "fluorcast-record-slurm-submission" if command_spec.args.len() == 2 => {
+            validate_remote_path(&command_spec.args[0], "Remote Slurm marker path")?;
+            if !command_spec.args[0].ends_with("/slurm_job_id.txt") {
+                return Err("Remote Slurm marker path must end with /slurm_job_id.txt.".to_string());
+            }
+            validate_slurm_job_id(&command_spec.args[1])
         }
         "command" if command_spec.args.len() == 2 && command_spec.args[0] == "-v" => {
             match command_spec.args[1].as_str() {
@@ -2096,28 +2103,16 @@ fn structured_remote_command_to_shell(
             "python3 -m json.tool {} >/dev/null",
             shell_quote(&command_spec.args[2])
         )),
-        "fluorcast-python-version" => Ok(format!(
-            "{} --version",
-            shell_quote(&command_spec.args[0])
-        )),
+        "fluorcast-python-version" => {
+            Ok(format!("{} --version", shell_quote(&command_spec.args[0])))
+        }
         "fluorcast-upload-smoke-test" => {
             Ok(upload_smoke_remote_shell_command(&command_spec.args[0]))
         }
         "cat" => Ok(format!("cat {}", shell_quote(&command_spec.args[0]))),
-        "fluorcast-record-slurm-submission" => Ok(format!(
-            "tmp={dir}/slurm_job_id.txt.tmp.$$ && printf '%s\\n' {slurm_id} > \"$tmp\" && mv \"$tmp\" {dir}/slurm_job_id.txt && printf '%s\\n' {submission_json} > {dir}/submission.json && printf '%s\\n' {status_json} > {dir}/status.json",
-            dir = shell_quote(&command_spec.args[0]),
-            slurm_id = shell_quote(&command_spec.args[3]),
-            submission_json = shell_quote(&format!(
-                "{{\"submission_id\":{},\"job_id\":{},\"slurm_job_id\":{},\"state\":\"submitted\"}}",
-                json_string_literal(&command_spec.args[1]),
-                json_string_literal(&command_spec.args[2]),
-                json_string_literal(&command_spec.args[3])
-            )),
-            status_json = shell_quote(&format!(
-                "{{\"state\":\"submitted\",\"slurm_job_id\":{}}}",
-                json_string_literal(&command_spec.args[3])
-            )),
+        "fluorcast-record-slurm-submission" => Ok(slurm_marker_remote_shell_command(
+            &command_spec.args[0],
+            &command_spec.args[1],
         )),
         "command" => Ok(format!("command -v {}", command_spec.args[1])),
         "squeue" => Ok(format!(
@@ -2382,6 +2377,54 @@ fn run_manual_mfa_upload_smoke_test_result(
     })
 }
 
+fn run_manual_mfa_slurm_marker_result(
+    settings: &NibiSettings,
+    command_spec: &RemoteCommandSpecInput,
+) -> Result<RemoteCommandResult, String> {
+    validate_remote_command_spec(command_spec)?;
+    validate_manual_login_settings(settings)?;
+    let started = Instant::now();
+    let preview = command_spec
+        .redacted_preview
+        .clone()
+        .unwrap_or_else(|| command_spec.label.clone());
+    let commands = build_manual_mfa_session_commands(settings)?;
+    let readiness = run_manual_mfa_session_readiness(&commands);
+    if !readiness.can_run_background_commands {
+        return Ok(RemoteCommandResult {
+            exit_code: readiness.last_session_test_exit_code.unwrap_or(1),
+            stdout: readiness.last_session_test_stdout,
+            stderr: readiness.message,
+            duration_ms: started.elapsed().as_millis(),
+            command_label: command_spec.label.clone(),
+            redacted_command_preview: preview,
+            timed_out: matches!(readiness.status, ManualMfaSessionStatus::Timeout),
+        });
+    }
+
+    let invocation = build_manual_mfa_slurm_marker_invocation(
+        &commands,
+        &command_spec.args[0],
+        &command_spec.args[1],
+    );
+    let output = run_program_with_stdin_timeout(
+        &invocation.program,
+        &invocation.args,
+        &invocation.stdin,
+        WSL_SCRIPT_TIMEOUT,
+    )?;
+
+    Ok(RemoteCommandResult {
+        exit_code: output.status,
+        stdout: output.stdout,
+        stderr: sanitize_session_stderr(&output.stderr, &commands),
+        duration_ms: started.elapsed().as_millis(),
+        command_label: command_spec.label.clone(),
+        redacted_command_preview: preview,
+        timed_out: output.timed_out,
+    })
+}
+
 fn validate_upload_smoke_command_shape(
     command_spec: &RemoteCommandSpecInput,
 ) -> Result<(), String> {
@@ -2390,6 +2433,23 @@ fn validate_upload_smoke_command_shape(
     } else {
         Err("Unsupported structured remote command.".to_string())
     }
+}
+
+fn build_manual_mfa_slurm_marker_invocation(
+    commands: &ManualMfaSessionCommands,
+    marker_path: &str,
+    slurm_id: &str,
+) -> WslBashScriptInvocation {
+    let args = vec![
+        commands.host.clone(),
+        marker_path.to_string(),
+        slurm_id.to_string(),
+    ];
+    build_wsl_bash_script_invocation(
+        &commands.wsl_distro,
+        &manual_mfa_slurm_marker_script(),
+        &args,
+    )
 }
 
 fn build_manual_mfa_upload_smoke_test_invocation(
@@ -2402,6 +2462,65 @@ fn build_manual_mfa_upload_smoke_test_invocation(
         &manual_mfa_upload_smoke_test_script(),
         &args,
     )
+}
+
+fn manual_mfa_slurm_marker_script() -> String {
+    let remote_script = slurm_marker_remote_script();
+    vec![
+        "#!/usr/bin/env bash",
+        "set -Eeuo pipefail",
+        "",
+        "HOST=\"$1\"",
+        "MARKER_PATH=\"$2\"",
+        "SLURM_ID=\"$3\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "",
+        "if [[ -z \"$MARKER_PATH\" ]]; then",
+        "    printf 'MARKER_ERROR=PATH_EMPTY\\n' >&2",
+        "    exit 50",
+        "fi",
+        "",
+        "if [[ -z \"$SLURM_ID\" ]]; then",
+        "    printf 'MARKER_ERROR=SLURM_ID_EMPTY\\n' >&2",
+        "    exit 51",
+        "fi",
+        "",
+        "remote_shell_quote() {",
+        "    local value=\"$1\"",
+        "    local quoted=\"'\"",
+        "    local index character",
+        "    for ((index = 0; index < ${#value}; index++)); do",
+        "        character=\"${value:index:1}\"",
+        "        if [[ \"$character\" == \"'\" ]]; then",
+        "            quoted+=\"'\\\\''\"",
+        "        else",
+        "            quoted+=\"$character\"",
+        "        fi",
+        "    done",
+        "    quoted+=\"'\"",
+        "    printf '%s' \"$quoted\"",
+        "}",
+        "",
+        "REMOTE_SCRIPT=$(cat <<'FLUORCAST_REMOTE_MARKER_SCRIPT'",
+        remote_script.as_str(),
+        "FLUORCAST_REMOTE_MARKER_SCRIPT",
+        ")",
+        "REMOTE_SCRIPT_ARG=\"$(remote_shell_quote \"$REMOTE_SCRIPT\")\"",
+        "MARKER_PATH_ARG=\"$(remote_shell_quote \"$MARKER_PATH\")\"",
+        "SLURM_ID_ARG=\"$(remote_shell_quote \"$SLURM_ID\")\"",
+        "REMOTE_COMMAND=\"bash -lc ${REMOTE_SCRIPT_ARG} -- ${MARKER_PATH_ARG} ${SLURM_ID_ARG}\"",
+        "",
+        "ssh \\",
+        "  -n \\",
+        "  -S \"$CTL\" \\",
+        "  -o ControlMaster=no \\",
+        "  -o BatchMode=yes \\",
+        "  -o PasswordAuthentication=no \\",
+        "  -o KbdInteractiveAuthentication=no \\",
+        "  \"$HOST\" \\",
+        "  \"$REMOTE_COMMAND\"",
+    ]
+    .join("\n")
 }
 
 fn manual_mfa_upload_smoke_test_script() -> String {
@@ -2462,6 +2581,51 @@ fn upload_smoke_remote_shell_command(remote_jobs_path: &str) -> String {
         shell_quote(&upload_smoke_remote_script()),
         shell_quote(remote_jobs_path)
     )
+}
+
+fn slurm_marker_remote_shell_command(marker_path: &str, slurm_id: &str) -> String {
+    format!(
+        "bash -lc {} -- {} {}",
+        shell_quote(&slurm_marker_remote_script()),
+        shell_quote(marker_path),
+        shell_quote(slurm_id)
+    )
+}
+
+fn slurm_marker_remote_script() -> String {
+    [
+        "set -eu",
+        "",
+        "marker_path=\"$1\"",
+        "slurm_id=\"$2\"",
+        "",
+        "if [[ -z \"$marker_path\" ]]; then",
+        "    printf 'MARKER_ERROR=PATH_EMPTY\\n' >&2",
+        "    exit 50",
+        "fi",
+        "",
+        "if [[ -z \"$slurm_id\" ]]; then",
+        "    printf 'MARKER_ERROR=SLURM_ID_EMPTY\\n' >&2",
+        "    exit 51",
+        "fi",
+        "",
+        "mkdir -p -- \"$(dirname -- \"$marker_path\")\"",
+        "",
+        "temporary=\"${marker_path}.tmp.$$\"",
+        "",
+        "printf '%s\\n' \"$slurm_id\" > \"$temporary\"",
+        "mv -f -- \"$temporary\" \"$marker_path\"",
+        "",
+        "recorded=\"$(cat -- \"$marker_path\")\"",
+        "",
+        "if [[ \"$recorded\" != \"$slurm_id\" ]]; then",
+        "    printf 'MARKER_ERROR=VERIFY_FAILED\\n' >&2",
+        "    exit 52",
+        "fi",
+        "",
+        "printf 'SLURM_MARKER_RECORDED=%s\\n' \"$marker_path\"",
+    ]
+    .join("\n")
 }
 
 fn upload_smoke_remote_script() -> String {
@@ -3931,25 +4095,6 @@ fn shell_quote(value: &str) -> String {
 
 fn powershell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
-}
-
-fn json_string_literal(value: &str) -> String {
-    let mut out = String::from("\"");
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            character if character.is_control() => {
-                out.push_str(&format!("\\u{:04x}", character as u32));
-            }
-            character => out.push(character),
-        }
-    }
-    out.push('"');
-    out
 }
 
 fn default_wsl_key_path() -> String {
@@ -5653,17 +5798,40 @@ mod tests {
             label: "Record Slurm submission".to_string(),
             executable: "fluorcast-record-slurm-submission".to_string(),
             args: vec![
-                "/home/alice/scratch/fluorcast-jobs/job-1".to_string(),
-                "job-1".to_string(),
-                "job-1".to_string(),
+                "/home/alice/scratch/fluorcast-jobs/job-1/slurm_job_id.txt".to_string(),
                 "12345".to_string(),
             ],
             redacted_preview: None,
         };
         let command = structured_remote_command_to_shell(&record).expect("record command");
         assert!(command.contains("slurm_job_id.txt"));
-        assert!(command.contains("submission.json"));
-        assert!(command.contains("status.json"));
+        assert!(command.contains("MARKER_ERROR=PATH_EMPTY"));
+        assert!(command.contains("MARKER_ERROR=SLURM_ID_EMPTY"));
+        assert!(command.contains("MARKER_ERROR=VERIFY_FAILED"));
+        assert!(command.contains("SLURM_MARKER_RECORDED=%s"));
         assert!(command.contains("'12345'"));
+    }
+
+    #[test]
+    fn slurm_marker_manual_mfa_invocation_uses_separate_arguments_and_ssh_n() {
+        let commands = build_manual_mfa_session_commands(&settings()).unwrap();
+        let invocation = build_manual_mfa_slurm_marker_invocation(
+            &commands,
+            "/home/alice/scratch/fluorcast-jobs/job-1/slurm_job_id.txt",
+            "12345",
+        );
+
+        assert_eq!(invocation.program, "wsl.exe");
+        assert_eq!(invocation.args[6], "alice@nibi.alliancecan.ca");
+        assert_eq!(
+            invocation.args[7],
+            "/home/alice/scratch/fluorcast-jobs/job-1/slurm_job_id.txt"
+        );
+        assert_eq!(invocation.args[8], "12345");
+        assert!(invocation.stdin.contains("HOST=\"$1\""));
+        assert!(invocation.stdin.contains("MARKER_PATH=\"$2\""));
+        assert!(invocation.stdin.contains("SLURM_ID=\"$3\""));
+        assert!(invocation.stdin.contains("MARKER_ERROR=PATH_EMPTY"));
+        assert!(invocation.stdin.contains("ssh \\\n  -n \\\n"));
     }
 }

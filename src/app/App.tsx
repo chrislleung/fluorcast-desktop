@@ -384,6 +384,12 @@ export function App() {
       );
       setManualMfaJobStatus(result.message);
       await refreshJobsFromDatabase();
+      if (result.remoteSlurmId) {
+        const persistedJob = await getJobWithResult(job.id);
+        if (persistedJob) {
+          await refreshRemoteJob(persistedJob);
+        }
+      }
       if (selectedJobId === job.id) {
         const persistedJob = await getJobWithResult(job.id);
         setSelectedJobDetail(persistedJob);
@@ -392,7 +398,7 @@ export function App() {
     } finally {
       activeSlurmSubmissionsRef.current.delete(submissionId);
     }
-  }, [createAuthenticatedManualExecutor, createSelectedRemoteExecutor, isManualMfaReady, nibiSettings, refreshJobsFromDatabase, selectedJobId, testManualMfaSessionForJobs]);
+  }, [createAuthenticatedManualExecutor, createSelectedRemoteExecutor, isManualMfaReady, nibiSettings, refreshJobsFromDatabase, refreshRemoteJob, selectedJobId, testManualMfaSessionForJobs]);
 
   const cancelRemoteSlurmJob = useCallback(async (job: StoredPredictionJob) => {
     const remoteExecutor = createSelectedRemoteExecutor();
@@ -848,6 +854,7 @@ function isPollableRemoteJob(job: StoredPredictionJob) {
     || job.status === "output_missing"
     || job.status === "login_required"
     || job.status === "connection_failed"
+    || job.status === "slurm_submission_failed"
   );
 }
 

@@ -108,11 +108,71 @@ describe("Slurm submission", () => {
     expect(selectedExecutor.runCommand).toHaveBeenCalledWith(expect.objectContaining({
       executable: "fluorcast-record-slurm-submission",
       args: [
-        "/home/alice/scratch/fluorcast-jobs/job-1",
-        "job-1",
-        "job-1",
+        "/home/alice/scratch/fluorcast-jobs/job-1/slurm_job_id.txt",
         "123456",
       ],
+    }));
+  });
+
+  it("persists a valid sbatch ID before marker writing", async () => {
+    const selectedExecutor = executor("interactive_mfa", true, "123456");
+    const store = persistence();
+
+    await submitPredictionSlurmJob(
+      job,
+      {
+        ...defaultNibiSettings,
+        backend_mode: "nibi",
+        connection_mode: "interactive_mfa",
+        remote_project_path: "/home/alice/scratch/FluorCast",
+        remote_jobs_path: "/home/alice/scratch/fluorcast-jobs",
+      },
+      selectedExecutor,
+      store,
+    );
+
+    const submittedCall = vi.mocked(store.updateJobStatus).mock.invocationCallOrder[1];
+    const markerCall = vi.mocked(selectedExecutor.runCommand).mock.calls.findIndex(([command]) => command.executable === "fluorcast-record-slurm-submission");
+    expect(store.updateJobStatus).toHaveBeenCalledWith("job-1", "submitted_to_slurm", expect.objectContaining({
+      remoteSlurmId: "123456",
+      remoteJobDir: "/home/alice/scratch/fluorcast-jobs/job-1",
+      submissionId: "job-1",
+    }));
+    expect(submittedCall).toBeLessThan(vi.mocked(selectedExecutor.runCommand).mock.invocationCallOrder[markerCall]);
+  });
+
+  it("keeps submitted status and Slurm ID when marker writing fails", async () => {
+    const selectedExecutor = executor("interactive_mfa", true, "123456");
+    vi.mocked(selectedExecutor.runCommand).mockImplementation(async (commandSpec) => ({
+      exit_code: commandSpec.executable === "fluorcast-record-slurm-submission" ? 50 : commandSpec.executable === "cat" ? 1 : 0,
+      stdout: commandSpec.executable === "sbatch" ? "Submitted batch job 123456" : "",
+      stderr: commandSpec.executable === "fluorcast-record-slurm-submission" ? "MARKER_ERROR=PATH_EMPTY" : "",
+      duration_ms: 1,
+      command_label: commandSpec.label,
+      redacted_command_preview: commandSpec.redacted_preview ?? commandSpec.executable,
+    }));
+    const store = persistence();
+
+    const result = await submitPredictionSlurmJob(
+      job,
+      {
+        ...defaultNibiSettings,
+        backend_mode: "nibi",
+        connection_mode: "interactive_mfa",
+        remote_project_path: "/home/alice/scratch/FluorCast",
+        remote_jobs_path: "/home/alice/scratch/fluorcast-jobs",
+      },
+      selectedExecutor,
+      store,
+    );
+
+    expect(result.status).toBe("submitted_to_slurm");
+    expect(result.remoteSlurmId).toBe("123456");
+    expect(result.technicalDetails).toContain("Remote marker path was empty.");
+    expect(store.updateJobStatus).not.toHaveBeenCalledWith("job-1", "slurm_submission_failed", expect.anything());
+    expect(store.updateJobStatus).toHaveBeenLastCalledWith("job-1", "submitted_to_slurm", expect.objectContaining({
+      remoteSlurmId: "123456",
+      errorMessage: expect.stringContaining("Marker write exit code: 50"),
     }));
   });
 
@@ -136,6 +196,29 @@ describe("Slurm submission", () => {
     );
 
     expect(result.remoteSlurmId).toBe("777");
+    expect(vi.mocked(selectedExecutor.runCommand).mock.calls.some(([command]) => command.executable === "sbatch")).toBe(false);
+  });
+
+  it("three retries with an existing Slurm ID do not call sbatch", async () => {
+    const selectedExecutor = executor("interactive_mfa", true, "123456");
+    const submittedJob = {
+      ...job,
+      status: "slurm_submission_failed" as const,
+      remote_slurm_id: "18215500",
+      submitted_at: "2026-07-22T12:01:00.000Z",
+    };
+    const settings = {
+      ...defaultNibiSettings,
+      backend_mode: "nibi" as const,
+      connection_mode: "interactive_mfa" as const,
+      remote_project_path: "/home/alice/scratch/FluorCast",
+      remote_jobs_path: "/home/alice/scratch/fluorcast-jobs",
+    };
+
+    await submitPredictionSlurmJob(submittedJob, settings, selectedExecutor, persistence());
+    await submitPredictionSlurmJob(submittedJob, settings, selectedExecutor, persistence());
+    await submitPredictionSlurmJob(submittedJob, settings, selectedExecutor, persistence());
+
     expect(vi.mocked(selectedExecutor.runCommand).mock.calls.some(([command]) => command.executable === "sbatch")).toBe(false);
   });
 

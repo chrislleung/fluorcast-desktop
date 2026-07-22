@@ -52,9 +52,11 @@ function canRefresh(job: StoredPredictionJob) {
 }
 
 function canSubmitToSlurm(job: StoredPredictionJob) {
-  return job.status === "uploaded_to_nibi"
+  return !job.remote_slurm_id && (
+    job.status === "uploaded_to_nibi"
     || job.status === "slurm_submission_failed"
-    || (job.status === "login_required" && Boolean(job.remote_input_path) && !job.remote_slurm_id);
+    || (job.status === "login_required" && Boolean(job.remote_input_path) && !job.remote_slurm_id)
+  );
 }
 
 function isRemoteActive(job: StoredPredictionJob) {
@@ -183,6 +185,25 @@ export function JobsPage({
                         </button>
                       ) : job.status === "uploaded_to_nibi" ? (
                         <span>Input uploaded. Submit to Slurm.</span>
+                      ) : job.status === "slurm_submission_failed" && job.remote_slurm_id ? (
+                        <>
+                          <span>Submission accepted by Slurm</span>
+                          {onRefreshJobStatus ? (
+                            <button
+                              className="secondary-button compact-button"
+                              onClick={() => void onRefreshJobStatus(job)}
+                              type="button"
+                            >
+                              Resume monitoring
+                            </button>
+                          ) : null}
+                          {job.error_message ? (
+                            <details className="remote-check-details">
+                              <summary>Marker warning</summary>
+                              <pre>{job.error_message}</pre>
+                            </details>
+                          ) : null}
+                        </>
                       ) : job.status === "slurm_submission_failed" ? (
                         <>
                           <span>Submission failed</span>
@@ -222,6 +243,12 @@ export function JobsPage({
                             >
                               Cancel remote job
                             </button>
+                          ) : null}
+                          {job.error_message ? (
+                            <details className="remote-check-details">
+                              <summary>Marker warning</summary>
+                              <pre>{job.error_message}</pre>
+                            </details>
                           ) : null}
                         </>
                       ) : showReconnectPanel(job, nibiSettings, manualMfaSession) ? (
