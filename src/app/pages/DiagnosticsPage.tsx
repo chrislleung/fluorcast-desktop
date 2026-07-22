@@ -151,6 +151,24 @@ export function DiagnosticsPage({
                 <div><span className="step-label">Polling coordinator</span><strong>{pollingDiagnostics?.coordinatorCount ?? 0}</strong></div>
                 <div><span className="step-label">Active poll timers</span><strong>{pollingDiagnostics?.activeTimerCount ?? 0}</strong></div>
                 <div><span className="step-label">In-flight polls</span><strong>{pollingDiagnostics?.inFlightRemoteRequestCount ?? 0}</strong></div>
+                <div><span className="step-label">Global queue length</span><strong>{pollingDiagnostics?.globalQueueLength ?? 0}</strong></div>
+                <div><span className="step-label">Global in-flight remote</span><strong>{pollingDiagnostics?.globalRunningRemoteRequestCount ?? 0}</strong></div>
+                <div><span className="step-label">Max global concurrency</span><strong>{pollingDiagnostics?.maxGlobalConcurrency ?? 1}</strong></div>
+                <div><span className="step-label">Queued jobs</span><code>{pollingDiagnostics?.queuedJobs.join(", ") || "None"}</code></div>
+                <div><span className="step-label">Currently executing job</span><code>{pollingDiagnostics?.currentlyExecutingJob ?? "None"}</code></div>
+                <div><span className="step-label">Coalesced requests</span><strong>{pollingDiagnostics?.coalescedRequestCount ?? 0}</strong></div>
+                <div><span className="step-label">Pollable job count</span><strong>{pollingDiagnostics?.pollableJobCount ?? 0}</strong></div>
+                <div><span className="step-label">Session health state</span><strong>{pollingDiagnostics?.sessionHealthState ?? "unknown"}</strong></div>
+                <div><span className="step-label">Session generation</span><strong>{pollingDiagnostics?.sessionGeneration ?? 0}</strong></div>
+                <div><span className="step-label">Session state source</span><strong>{pollingDiagnostics?.sessionStateSource ?? "unknown"}</strong></div>
+                <div><span className="step-label">Session checks in flight</span><strong>{pollingDiagnostics?.sessionHealthCheckInFlightCount ?? 0}</strong></div>
+                <div><span className="step-label">Last successful session check</span><code>{pollingDiagnostics?.lastSuccessfulSessionCheck ?? "None"}</code></div>
+                <div><span className="step-label">Last auth success</span><code>{pollingDiagnostics?.lastAuthSuccess ?? "None"}</code></div>
+                <div><span className="step-label">Last auth failure</span><code>{pollingDiagnostics?.lastAuthFailure ?? "None"}</code></div>
+                <div><span className="step-label">Last global writer</span><strong>{pollingDiagnostics?.lastGlobalStateWriter ?? "None"}</strong></div>
+                <div><span className="step-label">Last global reason</span><strong>{pollingDiagnostics?.lastGlobalStateWriteReason ?? "None"}</strong></div>
+                <div><span className="step-label">Stale session responses ignored</span><strong>{pollingDiagnostics?.staleSessionResponsesIgnored ?? 0}</strong></div>
+                <div><span className="step-label">Timed-out commands</span><strong>{pollingDiagnostics?.timedOutCommands ?? 0}</strong></div>
                 <div><span className="step-label">Polling session state</span><strong>{pollingDiagnostics?.authenticatedSessionState ?? "unknown"}</strong></div>
                 <div><span className="step-label">Selected Manual MFA SSH backend</span><strong>{nibiSettings.manual_mfa_ssh_backend}</strong></div>
                 <div><span className="step-label">Effective backend</span><strong>WSL</strong></div>
@@ -184,6 +202,12 @@ export function DiagnosticsPage({
                 <div><span className="step-label">WSL script file exists</span><strong>{boolLabel(manualMfaSession.last_script_file_exists)}</strong></div>
                 <div><span className="step-label">Manual WSL command</span><code>{manualMfaSession.manual_wsl_command || "None"}</code></div>
               </div>
+              {pollingDiagnostics?.jobsExcludedFromAutomaticPolling ? (
+                <details className="remote-check-details">
+                  <summary>Jobs excluded from automatic polling</summary>
+                  <pre>{JSON.stringify(pollingDiagnostics.jobsExcludedFromAutomaticPolling, null, 2)}</pre>
+                </details>
+              ) : null}
             </section>
           ) : null}
 

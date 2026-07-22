@@ -15,6 +15,7 @@ import {
   classifyRemoteCommandFailure,
   type AppError,
 } from "./errors";
+import type { RefreshTraceStage } from "./refreshDiagnostics";
 import { joinRemoteChildPath } from "./uploadPredictionInput";
 
 export type SlurmPollingStatus =
@@ -52,12 +53,30 @@ export type SlurmPollingPersistence = {
   addJobEvent: typeof addJobEvent;
 };
 
+export type SlurmRefreshDiagnosticsRecorder = {
+  record(stage: RefreshTraceStage, fields?: Record<string, unknown>): void;
+  recordRowStatusWrite(params: {
+    localJobId: string;
+    oldStatus?: PersistedPredictionJob["status"];
+    newStatus: PersistedPredictionJob["status"];
+    writerFunction: string;
+    reason: string;
+    pollGeneration?: number;
+    appliedOrIgnored: "applied" | "ignored";
+  }): void;
+};
+
 type SqueueRow = {
   jobId: string;
   state: string;
   elapsed: string;
   reason: string;
 };
+
+export type SqueueResultClassification =
+  | "active_job_found"
+  | "active_job_not_found"
+  | "hard_failure";
 
 type SacctRow = {
   jobId: string;
@@ -170,6 +189,25 @@ function isSacctUnavailable(result: { exit_code: number; stdout: string; stderr:
   );
 }
 
+export function classifySqueueResult(
+  result: { exit_code: number; stdout: string; stderr: string },
+  activeRow: SqueueRow | null,
+): SqueueResultClassification {
+  if (activeRow) {
+    return "active_job_found";
+  }
+  const text = commandText(result).toLowerCase();
+  if (
+    result.exit_code === 0
+    || text.includes("invalid job id specified")
+    || text.includes("job not found")
+    || text.includes("invalid job id")
+  ) {
+    return "active_job_not_found";
+  }
+  return "hard_failure";
+}
+
 function mapSlurmState(state: string, exitCode?: string): SlurmPollingStatus {
   const normalized = state.trim().toUpperCase().split(/\s+/)[0];
   if (["PENDING", "CONFIGURING", "REQUEUED", "RESIZING", "SUSPENDED"].includes(normalized)) {
@@ -232,7 +270,7 @@ function buildFailureDetails(params: {
 }
 
 export function parseSqueueOutput(output: string): SqueueRow | null {
-  const firstLine = output.trim().split(/\r?\n/).find(Boolean);
+  const firstLine = (output ?? "").trim().split(/\r?\n/).find(Boolean);
   if (!firstLine) return null;
   const [jobId, state, elapsed, reason] = firstLine.split("|");
   if (!jobId || !state) return null;
@@ -278,18 +316,36 @@ async function persistPollingStatus(
   job: PersistedPredictionJob,
   result: SlurmPollingResult,
   persistence: SlurmPollingPersistence,
+  diagnostics?: SlurmRefreshDiagnosticsRecorder,
+  reason = "polling_status_changed",
 ) {
   if (!pollingStatusChanged(job, result)) {
+    diagnostics?.recordRowStatusWrite({
+      localJobId: job.id,
+      oldStatus: job.status,
+      newStatus: result.status,
+      writerFunction: "persistPollingStatus",
+      reason,
+      appliedOrIgnored: "ignored",
+    });
     return;
   }
   const completedAt = activeStatus(result.status) || result.status === "login_required" || result.status === "robot_auth_failed" || result.status === "connection_failed"
     ? undefined
     : new Date().toISOString();
-  await persistence.updateJobStatus(job.id, result.status, {
+  const updated = await persistence.updateJobStatus(job.id, result.status, {
     completedAt,
     slurmState: result.slurmState,
     slurmExitCode: result.slurmExitCode,
     errorMessage: resultErrorMessage(result),
+  });
+  diagnostics?.recordRowStatusWrite({
+    localJobId: job.id,
+    oldStatus: job.status,
+    newStatus: result.status,
+    writerFunction: "persistPollingStatus",
+    reason,
+    appliedOrIgnored: updated ? "applied" : "ignored",
   });
   await persistence.addJobEvent(job.id, `slurm_${result.status}`, result.message, completedAt);
 }
@@ -298,10 +354,18 @@ export async function checkRemoteOutputExists(
   job: PersistedPredictionJob,
   settings: NibiSettings,
   remoteExecutor: RemoteExecutor,
+  diagnostics?: SlurmRefreshDiagnosticsRecorder,
 ): Promise<boolean> {
+  diagnostics?.record("OUTPUT_CHECK_STARTED", { remoteOutputPath: remoteOutputPath(job) });
   const result = await remoteExecutor.runCommand({
     ...buildRemoteOutputExistsCommand(job),
     settings: trimNibiSettings(settings),
+  });
+  diagnostics?.record("OUTPUT_EXISTS", {
+    exists: result.exit_code === 0,
+    exitCode: result.exit_code,
+    stdout: result.stdout,
+    stderr: result.stderr,
   });
   return result.exit_code === 0;
 }
@@ -393,6 +457,7 @@ export async function downloadPredictionOutput(
   remoteExecutor: RemoteExecutor,
   persistence: SlurmPollingPersistence = defaultPersistence,
   schedulerState: { state?: string; exitCode?: string; end?: string } = {},
+  diagnostics?: SlurmRefreshDiagnosticsRecorder,
 ): Promise<SlurmPollingResult> {
   const outputPath = remoteOutputPath(job);
   let localPath = "";
@@ -431,11 +496,22 @@ export async function downloadPredictionOutput(
       ? await tryLocalImport()
       : null;
     if (existingImport) {
-      await persistence.updateJobStatus(job.id, "completed", {
+      const updated = await persistence.updateJobStatus(job.id, "completed", {
         completedAt: existingImport.output.completed_at,
         errorMessage: undefined,
       });
+      diagnostics?.recordRowStatusWrite({
+        localJobId: job.id,
+        oldStatus: job.status,
+        newStatus: "completed",
+        writerFunction: "downloadPredictionOutput.existingImport",
+        reason: "existing_output_imported",
+        appliedOrIgnored: updated ? "applied" : "ignored",
+      });
       await persistence.addJobEvent(job.id, "slurm_completed", "Imported downloaded output.json.", existingImport.output.completed_at);
+      diagnostics?.record("REMOTE_SCHEMA_STATUS", { status: existingImport.diagnostics.remoteSchemaStatus });
+      diagnostics?.record("ADAPTER_STATUS", { status: existingImport.diagnostics.adapterStatus });
+      diagnostics?.record("PERSISTENCE_STATUS", { status: existingImport.diagnostics.persistenceStatus });
       return {
         jobId: job.id,
         slurmJobId: job.remote_slurm_id,
@@ -452,7 +528,7 @@ export async function downloadPredictionOutput(
         schedulerConfirmed: Boolean(schedulerState.state),
       };
     }
-    const exists = await checkRemoteOutputExists(job, settings, remoteExecutor);
+    const exists = await checkRemoteOutputExists(job, settings, remoteExecutor, diagnostics);
     if (!exists) {
       const error = appError("output_missing", `DOWNLOAD_FAILURE_CODE=46\n${downloadDiagnostics({ remotePath: outputPath, remoteOutputExists: false })}`);
       const result: SlurmPollingResult = {
@@ -466,15 +542,19 @@ export async function downloadPredictionOutput(
         slurmExitCode: schedulerState.exitCode,
         schedulerConfirmed: Boolean(schedulerState.state),
       };
-      await persistPollingStatus(job, result, persistence);
+      await persistPollingStatus(job, result, persistence, diagnostics, "remote_output_missing");
       return result;
     }
     const [stdoutLog, stderrLog] = await Promise.all([
       readRemoteLog(job, "stdout.log", settings, remoteExecutor),
       readRemoteLog(job, "stderr.log", settings, remoteExecutor),
     ]);
+    diagnostics?.record("OUTPUT_SIZE", { size: "unknown" });
+    diagnostics?.record("DOWNLOAD_STARTED", { remotePath: outputPath, localPath });
     await remoteExecutor.downloadFile(outputPath, localPath, trimNibiSettings(settings));
+    diagnostics?.record("DOWNLOAD_EXIT_CODE", { exitCode: 0 });
     const outputJson = await invoke<string>("read_prediction_output_file", { localPath });
+    diagnostics?.record("OUTPUT_SIZE", { size: outputJson.length });
     const imported = await importPredictionOutputJson({
       job,
       outputJson,
@@ -489,13 +569,24 @@ export async function downloadPredictionOutput(
       },
     });
     const output = imported.output;
-    await persistence.updateJobStatus(job.id, "completed", {
+    const updated = await persistence.updateJobStatus(job.id, "completed", {
       completedAt: output.completed_at,
       slurmStdout: stdoutLog,
       slurmStderr: stderrLog,
       errorMessage: undefined,
     });
+    diagnostics?.recordRowStatusWrite({
+      localJobId: job.id,
+      oldStatus: job.status,
+      newStatus: "completed",
+      writerFunction: "downloadPredictionOutput",
+      reason: "downloaded_output_imported",
+      appliedOrIgnored: updated ? "applied" : "ignored",
+    });
     await persistence.addJobEvent(job.id, "slurm_completed", "Downloaded and saved output.json.", output.completed_at);
+    diagnostics?.record("REMOTE_SCHEMA_STATUS", { status: imported.diagnostics.remoteSchemaStatus });
+    diagnostics?.record("ADAPTER_STATUS", { status: imported.diagnostics.adapterStatus });
+    diagnostics?.record("PERSISTENCE_STATUS", { status: imported.diagnostics.persistenceStatus });
     return {
       jobId: job.id,
       slurmJobId: job.remote_slurm_id,
@@ -542,7 +633,11 @@ export async function downloadPredictionOutput(
       slurmExitCode: schedulerState.exitCode,
       schedulerConfirmed: Boolean(schedulerState.state),
     };
-    await persistPollingStatus(job, result, persistence);
+    diagnostics?.record("DOWNLOAD_EXIT_CODE", { exitCode: 1 });
+    diagnostics?.record("ERROR_STAGE", { stage: "download/import" });
+    diagnostics?.record("ERROR_CLASS", { class: error instanceof Error ? error.name : typeof error });
+    diagnostics?.record("ERROR_MESSAGE", { message: error instanceof Error ? error.message : String(error) });
+    await persistPollingStatus(job, result, persistence, diagnostics, status);
     return result;
   }
 }
@@ -552,11 +647,15 @@ export async function pollSlurmJobStatus(
   settings: NibiSettings,
   remoteExecutor: RemoteExecutor,
   persistence: SlurmPollingPersistence = defaultPersistence,
+  diagnostics?: SlurmRefreshDiagnosticsRecorder,
 ): Promise<SlurmPollingResult> {
   const connectionFailure = connectionFailureStatus(settings, remoteExecutor);
   if (connectionFailure) {
     const result = { ...connectionFailure, jobId: job.id, slurmJobId: job.remote_slurm_id };
-    await persistPollingStatus(job, result, persistence);
+    diagnostics?.record("ERROR_STAGE", { stage: "connection_status" });
+    diagnostics?.record("ERROR_CLASS", { class: result.appError?.code });
+    diagnostics?.record("ERROR_MESSAGE", { message: result.message });
+    await persistPollingStatus(job, result, persistence, diagnostics, "connection_status");
     return result;
   }
 
@@ -569,11 +668,12 @@ export async function pollSlurmJobStatus(
       message: error.message,
       appError: error,
     };
-    await persistPollingStatus(job, result, persistence);
+    await persistPollingStatus(job, result, persistence, diagnostics, "missing_slurm_id");
     return result;
   }
 
   const trimmed = trimNibiSettings(settings);
+  diagnostics?.record("SQUEUE_STARTED", { slurmId: job.remote_slurm_id });
   const squeue = await remoteExecutor.runCommand({
     label: "Poll active Slurm job",
     executable: "squeue",
@@ -581,8 +681,18 @@ export async function pollSlurmJobStatus(
     settings: trimmed,
     redacted_preview: "squeue -j <job_id> --noheader --format=\"%i|%T|%M|%R\"",
   });
+  diagnostics?.record("SQUEUE_EXIT_CODE", { exitCode: squeue.exit_code });
+  diagnostics?.record("SQUEUE_STDOUT", { stdout: squeue.stdout });
+  diagnostics?.record("SQUEUE_STDERR", { stderr: squeue.stderr });
 
-  if (squeue.exit_code !== 0 && commandText(squeue)) {
+  const activeRow = parseSqueueOutput(squeue.stdout);
+  const squeueClassification = classifySqueueResult(squeue, activeRow);
+  diagnostics?.record("SQUEUE_CLASSIFICATION", {
+    SQUEUE_CLASSIFICATION: squeueClassification,
+  });
+  diagnostics?.record("SQUEUE_MATCH_FOUND", { found: Boolean(activeRow) });
+
+  if (squeueClassification === "hard_failure") {
     const error = classifyRemoteCommandFailure(squeue, "slurm_poll");
     const result: SlurmPollingResult = {
       jobId: job.id,
@@ -592,11 +702,13 @@ export async function pollSlurmJobStatus(
       technicalDetails: error.technicalDetails,
       appError: error,
     };
-    await persistPollingStatus(job, result, persistence);
+    diagnostics?.record("ERROR_STAGE", { stage: "squeue" });
+    diagnostics?.record("ERROR_CLASS", { class: error.code });
+    diagnostics?.record("ERROR_MESSAGE", { message: error.message });
+    await persistPollingStatus(job, result, persistence, diagnostics, "squeue_failed");
     return result;
   }
 
-  const activeRow = parseSqueueOutput(squeue.stdout);
   if (activeRow) {
     const status = mapSlurmState(activeRow.state);
     const result: SlurmPollingResult = {
@@ -608,10 +720,18 @@ export async function pollSlurmJobStatus(
       slurmState: activeRow.state,
       schedulerConfirmed: true,
     };
-    await persistPollingStatus(job, result, persistence);
+    await persistPollingStatus(job, result, persistence, diagnostics, "squeue_active_row");
     return result;
   }
 
+  diagnostics?.record("SACCT_FALLBACK_STARTED", {
+    SACCT_FALLBACK_STARTED: 1,
+    GLOBAL_SESSION_STATE_CHANGED: false,
+  });
+  diagnostics?.record("GLOBAL_SESSION_STATE_CHANGED", {
+    GLOBAL_SESSION_STATE_CHANGED: false,
+  });
+  diagnostics?.record("SACCT_STARTED", { slurmId: job.remote_slurm_id });
   const sacct = await remoteExecutor.runCommand({
     label: "Poll completed Slurm job",
     executable: "sacct",
@@ -619,7 +739,12 @@ export async function pollSlurmJobStatus(
     settings: trimmed,
     redacted_preview: "sacct -j <job_id> --format=JobID,State,ExitCode,End --parsable2 --noheader",
   });
+  diagnostics?.record("SACCT_EXIT_CODE", { exitCode: sacct.exit_code });
+  diagnostics?.record("SACCT_STDOUT", { stdout: sacct.stdout });
+  diagnostics?.record("SACCT_STDERR", { stderr: sacct.stderr });
   const sacctRow = sacct.exit_code === 0 ? parseSacctOutput(sacct.stdout, job.remote_slurm_id) : null;
+  diagnostics?.record("SACCT_PARENT_STATE", { state: sacctRow?.state ?? "" });
+  diagnostics?.record("SACCT_PARENT_EXIT_CODE", { exitCode: sacctRow?.exitCode ?? "" });
   const sacctUnavailable = isSacctUnavailable(sacct);
   const mappedStatus = sacctRow ? mapSlurmState(sacctRow.state, sacctRow.exitCode) : null;
 
@@ -628,7 +753,7 @@ export async function pollSlurmJobStatus(
       state: sacctRow?.state,
       exitCode: sacctRow?.exitCode,
       end: sacctRow?.end,
-    });
+    }, diagnostics);
     if (downloaded.status !== "output_missing") {
       return {
         ...downloaded,
@@ -671,7 +796,7 @@ export async function pollSlurmJobStatus(
     };
     if (pollingStatusChanged(job, result) || job.slurm_stdout !== stdoutLog || job.slurm_stderr !== stderrLog) {
       const completedAt = new Date().toISOString();
-      await persistence.updateJobStatus(job.id, result.status, {
+      const updated = await persistence.updateJobStatus(job.id, result.status, {
         completedAt,
         slurmState: sacctRow?.state,
         slurmExitCode: sacctRow?.exitCode,
@@ -679,7 +804,24 @@ export async function pollSlurmJobStatus(
         slurmStderr: stderrLog,
         errorMessage: [result.message, result.technicalDetails].filter(Boolean).join("\n\n"),
       });
+      diagnostics?.recordRowStatusWrite({
+        localJobId: job.id,
+        oldStatus: job.status,
+        newStatus: result.status,
+        writerFunction: "pollSlurmJobStatus.outputMissing",
+        reason: "completed_but_output_missing",
+        appliedOrIgnored: updated ? "applied" : "ignored",
+      });
       await persistence.addJobEvent(job.id, `slurm_${result.status}`, result.message, completedAt);
+    } else {
+      diagnostics?.recordRowStatusWrite({
+        localJobId: job.id,
+        oldStatus: job.status,
+        newStatus: result.status,
+        writerFunction: "pollSlurmJobStatus.outputMissing",
+        reason: "completed_but_output_missing",
+        appliedOrIgnored: "ignored",
+      });
     }
     return result;
   }
@@ -715,7 +857,7 @@ export async function pollSlurmJobStatus(
     };
     if (pollingStatusChanged(job, result) || job.slurm_stdout !== stdoutLog || job.slurm_stderr !== stderrLog) {
       const completedAt = new Date().toISOString();
-      await persistence.updateJobStatus(job.id, result.status, {
+      const updated = await persistence.updateJobStatus(job.id, result.status, {
         completedAt,
         slurmState: sacctRow?.state,
         slurmExitCode: sacctRow?.exitCode,
@@ -723,7 +865,24 @@ export async function pollSlurmJobStatus(
         slurmStderr: stderrLog,
         errorMessage: [result.message, result.technicalDetails].filter(Boolean).join("\n\n"),
       });
+      diagnostics?.recordRowStatusWrite({
+        localJobId: job.id,
+        oldStatus: job.status,
+        newStatus: result.status,
+        writerFunction: "pollSlurmJobStatus.sacctMappedStatus",
+        reason: "sacct_mapped_status",
+        appliedOrIgnored: updated ? "applied" : "ignored",
+      });
       await persistence.addJobEvent(job.id, `slurm_${result.status}`, result.message, completedAt);
+    } else {
+      diagnostics?.recordRowStatusWrite({
+        localJobId: job.id,
+        oldStatus: job.status,
+        newStatus: result.status,
+        writerFunction: "pollSlurmJobStatus.sacctMappedStatus",
+        reason: "sacct_mapped_status",
+        appliedOrIgnored: "ignored",
+      });
     }
     return result;
   }
@@ -749,6 +908,9 @@ export async function pollSlurmJobStatus(
     technicalDetails: error.technicalDetails,
     appError: error,
   };
-  await persistPollingStatus(job, result, persistence);
+  diagnostics?.record("ERROR_STAGE", { stage: sacct.exit_code === 0 ? "sacct_no_parent_row" : "sacct" });
+  diagnostics?.record("ERROR_CLASS", { class: error.code });
+  diagnostics?.record("ERROR_MESSAGE", { message: error.message });
+  await persistPollingStatus(job, result, persistence, diagnostics, sacct.exit_code === 0 ? "sacct_no_parent_row" : "sacct_failed");
   return result;
 }

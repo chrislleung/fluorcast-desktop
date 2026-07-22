@@ -3,6 +3,7 @@ export * from "./duplicateCheck";
 export * from "./errors";
 export * from "./manualMfaSession";
 export * from "./remoteEnvironmentChecks";
+export * from "./refreshDiagnostics";
 export * from "./slurmPolling";
 export * from "./slurmPollingCoordinator";
 export * from "./slurmCancellation";

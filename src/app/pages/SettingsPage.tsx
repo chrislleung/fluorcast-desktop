@@ -633,6 +633,9 @@ export function SettingsPage({
     : robotTestStatus
     ? "Robot automation test failed"
     : "Robot access not configured";
+  const modeStatusMessage = isManualMfaMode && isManualSessionReady
+    ? manualMfaSession.last_session_test_result || "Manual NIBI session authenticated."
+    : connectionStatus.message;
 
   return (
     <div className="page narrow-page">
@@ -691,7 +694,7 @@ export function SettingsPage({
         <section className="connection-status-panel" aria-label="Mode status summary">
           <span>Selected mode: {connectionStatus.mode}</span>
           <strong>{modeStatusSummary}</strong>
-          <p>{connectionStatus.message}</p>
+          <p>{modeStatusMessage}</p>
         </section>
 
         {!isMockMode ? (

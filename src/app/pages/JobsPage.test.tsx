@@ -82,7 +82,47 @@ describe("JobsPage recovery actions", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Download result" }));
-    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ status: "output_missing" }));
+    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ status: "output_missing" }), expect.stringMatching(/^refresh-/));
+  });
+
+  it("allows connection-failed jobs with persisted Slurm metadata to refresh", () => {
+    const refresh = vi.fn();
+    render(
+      <JobsPage
+        jobs={[{
+          ...baseJob,
+          status: "connection_failed",
+          remote_slurm_id: "18231560",
+          remote_job_dir: "/home/alice/scratch/fluorcast-jobs/job-1",
+        }]}
+        onOpenResult={vi.fn()}
+        onRefreshJobStatus={refresh}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({
+      status: "connection_failed",
+      remote_slurm_id: "18231560",
+      remote_job_dir: "/home/alice/scratch/fluorcast-jobs/job-1",
+    }), expect.stringMatching(/^refresh-/));
+  });
+
+  it("does not show refresh for connection-failed jobs missing the remote directory", () => {
+    render(
+      <JobsPage
+        jobs={[{
+          ...baseJob,
+          status: "connection_failed",
+          remote_slurm_id: "18231560",
+          remote_job_dir: undefined,
+        }]}
+        onOpenResult={vi.fn()}
+        onRefreshJobStatus={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Refresh status" })).not.toBeInTheDocument();
   });
 
   it("shows retry output download for download failures without Slurm resubmission", () => {
@@ -108,7 +148,7 @@ describe("JobsPage recovery actions", () => {
     expect(refresh).toHaveBeenCalledWith(expect.objectContaining({
       status: "download_failed",
       remote_slurm_id: "18217313",
-    }));
+    }), expect.stringMatching(/^refresh-/));
     expect(submit).not.toHaveBeenCalled();
   });
 
@@ -135,7 +175,7 @@ describe("JobsPage recovery actions", () => {
     expect(refresh).toHaveBeenCalledWith(expect.objectContaining({
       status: "output_invalid",
       remote_slurm_id: "18226108",
-    }));
+    }), expect.stringMatching(/^refresh-/));
     expect(submit).not.toHaveBeenCalled();
   });
 
@@ -213,7 +253,7 @@ describe("JobsPage recovery actions", () => {
 
     expect(screen.queryByRole("button", { name: "Retry Slurm submission" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Resume monitoring" }));
-    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ remote_slurm_id: "18215500" }));
+    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ remote_slurm_id: "18215500" }), expect.stringMatching(/^refresh-/));
     expect(submit).not.toHaveBeenCalled();
     expect(screen.getByText("Marker warning")).toBeInTheDocument();
   });
@@ -300,7 +340,77 @@ describe("JobsPage recovery actions", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
-    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ id: "job-1" }));
+    expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ id: "job-1" }), expect.stringMatching(/^refresh-/));
+  });
+
+  it("generates one refresh trace ID for one click", () => {
+    const refresh = vi.fn();
+    render(
+      <JobsPage
+        jobs={[{ ...baseJob, status: "connection_failed" }]}
+        onOpenResult={vi.fn()}
+        onRefreshJobStatus={refresh}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh.mock.calls[0][1]).toMatch(/^refresh-/);
+  });
+
+  it("copies ordered manual refresh diagnostics", () => {
+    const writeText = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(
+      <JobsPage
+        jobs={[baseJob]}
+        latestManualRefreshTraceByJob={{
+          [baseJob.id]: {
+            traceId: "refresh-test",
+            localJobId: baseJob.id,
+            slurmId: "12345",
+            remoteJobDir: baseJob.remote_job_dir,
+            events: [
+              {
+                traceId: "refresh-test",
+                seq: 1,
+                timestamp: "2026-07-22T12:00:00.000Z",
+                stage: "BUTTON_CLICKED",
+                localJobId: baseJob.id,
+              },
+              {
+                traceId: "refresh-test",
+                seq: 2,
+                timestamp: "2026-07-22T12:00:01.000Z",
+                stage: "SQUEUE_STARTED",
+                localJobId: baseJob.id,
+              },
+            ],
+            rowStatusWrites: [],
+          },
+        }}
+        latestGlobalBannerWriteTrace={{
+          traceId: "banner-test",
+          seq: 1,
+          timestamp: "2026-07-22T12:00:02.000Z",
+          oldBannerState: "unknown",
+          newBannerState: "available",
+          writerFunction: "SlurmPollingCoordinator.applyResult",
+          writerFile: "src/lib/remote/slurmPollingCoordinator.ts",
+          reason: "scheduler_success",
+          sessionGeneration: 1,
+          relatedRefreshTraceId: "refresh-test",
+        }}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy diagnostics" }));
+
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("1. 2026-07-22T12:00:00.000Z BUTTON_CLICKED"));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("2. 2026-07-22T12:00:01.000Z SQUEUE_STARTED"));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("BANNER_WRITE_TRACE_ID=banner-test"));
   });
 
   it("requires confirmation before cancelling a remote Slurm job", () => {

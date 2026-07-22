@@ -6,6 +6,7 @@ import type { RemoteExecutor } from "./RemoteExecutor";
 import {
   buildRemoteOutputExistsCommand,
   checkRemoteOutputExists,
+  classifySqueueResult,
   downloadPredictionOutput,
   mapSlurmStateToJobStatus,
   parseSacctOutput,
@@ -117,6 +118,13 @@ describe("Slurm polling helpers", () => {
       elapsed: "00:02:13",
       reason: "node-a",
     });
+  });
+
+  it("classifies invalid squeue job id as active queue not found", () => {
+    expect(classifySqueueResult(commandResult({
+      exit_code: 1,
+      stderr: "slurm_load_jobs error: Invalid job id specified",
+    }), null)).toBe("active_job_not_found");
   });
 
   it("parses sacct output and prefers the parent job row", () => {
@@ -331,6 +339,214 @@ describe("Slurm polling helpers", () => {
       executable: "sacct",
       args: ["-j", "18215500", "--format=JobID,State,ExitCode,End", "--parsable2", "--noheader"],
     });
+  });
+
+  it("replaces connection failed with sacct running for an existing Slurm job", async () => {
+    const store = persistence();
+    const remoteJobDir = "/home/chrisl/scratch/fluorcast-jobs/connection-failed-running";
+
+    const result = await pollSlurmJobStatus(
+      {
+        ...job,
+        status: "connection_failed",
+        remote_slurm_id: "18215501",
+        remote_job_dir: remoteJobDir,
+      },
+      settings,
+      executor([
+        commandResult({ stdout: "" }),
+        commandResult({ stdout: "18215501|RUNNING|0:0|" }),
+      ]),
+      store,
+    );
+
+    expect(result).toMatchObject({
+      status: "running",
+      slurmJobId: "18215501",
+      slurmState: "RUNNING",
+    });
+    expect(store.updateJobStatus).toHaveBeenCalledWith("job-1", "running", expect.objectContaining({
+      slurmState: "RUNNING",
+      errorMessage: expect.any(String),
+    }));
+  });
+
+  it("falls back to sacct when squeue reports invalid job id", async () => {
+    const commands: RemoteCommandSpec[] = [];
+    const result = await pollSlurmJobStatus(
+      {
+        ...job,
+        status: "connection_failed",
+        remote_slurm_id: "18234413",
+      },
+      settings,
+      executor([
+        commandResult({
+          exit_code: 1,
+          stderr: "slurm_load_jobs error: Invalid job id specified",
+        }),
+        commandResult({ stdout: "18234413|RUNNING|0:0|" }),
+      ], { onCommand: (command) => commands.push(command) }),
+      persistence(),
+    );
+
+    expect(result.status).toBe("running");
+    expect(result.appError?.code).not.toBe("slurm_unavailable");
+    expect(result.status).not.toBe("connection_failed");
+    expect(commands.map((command) => command.executable)).toEqual(["squeue", "sacct"]);
+    expect(commands[1].args).toEqual(["-j", "18234413", "--format=JobID,State,ExitCode,End", "--parsable2", "--noheader"]);
+  });
+
+  it("recovers completed historical jobs after invalid squeue job id", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "prediction_output_temp_file_path") return "C:\\Temp\\fluorcast-18234413-output.json";
+      if (command === "read_prediction_output_file") {
+        return JSON.stringify({ ...flatRemoteOutput, job_id: "9063ef52-e2d0-48c5-a7e9-786be6042f78" });
+      }
+      if (command === "prediction_output_file_modified_at") return "1780000000000";
+      return null;
+    });
+    const commands: RemoteCommandSpec[] = [];
+    const downloads: Array<[string, string]> = [];
+    const store = persistence();
+    const remoteJobDir = "/home/alice/scratch/fluorcast-jobs/9063ef52-e2d0-48c5-a7e9-786be6042f78";
+
+    const result = await pollSlurmJobStatus(
+      {
+        ...job,
+        id: "9063ef52-e2d0-48c5-a7e9-786be6042f78",
+        status: "connection_failed",
+        remote_slurm_id: "18234413",
+        remote_job_dir: remoteJobDir,
+      },
+      settings,
+      executor([
+        commandResult({
+          exit_code: 1,
+          stderr: "slurm_load_jobs error: Invalid job id specified",
+        }),
+        commandResult({ stdout: "18234413|COMPLETED|0:0|2026-07-22T11:22:03" }),
+        commandResult({ exit_code: 0 }),
+        commandResult({ stdout: "stdout text" }),
+        commandResult({ stdout: "stderr text" }),
+      ], {
+        onCommand: (command) => commands.push(command),
+        onDownload: (remotePath, localPath) => downloads.push([remotePath, localPath]),
+      }),
+      store,
+    );
+
+    expect(result).toMatchObject({
+      status: "completed",
+      slurmJobId: "18234413",
+      slurmState: "COMPLETED",
+      slurmExitCode: "0:0",
+    });
+    expect(commands.map((command) => command.executable)).toEqual(["squeue", "sacct", "test", "cat", "cat"]);
+    expect(commands.some((command) => command.executable === "sbatch")).toBe(false);
+    expect(downloads).toEqual([[`${remoteJobDir}/output.json`, "C:\\Temp\\fluorcast-18234413-output.json"]]);
+    expect(store.updateJobStatus).toHaveBeenCalledWith(
+      "9063ef52-e2d0-48c5-a7e9-786be6042f78",
+      "completed",
+      expect.objectContaining({
+        errorMessage: undefined,
+      }),
+    );
+  });
+
+  it("maps sacct failed after invalid squeue job id to job failure", async () => {
+    const result = await pollSlurmJobStatus(
+      { ...job, status: "connection_failed", remote_slurm_id: "18234414" },
+      settings,
+      executor([
+        commandResult({
+          exit_code: 1,
+          stderr: "slurm_load_jobs error: Invalid job id specified",
+        }),
+        commandResult({ stdout: "18234414|FAILED|1:0|" }),
+        commandResult({ stdout: "stdout text" }),
+        commandResult({ stdout: "stderr text" }),
+      ]),
+      persistence(),
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.appError?.code).toBe("job_failed");
+    expect(result.status).not.toBe("connection_failed");
+  });
+
+  it("keeps genuine squeue transport failures distinguishable", async () => {
+    const result = await pollSlurmJobStatus(
+      job,
+      settings,
+      executor([
+        commandResult({
+          exit_code: 255,
+          stderr: "ssh: connect to host nibi.example port 22: Connection timed out",
+        }),
+      ]),
+      persistence(),
+    );
+
+    expect(result.status).toBe("connection_failed");
+    expect(result.appError?.code).toBe("ssh_connection_failed");
+  });
+
+  it("records squeue active-not-found and sacct fallback diagnostics", async () => {
+    const events: Array<{ stage: string; fields?: Record<string, unknown> }> = [];
+    await pollSlurmJobStatus(
+      { ...job, status: "connection_failed", remote_slurm_id: "18234415" },
+      settings,
+      executor([
+        commandResult({
+          exit_code: 1,
+          stderr: "slurm_load_jobs error: Invalid job id specified",
+        }),
+        commandResult({ stdout: "18234415|RUNNING|0:0|" }),
+      ]),
+      persistence(),
+      {
+        record: (stage, fields) => events.push({ stage, fields }),
+        recordRowStatusWrite: () => undefined,
+      },
+    );
+
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ stage: "SQUEUE_STARTED" }),
+      expect.objectContaining({ stage: "SQUEUE_EXIT_CODE", fields: expect.objectContaining({ exitCode: 1 }) }),
+      expect.objectContaining({ stage: "SQUEUE_CLASSIFICATION", fields: expect.objectContaining({ SQUEUE_CLASSIFICATION: "active_job_not_found" }) }),
+      expect.objectContaining({ stage: "SACCT_FALLBACK_STARTED", fields: expect.objectContaining({ SACCT_FALLBACK_STARTED: 1 }) }),
+      expect.objectContaining({ stage: "SACCT_PARENT_STATE", fields: expect.objectContaining({ state: "RUNNING" }) }),
+    ]));
+  });
+
+  it("does not map result import errors after completed sacct fallback to connection failed", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "prediction_output_temp_file_path") return "C:\\Temp\\fluorcast-invalid-output.json";
+      if (command === "read_prediction_output_file") return "{not-json";
+      if (command === "prediction_output_file_modified_at") return "1780000000000";
+      return null;
+    });
+
+    const result = await pollSlurmJobStatus(
+      { ...job, status: "connection_failed", remote_slurm_id: "18234416" },
+      settings,
+      executor([
+        commandResult({
+          exit_code: 1,
+          stderr: "slurm_load_jobs error: Invalid job id specified",
+        }),
+        commandResult({ stdout: "18234416|COMPLETED|0:0|" }),
+        commandResult({ exit_code: 0 }),
+        commandResult({ stdout: "stdout text" }),
+        commandResult({ stdout: "stderr text" }),
+      ]),
+      persistence(),
+    );
+
+    expect(result.status).toBe("output_invalid");
+    expect(result.appError?.code).toBe("output_invalid");
+    expect(result.status).not.toBe("connection_failed");
   });
 
   it("retrieves stdout stderr and output from the existing remote directory", async () => {

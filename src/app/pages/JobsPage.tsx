@@ -1,6 +1,13 @@
 import type { StoredPredictionJob } from "../../features/jobs";
 import type { NibiSettings } from "../../features/settings";
-import type { ManualMfaSessionUiState } from "../../lib/remote";
+import {
+  canManuallyRefreshSlurmJob,
+  createRefreshTraceId,
+  formatRefreshDiagnosticsText,
+  type BannerWriteTrace,
+  type ManualMfaSessionUiState,
+  type ManualRefreshTrace,
+} from "../../lib/remote";
 
 type JobsPageProps = {
   jobs: StoredPredictionJob[];
@@ -11,7 +18,9 @@ type JobsPageProps = {
   onOpenResult: (jobId: string) => void;
   onReconnect?: () => void;
   onOpenRobotSetup?: () => void;
-  onRefreshJobStatus?: (job: StoredPredictionJob) => Promise<unknown>;
+  latestManualRefreshTraceByJob?: Record<string, ManualRefreshTrace>;
+  latestGlobalBannerWriteTrace?: BannerWriteTrace;
+  onRefreshJobStatus?: (job: StoredPredictionJob, traceId: string) => Promise<unknown>;
   onCancelRemoteJob?: (job: StoredPredictionJob) => Promise<unknown>;
   onSubmitSlurmJob?: (job: StoredPredictionJob) => Promise<unknown>;
 };
@@ -49,7 +58,7 @@ function formatCreatedDate(value: string) {
 }
 
 function canRefresh(job: StoredPredictionJob) {
-  return Boolean(job.remote_slurm_id) && job.status !== "completed";
+  return job.status !== "completed" && canManuallyRefreshSlurmJob(job);
 }
 
 function canSubmitToSlurm(job: StoredPredictionJob) {
@@ -105,8 +114,20 @@ export function JobsPage({
   onRefreshJobStatus,
   onCancelRemoteJob,
   onSubmitSlurmJob,
+  latestManualRefreshTraceByJob = {},
+  latestGlobalBannerWriteTrace,
 }: JobsPageProps) {
   const refreshingJobs = new Set(refreshingJobIds);
+
+  function refreshJobStatus(job: StoredPredictionJob) {
+    const traceId = createRefreshTraceId();
+    void onRefreshJobStatus?.(job, traceId);
+  }
+
+  function copyDiagnostics(job: StoredPredictionJob) {
+    const text = formatRefreshDiagnosticsText(latestManualRefreshTraceByJob[job.id], latestGlobalBannerWriteTrace);
+    void navigator.clipboard?.writeText(text);
+  }
 
   function confirmAndCancel(job: StoredPredictionJob) {
     if (!job.remote_slurm_id) return;
@@ -196,7 +217,7 @@ export function JobsPage({
                             <button
                               className="secondary-button compact-button"
                               disabled={refreshingJobs.has(job.id)}
-                              onClick={() => void onRefreshJobStatus(job)}
+                              onClick={() => refreshJobStatus(job)}
                               type="button"
                             >
                               {refreshingJobs.has(job.id) ? "Refreshing..." : "Resume monitoring"}
@@ -235,7 +256,7 @@ export function JobsPage({
                             <button
                               className="secondary-button compact-button"
                               disabled={refreshingJobs.has(job.id)}
-                              onClick={() => void onRefreshJobStatus(job)}
+                              onClick={() => refreshJobStatus(job)}
                               type="button"
                             >
                               {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
@@ -290,7 +311,7 @@ export function JobsPage({
                         <button
                           className="secondary-button compact-button"
                           disabled={refreshingJobs.has(job.id)}
-                          onClick={() => void onRefreshJobStatus(job)}
+                          onClick={() => refreshJobStatus(job)}
                           type="button"
                         >
                           {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
@@ -313,7 +334,7 @@ export function JobsPage({
                         <button
                           className="secondary-button compact-button"
                           disabled={refreshingJobs.has(job.id)}
-                          onClick={() => void onRefreshJobStatus(job)}
+                          onClick={() => refreshJobStatus(job)}
                           type="button"
                         >
                           {refreshingJobs.has(job.id) ? "Refreshing..." : "Download result"}
@@ -324,7 +345,7 @@ export function JobsPage({
                           <button
                             className="secondary-button compact-button"
                             disabled={refreshingJobs.has(job.id)}
-                            onClick={() => void onRefreshJobStatus(job)}
+                            onClick={() => refreshJobStatus(job)}
                             type="button"
                           >
                             {refreshingJobs.has(job.id) ? "Refreshing..." : "Retry output download"}
@@ -342,7 +363,7 @@ export function JobsPage({
                           <button
                             className="secondary-button compact-button"
                             disabled={refreshingJobs.has(job.id)}
-                            onClick={() => void onRefreshJobStatus(job)}
+                            onClick={() => refreshJobStatus(job)}
                             type="button"
                           >
                             {refreshingJobs.has(job.id) ? "Refreshing..." : "Retry result import"}
@@ -392,7 +413,7 @@ export function JobsPage({
                         <button
                           className="secondary-button compact-button"
                           disabled={refreshingJobs.has(job.id)}
-                          onClick={() => void onRefreshJobStatus(job)}
+                          onClick={() => refreshJobStatus(job)}
                           type="button"
                         >
                           {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
@@ -406,6 +427,19 @@ export function JobsPage({
                         <details className="remote-check-details">
                           <summary>Remote folder</summary>
                           <code>{job.remote_job_dir}</code>
+                        </details>
+                      ) : null}
+                      {latestManualRefreshTraceByJob[job.id] || latestGlobalBannerWriteTrace ? (
+                        <details className="remote-check-details">
+                          <summary>Development diagnostics</summary>
+                          <button
+                            className="secondary-button compact-button"
+                            onClick={() => copyDiagnostics(job)}
+                            type="button"
+                          >
+                            Copy diagnostics
+                          </button>
+                          <pre>{formatRefreshDiagnosticsText(latestManualRefreshTraceByJob[job.id], latestGlobalBannerWriteTrace)}</pre>
                         </details>
                       ) : null}
                     </td>
