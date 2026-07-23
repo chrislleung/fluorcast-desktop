@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import flatRemoteOutput from "../../../tests/fixtures/remote-output.flat-success.example.json";
 import { validatePredictionJobOutput } from "../schemas";
@@ -9,6 +10,8 @@ import {
 } from "./remotePredictionOutputAdapter";
 
 const localJobId = "2e80b1b9-f65f-426a-a289-1466ab7f0abd";
+const authoritativeHybridJobId = "d5607546-105a-4c1a-a4e0-6cb13fcba3d9";
+const authoritativeHybridFixturePath = "src/lib/remote/test-fixtures/real-hybrid-output.json";
 
 function basePrediction() {
   return {
@@ -137,6 +140,57 @@ describe("remote prediction output adapter", () => {
     expect(prediction.applicability_domain?.outside_applicability_domain).toBe(false);
     expect(prediction.prediction_intervals?.quantum_yield?.lower).toBe(-0.23344108221592028);
     expect(prediction.brightness_class).toBe("dim");
+  });
+
+  it("imports the authoritative real Hybrid output fixture through the JSON import boundary", () => {
+    const fixtureJson = readFileSync(authoritativeHybridFixturePath, "utf8");
+    const source = JSON.parse(fixtureJson) as Record<string, unknown>;
+    const { output, diagnostics } = parseRemoteOutputJsonForImport(fixtureJson, {
+      localJobId: authoritativeHybridJobId,
+      completion: { importTime: "2026-07-22T12:00:00.000Z" },
+    });
+    const prediction = output.predictions[0];
+
+    expect(source.status).toBe("success");
+    expect(diagnostics).toMatchObject({
+      jsonSyntaxStatus: "valid",
+      remoteSchemaStatus: "valid",
+      adapterStatus: "success",
+      canonicalSchemaStatus: "valid",
+    });
+    expect(output.status).toBe("succeeded");
+    expect(output.job_id).toBe(authoritativeHybridJobId);
+    expect(prediction.model_name).toBe("hybrid");
+    expect(prediction.predicted_absorption_nm).toBe(320.69705127630357);
+    expect(prediction.predicted_emission_nm).toBe(501.3903336407451);
+    expect(prediction.predicted_quantum_yield).toBe(0.11199180746552381);
+    expect(prediction.predicted_stokes_shift_nm).toBe(180.69328236444153);
+    expect(prediction["predicted_stokes_shift_cm^-1"]).toBe(11237.535675197625);
+    expect(prediction.physically_valid_stokes).toBe(true);
+    expect(prediction.confidence_label).toBeUndefined();
+    expect(prediction.confidence_label).not.toBe(prediction.brightness_class);
+    expect(prediction.brightness_class).toBe("dim");
+    expect(prediction.applicability_domain?.outside_applicability_domain).toBe(false);
+    expect(prediction.outside_applicability_domain).toBe(false);
+    expect(prediction.prediction_intervals).toEqual({
+      absorption_nm: {
+        lower: 269.8078535450293,
+        upper: 371.58624900757786,
+        coverage: 0.9,
+      },
+      emission_nm: {
+        lower: 433.7084180663891,
+        upper: 569.0722492151011,
+        coverage: 0.9,
+      },
+      quantum_yield: {
+        lower: -0.23344108221592028,
+        upper: 0.4574246971469679,
+        coverage: 0.9,
+      },
+    });
+    expect(prediction.prediction_intervals?.quantum_yield?.lower).toBe(-0.23344108221592028);
+    expect(prediction.prediction_intervals?.quantum_yield?.coverage).toBe(0.9);
   });
 
   it("preserves valid confidence_label when supplied", () => {
