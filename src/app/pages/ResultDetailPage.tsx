@@ -29,6 +29,10 @@ function modelWarnings(prediction: PredictionItem) {
   return prediction.warnings.length > 0 ? prediction.warnings.join("; ") : "None";
 }
 
+function confidenceLabel(prediction: PredictionItem) {
+  return prediction.confidence_label ?? "Not available";
+}
+
 export function ResultDetailPage({ output }: ResultDetailPageProps) {
   const rawJson = JSON.stringify(output, null, 2);
 
@@ -143,7 +147,7 @@ export function ResultDetailPage({ output }: ResultDetailPageProps) {
                       </>
                     )}
                   </td>
-                  <td>{prediction.confidence_label}</td>
+                  <td>{confidenceLabel(prediction)}</td>
                   <td>{modelWarnings(prediction)}</td>
                 </tr>
               ))}

@@ -15,6 +15,31 @@ export type ResultApplicabilityDomain = {
   scaffold_match: boolean;
 };
 
+export type PredictionInterval = {
+  lower: number;
+  upper: number;
+  coverage: number;
+};
+
+export type PredictionIntervals = {
+  absorption_nm?: PredictionInterval;
+  emission_nm?: PredictionInterval;
+  quantum_yield?: PredictionInterval;
+};
+
+export type PredictionApplicabilityTarget = {
+  outside_applicability_domain: boolean;
+};
+
+export type PredictionApplicabilityDomain = {
+  outside_applicability_domain: boolean;
+  targets?: {
+    absorption?: PredictionApplicabilityTarget;
+    emission?: PredictionApplicabilityTarget;
+    quantum_yield?: PredictionApplicabilityTarget;
+  };
+};
+
 export type PredictionItem = {
   model_name: string;
   predicted_absorption_nm: number | null;
@@ -25,8 +50,11 @@ export type PredictionItem = {
   physically_valid_stokes?: boolean;
   nearest_training_similarity: number;
   nearest_training_smiles: string;
-  confidence_label: string;
+  confidence_label?: string;
   outside_applicability_domain: boolean;
+  prediction_intervals?: PredictionIntervals;
+  applicability_domain?: PredictionApplicabilityDomain;
+  brightness_class?: string;
   warnings: string[];
 };
 
@@ -232,6 +260,106 @@ function exactKeys(value: Record<string, unknown>, allowed: string[], path: stri
   }
 }
 
+function optionalNonEmptyString(value: unknown, path: string): string | undefined {
+  if (value === undefined) return undefined;
+  return nonEmptyString(value, path);
+}
+
+function finiteNumber(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new PredictionJobValidationError(`${path} must be a finite number`);
+  }
+  return value;
+}
+
+function parsePredictionInterval(value: unknown, path: string): PredictionInterval {
+  const interval = record(value, path);
+  exactKeys(interval, ["lower", "upper", "coverage"], path);
+  const lower = finiteNumber(interval.lower, `${path}.lower`);
+  const upper = finiteNumber(interval.upper, `${path}.upper`);
+  const coverage = finiteNumber(interval.coverage, `${path}.coverage`);
+  if (lower > upper) {
+    throw new PredictionJobValidationError(`${path}.lower must be less than or equal to ${path}.upper`);
+  }
+  if (coverage < 0 || coverage > 1) {
+    throw new PredictionJobValidationError(`${path}.coverage must be between 0 and 1`);
+  }
+  return { lower, upper, coverage };
+}
+
+function parsePredictionIntervals(value: unknown, path: string): PredictionIntervals | undefined {
+  if (value === undefined) return undefined;
+  const intervals = record(value, path);
+  exactKeys(intervals, ["absorption_nm", "emission_nm", "quantum_yield"], path);
+  return {
+    ...(intervals.absorption_nm === undefined ? {} : {
+      absorption_nm: parsePredictionInterval(intervals.absorption_nm, `${path}.absorption_nm`),
+    }),
+    ...(intervals.emission_nm === undefined ? {} : {
+      emission_nm: parsePredictionInterval(intervals.emission_nm, `${path}.emission_nm`),
+    }),
+    ...(intervals.quantum_yield === undefined ? {} : {
+      quantum_yield: parsePredictionInterval(intervals.quantum_yield, `${path}.quantum_yield`),
+    }),
+  };
+}
+
+function parseApplicabilityTarget(value: unknown, path: string): PredictionApplicabilityTarget {
+  const target = record(value, path);
+  exactKeys(target, ["outside_applicability_domain"], path);
+  if (typeof target.outside_applicability_domain !== "boolean") {
+    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+  }
+  return { outside_applicability_domain: target.outside_applicability_domain };
+}
+
+function parseApplicabilityDomain(value: unknown, path: string): PredictionApplicabilityDomain | undefined {
+  if (value === undefined) return undefined;
+  const domain = record(value, path);
+  exactKeys(domain, ["outside_applicability_domain", "targets"], path);
+  if (typeof domain.outside_applicability_domain !== "boolean") {
+    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+  }
+  const targets = domain.targets === undefined ? undefined : record(domain.targets, `${path}.targets`);
+  if (targets) {
+    exactKeys(targets, ["absorption", "emission", "quantum_yield"], `${path}.targets`);
+  }
+  return {
+    outside_applicability_domain: domain.outside_applicability_domain,
+    ...(targets === undefined ? {} : {
+      targets: {
+        ...(targets.absorption === undefined ? {} : {
+          absorption: parseApplicabilityTarget(targets.absorption, `${path}.targets.absorption`),
+        }),
+        ...(targets.emission === undefined ? {} : {
+          emission: parseApplicabilityTarget(targets.emission, `${path}.targets.emission`),
+        }),
+        ...(targets.quantum_yield === undefined ? {} : {
+          quantum_yield: parseApplicabilityTarget(targets.quantum_yield, `${path}.targets.quantum_yield`),
+        }),
+      },
+    }),
+  };
+}
+
+function resolveOutsideApplicabilityDomain(
+  flatValue: unknown,
+  nestedValue: PredictionApplicabilityDomain | undefined,
+  path: string,
+): boolean {
+  if (flatValue !== undefined && typeof flatValue !== "boolean") {
+    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+  }
+  if (flatValue !== undefined && nestedValue !== undefined && flatValue !== nestedValue.outside_applicability_domain) {
+    throw new PredictionJobValidationError(
+      `${path}.outside_applicability_domain conflicts with ${path}.applicability_domain.outside_applicability_domain`,
+    );
+  }
+  if (nestedValue !== undefined) return nestedValue.outside_applicability_domain;
+  if (flatValue !== undefined) return flatValue;
+  throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+}
+
 function parsePredictionItem(value: unknown, path: string): PredictionItem {
   const item = record(value, path);
   exactKeys(
@@ -248,6 +376,9 @@ function parsePredictionItem(value: unknown, path: string): PredictionItem {
       "nearest_training_smiles",
       "confidence_label",
       "outside_applicability_domain",
+      "prediction_intervals",
+      "applicability_domain",
+      "brightness_class",
       "warnings",
     ],
     path,
@@ -276,15 +407,14 @@ function parsePredictionItem(value: unknown, path: string): PredictionItem {
   ) {
     throw new PredictionJobValidationError(`${path}.nearest_training_similarity must be between 0 and 1`);
   }
-  if (typeof item.outside_applicability_domain !== "boolean") {
-    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
-  }
   if (item.physically_valid_stokes !== undefined && typeof item.physically_valid_stokes !== "boolean") {
     throw new PredictionJobValidationError(`${path}.physically_valid_stokes must be a boolean`);
   }
   if (!Array.isArray(item.warnings)) {
     throw new PredictionJobValidationError(`${path}.warnings must be an array`);
   }
+  const applicabilityDomain = parseApplicabilityDomain(item.applicability_domain, `${path}.applicability_domain`);
+  const predictionIntervals = parsePredictionIntervals(item.prediction_intervals, `${path}.prediction_intervals`);
   return {
     model_name: nonEmptyString(item.model_name, `${path}.model_name`),
     predicted_absorption_nm: nullableFiniteNumber("predicted_absorption_nm"),
@@ -301,8 +431,19 @@ function parsePredictionItem(value: unknown, path: string): PredictionItem {
     }),
     nearest_training_similarity: item.nearest_training_similarity,
     nearest_training_smiles: nonEmptyString(item.nearest_training_smiles, `${path}.nearest_training_smiles`),
-    confidence_label: nonEmptyString(item.confidence_label, `${path}.confidence_label`),
-    outside_applicability_domain: item.outside_applicability_domain,
+    ...(optionalNonEmptyString(item.confidence_label, `${path}.confidence_label`) === undefined ? {} : {
+      confidence_label: optionalNonEmptyString(item.confidence_label, `${path}.confidence_label`),
+    }),
+    outside_applicability_domain: resolveOutsideApplicabilityDomain(
+      item.outside_applicability_domain,
+      applicabilityDomain,
+      path,
+    ),
+    ...(predictionIntervals === undefined ? {} : { prediction_intervals: predictionIntervals }),
+    ...(applicabilityDomain === undefined ? {} : { applicability_domain: applicabilityDomain }),
+    ...(optionalNonEmptyString(item.brightness_class, `${path}.brightness_class`) === undefined ? {} : {
+      brightness_class: optionalNonEmptyString(item.brightness_class, `${path}.brightness_class`),
+    }),
     warnings: item.warnings.map((warning, index) =>
       nonEmptyString(warning, `${path}.warnings[${index}]`),
     ),

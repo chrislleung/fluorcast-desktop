@@ -10,6 +10,40 @@ import {
 
 const localJobId = "2e80b1b9-f65f-426a-a289-1466ab7f0abd";
 
+function basePrediction() {
+  return {
+    model_name: "hybrid",
+    predicted_absorption_nm: 403.2,
+    predicted_emission_nm: 515.6,
+    predicted_quantum_yield: 0.62,
+    predicted_stokes_shift_nm: 112.4,
+    "predicted_stokes_shift_cm^-1": 5418.25,
+    physically_valid_stokes: true,
+    nearest_training_similarity: 0.84,
+    nearest_training_smiles: "CCO",
+    outside_applicability_domain: false,
+    warnings: [],
+  };
+}
+
+function remoteOutputWith(prediction: Record<string, unknown>) {
+  return {
+    status: "success",
+    job_id: localJobId,
+    canonical_molecule_smiles: "CCO",
+    canonical_solvent_smiles: "O",
+    predictions: [prediction],
+    warnings: [],
+  };
+}
+
+function adaptPrediction(prediction: Record<string, unknown>) {
+  return adaptFlatRemotePredictionOutput(remoteOutputWith(prediction), {
+    localJobId,
+    completion: { importTime: "2026-07-22T12:00:00.000Z" },
+  }).output.predictions[0];
+}
+
 describe("remote prediction output adapter", () => {
   it("imports the actual flat remote success payload without an output wrapper or remote completed_at", () => {
     const { output, diagnostics } = adaptFlatRemotePredictionOutput(flatRemoteOutput, {
@@ -74,6 +108,161 @@ describe("remote prediction output adapter", () => {
     expect(extraTrees["predicted_stokes_shift_cm^-1"]).toBe(21652.845944993347);
     expect(mlp.predicted_stokes_shift_nm).toBeUndefined();
     expect(validatePredictionJobOutput(output)).toEqual(output);
+  });
+
+  it("imports Hybrid output without confidence_label and preserves Hybrid metadata", () => {
+    const prediction = adaptPrediction({
+      ...basePrediction(),
+      confidence_label: undefined,
+      outside_applicability_domain: undefined,
+      prediction_intervals: {
+        absorption_nm: { lower: 390.1, upper: 420.2, coverage: 0.9 },
+        quantum_yield: { lower: -0.23344108221592028, upper: 0.91, coverage: 0.9 },
+      },
+      applicability_domain: {
+        outside_applicability_domain: false,
+        targets: {
+          absorption: { outside_applicability_domain: false },
+          emission: { outside_applicability_domain: false },
+          quantum_yield: { outside_applicability_domain: false },
+        },
+      },
+      brightness_class: "dim",
+    });
+
+    expect(prediction.model_name).toBe("hybrid");
+    expect(prediction.predicted_absorption_nm).toBe(403.2);
+    expect(prediction.confidence_label).toBeUndefined();
+    expect(prediction.outside_applicability_domain).toBe(false);
+    expect(prediction.applicability_domain?.outside_applicability_domain).toBe(false);
+    expect(prediction.prediction_intervals?.quantum_yield?.lower).toBe(-0.23344108221592028);
+    expect(prediction.brightness_class).toBe("dim");
+  });
+
+  it("preserves valid confidence_label when supplied", () => {
+    const prediction = adaptPrediction({ ...basePrediction(), confidence_label: "low-medium" });
+
+    expect(prediction.confidence_label).toBe("low-medium");
+  });
+
+  it("rejects invalid confidence_label values", () => {
+    expect(() => adaptPrediction({ ...basePrediction(), confidence_label: "" })).toThrow(/confidence_label/);
+    expect(() => adaptPrediction({ ...basePrediction(), confidence_label: "   " })).toThrow(/confidence_label/);
+    expect(() => adaptPrediction({ ...basePrediction(), confidence_label: 12 })).toThrow(/confidence_label/);
+  });
+
+  it("maps flat, nested, and equal applicability-domain values", () => {
+    expect(adaptPrediction({ ...basePrediction(), outside_applicability_domain: true }).outside_applicability_domain)
+      .toBe(true);
+    expect(adaptPrediction({
+      ...basePrediction(),
+      outside_applicability_domain: undefined,
+      applicability_domain: { outside_applicability_domain: true },
+    }).outside_applicability_domain).toBe(true);
+    expect(adaptPrediction({
+      ...basePrediction(),
+      outside_applicability_domain: true,
+      applicability_domain: { outside_applicability_domain: true },
+    }).outside_applicability_domain).toBe(true);
+  });
+
+  it("rejects malformed applicability-domain values", () => {
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      outside_applicability_domain: false,
+      applicability_domain: { outside_applicability_domain: true },
+    })).toThrow(/conflicts/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      outside_applicability_domain: undefined,
+      applicability_domain: { outside_applicability_domain: "false" },
+    })).toThrow(/applicability_domain\.outside_applicability_domain/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      applicability_domain: {
+        outside_applicability_domain: false,
+        targets: { absorption: { outside_applicability_domain: "false" } },
+      },
+    })).toThrow(/targets\.absorption\.outside_applicability_domain/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      applicability_domain: { outside_applicability_domain: false, extra: false },
+    })).toThrow(/applicability_domain\.extra is not supported/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      applicability_domain: {
+        outside_applicability_domain: false,
+        targets: { lifetime: { outside_applicability_domain: false } },
+      },
+    })).toThrow(/targets\.lifetime is not supported/);
+  });
+
+  it("validates prediction intervals strictly", () => {
+    expect(adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: {
+        emission_nm: { lower: 500, upper: 530, coverage: 0.8 },
+      },
+    }).prediction_intervals?.emission_nm).toEqual({ lower: 500, upper: 530, coverage: 0.8 });
+    expect(adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: {
+        quantum_yield: { lower: -0.4, upper: 1.2, coverage: 0.95 },
+      },
+    }).prediction_intervals?.quantum_yield).toEqual({ lower: -0.4, upper: 1.2, coverage: 0.95 });
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: { absorption_nm: { lower: 2, upper: 1, coverage: 0.9 } },
+    })).toThrow(/lower/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: { absorption_nm: { lower: 1, upper: 2, coverage: -0.1 } },
+    })).toThrow(/coverage/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: { absorption_nm: { lower: 1, upper: 2, coverage: 1.1 } },
+    })).toThrow(/coverage/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: { absorption_nm: { lower: Number.NaN, upper: 2, coverage: 0.9 } },
+    })).toThrow(/lower/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: { absorption_nm: { lower: 1, upper: Number.POSITIVE_INFINITY, coverage: 0.9 } },
+    })).toThrow(/upper/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: { absorption_nm: { lower: 1, coverage: 0.9 } },
+    })).toThrow(/upper/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: { absorption_nm: { lower: 1, upper: 2, coverage: "0.9" } },
+    })).toThrow(/coverage/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: { lifetime: { lower: 1, upper: 2, coverage: 0.9 } },
+    })).toThrow(/prediction_intervals\.lifetime is not supported/);
+    expect(() => adaptPrediction({
+      ...basePrediction(),
+      prediction_intervals: { absorption_nm: { lower: 1, upper: 2, coverage: 0.9, median: 1.5 } },
+    })).toThrow(/absorption_nm\.median is not supported/);
+  });
+
+  it("validates brightness_class without using it as confidence", () => {
+    expect(adaptPrediction({ ...basePrediction(), confidence_label: undefined, brightness_class: "bright" }))
+      .toMatchObject({ brightness_class: "bright" });
+    expect(adaptPrediction({ ...basePrediction(), brightness_class: undefined }).brightness_class).toBeUndefined();
+    expect(() => adaptPrediction({ ...basePrediction(), brightness_class: "" })).toThrow(/brightness_class/);
+    expect(() => adaptPrediction({ ...basePrediction(), brightness_class: "   " })).toThrow(/brightness_class/);
+    expect(() => adaptPrediction({ ...basePrediction(), brightness_class: false })).toThrow(/brightness_class/);
+  });
+
+  it("continues rejecting unrelated prediction and top-level fields", () => {
+    expect(() => adaptPrediction({ ...basePrediction(), extra: "nope" })).toThrow(/extra is not supported/);
+    expect(() => adaptFlatRemotePredictionOutput({ ...remoteOutputWith(basePrediction()), extra: "nope" }, {
+      localJobId,
+      completion: { importTime: "2026-07-22T12:00:00.000Z" },
+    })).toThrow(/remote_output\.extra is not supported/);
   });
 
   it("reports valid JSON separately from schema adaptation failures", () => {

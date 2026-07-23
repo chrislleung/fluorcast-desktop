@@ -2,6 +2,9 @@ import {
   PredictionJobValidationError,
   validatePredictionJobOutput,
   type PredictionItem,
+  type PredictionApplicabilityDomain,
+  type PredictionInterval,
+  type PredictionIntervals,
   type PredictionJobFailureOutput,
   type PredictionJobOutput,
   type PredictionJobSuccessOutput,
@@ -113,6 +116,18 @@ function optionalFiniteNumber(value: unknown, path: string): number | undefined 
   return value;
 }
 
+function optionalNonEmptyString(value: unknown, path: string): string | undefined {
+  if (value === undefined) return undefined;
+  return nonEmptyString(value, path);
+}
+
+function finiteNumber(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new PredictionJobValidationError(`${path} must be a finite number`);
+  }
+  return value;
+}
+
 function parseWarnings(value: unknown, path: string): string[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) {
@@ -152,6 +167,94 @@ function parseStructuredRemoteFailure(value: unknown): StructuredRemoteFailure {
   };
 }
 
+function parsePredictionInterval(value: unknown, path: string): PredictionInterval {
+  const interval = record(value, path);
+  exactKeys(interval, ["lower", "upper", "coverage"], path);
+  const lower = finiteNumber(interval.lower, `${path}.lower`);
+  const upper = finiteNumber(interval.upper, `${path}.upper`);
+  const coverage = finiteNumber(interval.coverage, `${path}.coverage`);
+  if (lower > upper) {
+    throw new PredictionJobValidationError(`${path}.lower must be less than or equal to ${path}.upper`);
+  }
+  if (coverage < 0 || coverage > 1) {
+    throw new PredictionJobValidationError(`${path}.coverage must be between 0 and 1`);
+  }
+  return { lower, upper, coverage };
+}
+
+function parsePredictionIntervals(value: unknown, path: string): PredictionIntervals | undefined {
+  if (value === undefined) return undefined;
+  const intervals = record(value, path);
+  exactKeys(intervals, ["absorption_nm", "emission_nm", "quantum_yield"], path);
+  return {
+    ...(intervals.absorption_nm === undefined ? {} : {
+      absorption_nm: parsePredictionInterval(intervals.absorption_nm, `${path}.absorption_nm`),
+    }),
+    ...(intervals.emission_nm === undefined ? {} : {
+      emission_nm: parsePredictionInterval(intervals.emission_nm, `${path}.emission_nm`),
+    }),
+    ...(intervals.quantum_yield === undefined ? {} : {
+      quantum_yield: parsePredictionInterval(intervals.quantum_yield, `${path}.quantum_yield`),
+    }),
+  };
+}
+
+function parseApplicabilityTarget(value: unknown, path: string): { outside_applicability_domain: boolean } {
+  const target = record(value, path);
+  exactKeys(target, ["outside_applicability_domain"], path);
+  if (typeof target.outside_applicability_domain !== "boolean") {
+    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+  }
+  return { outside_applicability_domain: target.outside_applicability_domain };
+}
+
+function parseApplicabilityDomain(value: unknown, path: string): PredictionApplicabilityDomain | undefined {
+  if (value === undefined) return undefined;
+  const domain = record(value, path);
+  exactKeys(domain, ["outside_applicability_domain", "targets"], path);
+  if (typeof domain.outside_applicability_domain !== "boolean") {
+    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+  }
+  const targets = domain.targets === undefined ? undefined : record(domain.targets, `${path}.targets`);
+  if (targets) {
+    exactKeys(targets, ["absorption", "emission", "quantum_yield"], `${path}.targets`);
+  }
+  return {
+    outside_applicability_domain: domain.outside_applicability_domain,
+    ...(targets === undefined ? {} : {
+      targets: {
+        ...(targets.absorption === undefined ? {} : {
+          absorption: parseApplicabilityTarget(targets.absorption, `${path}.targets.absorption`),
+        }),
+        ...(targets.emission === undefined ? {} : {
+          emission: parseApplicabilityTarget(targets.emission, `${path}.targets.emission`),
+        }),
+        ...(targets.quantum_yield === undefined ? {} : {
+          quantum_yield: parseApplicabilityTarget(targets.quantum_yield, `${path}.targets.quantum_yield`),
+        }),
+      },
+    }),
+  };
+}
+
+function resolveOutsideApplicabilityDomain(
+  flatValue: unknown,
+  nestedValue: PredictionApplicabilityDomain | undefined,
+  path: string,
+): boolean {
+  if (flatValue !== undefined && typeof flatValue !== "boolean") {
+    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+  }
+  if (flatValue !== undefined && nestedValue !== undefined && flatValue !== nestedValue.outside_applicability_domain) {
+    throw new PredictionJobValidationError(
+      `${path}.outside_applicability_domain conflicts with ${path}.applicability_domain.outside_applicability_domain`,
+    );
+  }
+  if (nestedValue !== undefined) return nestedValue.outside_applicability_domain;
+  if (flatValue !== undefined) return flatValue;
+  throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+}
+
 function parseRemotePrediction(value: unknown, path: string): PredictionItem {
   const prediction = record(value, path);
   exactKeys(
@@ -165,6 +268,9 @@ function parseRemotePrediction(value: unknown, path: string): PredictionItem {
       "nearest_training_smiles",
       "confidence_label",
       "outside_applicability_domain",
+      "prediction_intervals",
+      "applicability_domain",
+      "brightness_class",
       "warnings",
       "predicted_stokes_shift_nm",
       "predicted_stokes_shift_cm^-1",
@@ -181,9 +287,6 @@ function parseRemotePrediction(value: unknown, path: string): PredictionItem {
   ) {
     throw new PredictionJobValidationError(`${path}.nearest_training_similarity must be between 0 and 1`);
   }
-  if (typeof prediction.outside_applicability_domain !== "boolean") {
-    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
-  }
   if (
     prediction.physically_valid_stokes !== undefined &&
     typeof prediction.physically_valid_stokes !== "boolean"
@@ -196,6 +299,8 @@ function parseRemotePrediction(value: unknown, path: string): PredictionItem {
     prediction["predicted_stokes_shift_cm^-1"],
     `${path}.predicted_stokes_shift_cm^-1`,
   );
+  const applicabilityDomain = parseApplicabilityDomain(prediction.applicability_domain, `${path}.applicability_domain`);
+  const predictionIntervals = parsePredictionIntervals(prediction.prediction_intervals, `${path}.prediction_intervals`);
 
   return {
     model_name: nonEmptyString(prediction.model_name, `${path}.model_name`),
@@ -204,8 +309,19 @@ function parseRemotePrediction(value: unknown, path: string): PredictionItem {
     predicted_quantum_yield: finiteNumberOrNull(prediction.predicted_quantum_yield, `${path}.predicted_quantum_yield`),
     nearest_training_similarity: nearestTrainingSimilarity,
     nearest_training_smiles: nonEmptyString(prediction.nearest_training_smiles, `${path}.nearest_training_smiles`),
-    confidence_label: nonEmptyString(prediction.confidence_label, `${path}.confidence_label`),
-    outside_applicability_domain: prediction.outside_applicability_domain,
+    ...(optionalNonEmptyString(prediction.confidence_label, `${path}.confidence_label`) === undefined ? {} : {
+      confidence_label: optionalNonEmptyString(prediction.confidence_label, `${path}.confidence_label`),
+    }),
+    outside_applicability_domain: resolveOutsideApplicabilityDomain(
+      prediction.outside_applicability_domain,
+      applicabilityDomain,
+      path,
+    ),
+    ...(predictionIntervals === undefined ? {} : { prediction_intervals: predictionIntervals }),
+    ...(applicabilityDomain === undefined ? {} : { applicability_domain: applicabilityDomain }),
+    ...(optionalNonEmptyString(prediction.brightness_class, `${path}.brightness_class`) === undefined ? {} : {
+      brightness_class: optionalNonEmptyString(prediction.brightness_class, `${path}.brightness_class`),
+    }),
     warnings: parseWarnings(prediction.warnings, `${path}.warnings`),
     ...(stokesShiftNm === undefined ? {} : { predicted_stokes_shift_nm: stokesShiftNm }),
     ...(stokesShiftCm === undefined ? {} : { "predicted_stokes_shift_cm^-1": stokesShiftCm }),

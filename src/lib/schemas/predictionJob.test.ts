@@ -23,6 +23,39 @@ describe("prediction job contract", () => {
     expect(validatePredictionJobOutput(validSuccessOutput)).toEqual(validSuccessOutput);
   });
 
+  it("accepts canonical Hybrid prediction metadata with missing confidence_label", () => {
+    const output = validatePredictionJobOutput({
+      ...validSuccessOutput,
+      predictions: [{
+        ...validSuccessOutput.predictions[0],
+        model_name: "hybrid",
+        confidence_label: undefined,
+        outside_applicability_domain: undefined,
+        prediction_intervals: {
+          quantum_yield: {
+            lower: -0.23344108221592028,
+            upper: 0.88,
+            coverage: 0.9,
+          },
+        },
+        applicability_domain: {
+          outside_applicability_domain: false,
+          targets: {
+            quantum_yield: { outside_applicability_domain: false },
+          },
+        },
+        brightness_class: "dim",
+      }],
+    });
+
+    expect(output.status).toBe("succeeded");
+    if (output.status !== "succeeded") return;
+    expect(output.predictions[0].confidence_label).toBeUndefined();
+    expect(output.predictions[0].outside_applicability_domain).toBe(false);
+    expect(output.predictions[0].prediction_intervals?.quantum_yield?.lower).toBe(-0.23344108221592028);
+    expect(output.predictions[0].brightness_class).toBe("dim");
+  });
+
   it("accepts the valid failure output fixture", () => {
     expect(validatePredictionJobOutput(validFailureOutput)).toEqual(validFailureOutput);
   });
@@ -39,6 +72,17 @@ describe("prediction job contract", () => {
       predictions: [{ ...validSuccessOutput.predictions[0], predicted_emission_nm: "462.7" }],
     };
     expect(() => validatePredictionJobOutput(invalidOutput)).toThrow(/predicted_emission_nm/);
+  });
+
+  it("rejects conflicting canonical flat and nested applicability-domain values", () => {
+    expect(() => validatePredictionJobOutput({
+      ...validSuccessOutput,
+      predictions: [{
+        ...validSuccessOutput.predictions[0],
+        outside_applicability_domain: true,
+        applicability_domain: { outside_applicability_domain: false },
+      }],
+    })).toThrow(/conflicts/);
   });
 
   it("creates a valid local-user request", () => {

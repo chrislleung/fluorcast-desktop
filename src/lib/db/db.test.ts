@@ -51,6 +51,38 @@ describe("database pure helpers", () => {
     });
   });
 
+  it("round trips Hybrid metadata and missing confidence through persisted result JSON", () => {
+    const output = {
+      ...validOutput,
+      job_id: "job-1",
+      predictions: [{
+        ...validOutput.predictions[0],
+        model_name: "hybrid",
+        confidence_label: undefined,
+        outside_applicability_domain: false,
+        prediction_intervals: {
+          quantum_yield: { lower: -0.23344108221592028, upper: 0.9, coverage: 0.9 },
+        },
+        applicability_domain: {
+          outside_applicability_domain: false,
+          targets: {
+            absorption: { outside_applicability_domain: false },
+          },
+        },
+        brightness_class: "dim",
+      }],
+    } as PredictionJobOutput;
+
+    const parsed = parsePredictionResult(serializePredictionResult(output));
+
+    expect(parsed.status).toBe("succeeded");
+    if (parsed.status !== "succeeded") return;
+    expect(parsed.predictions[0].confidence_label).toBeUndefined();
+    expect(parsed.predictions[0].prediction_intervals?.quantum_yield?.lower).toBe(-0.23344108221592028);
+    expect(parsed.predictions[0].applicability_domain?.targets?.absorption?.outside_applicability_domain).toBe(false);
+    expect(parsed.predictions[0].brightness_class).toBe("dim");
+  });
+
   it("returns a persisted job with a parsed and validated result", async () => {
     const output = { ...validOutput, job_id: "job-1" } as PredictionJobOutput;
     const repository = createDatabaseRepository(async () => ({
