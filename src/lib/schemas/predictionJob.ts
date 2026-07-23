@@ -7,12 +7,6 @@ export const predictionJobStatuses = [
 
 export type PredictionJobStatus = (typeof predictionJobStatuses)[number];
 
-export type ApplicabilityDomain = {
-  in_domain: boolean;
-  score: number;
-  message?: string;
-};
-
 export type ResultApplicabilityDomain = {
   nearest_training_similarity: number;
   outside_applicability_domain: boolean;
@@ -21,12 +15,47 @@ export type ResultApplicabilityDomain = {
   scaffold_match: boolean;
 };
 
+export type PredictionInterval = {
+  lower: number;
+  upper: number;
+  coverage: number;
+};
+
+export type PredictionIntervals = {
+  absorption_nm?: PredictionInterval;
+  emission_nm?: PredictionInterval;
+  quantum_yield?: PredictionInterval;
+};
+
+export type PredictionApplicabilityTarget = {
+  outside_applicability_domain: boolean;
+};
+
+export type PredictionApplicabilityDomain = {
+  outside_applicability_domain: boolean;
+  targets?: {
+    absorption?: PredictionApplicabilityTarget;
+    emission?: PredictionApplicabilityTarget;
+    quantum_yield?: PredictionApplicabilityTarget;
+  };
+};
+
 export type PredictionItem = {
-  property: string;
-  value: number;
-  unit: string;
-  model: string;
-  applicability_domain: ApplicabilityDomain;
+  model_name: string;
+  predicted_absorption_nm: number | null;
+  predicted_emission_nm: number | null;
+  predicted_quantum_yield: number | null;
+  predicted_stokes_shift_nm?: number;
+  "predicted_stokes_shift_cm^-1"?: number;
+  physically_valid_stokes?: boolean;
+  nearest_training_similarity: number;
+  nearest_training_smiles: string;
+  confidence_label?: string;
+  outside_applicability_domain: boolean;
+  prediction_intervals?: PredictionIntervals;
+  applicability_domain?: PredictionApplicabilityDomain;
+  brightness_class?: string;
+  warnings: string[];
 };
 
 export type PredictionJobInput = {
@@ -34,14 +63,47 @@ export type PredictionJobInput = {
   user_id: string;
   molecule_smiles: string;
   solvent_smiles: string;
-  model_choice: string;
+  model_choice: DesktopModelChoice;
   requested_at: string;
+};
+
+export const desktopModelChoices = [
+  "all",
+  "extratrees",
+  "gbdt",
+  "graph",
+  "histgb",
+  "rf",
+  "hybrid_full",
+] as const;
+
+export type DesktopModelChoice = (typeof desktopModelChoices)[number];
+
+export function isDesktopModelChoice(value: string): value is DesktopModelChoice {
+  return desktopModelChoices.includes(value as DesktopModelChoice);
+}
+
+export const remoteModelChoices = [
+  "all",
+  "extratrees",
+  "gbdt",
+  "graph_model_later",
+  "histgb",
+  "hybrid",
+  "rf",
+] as const;
+
+export type RemoteModelChoice = (typeof remoteModelChoices)[number];
+
+export type RemotePredictionJobInput = Omit<PredictionJobInput, "model_choice"> & {
+  model_choice: RemoteModelChoice;
 };
 
 type PredictionJobOutputBase = {
   job_id: string;
   status: PredictionJobStatus;
   completed_at: string;
+  completed_at_source?: "slurm" | "sacct" | "remote_file_mtime" | "import_time";
 };
 
 export type PredictionJobSuccessOutput = PredictionJobOutputBase & {
@@ -49,7 +111,6 @@ export type PredictionJobSuccessOutput = PredictionJobOutputBase & {
   canonical_molecule_smiles: string;
   canonical_solvent_smiles: string;
   predictions: PredictionItem[];
-  applicability_domain: ResultApplicabilityDomain;
   warnings: string[];
   error?: never;
 };
@@ -63,6 +124,24 @@ export type PredictionJobFailureOutput = PredictionJobOutputBase & {
 export type PredictionJobOutput =
   | PredictionJobSuccessOutput
   | PredictionJobFailureOutput;
+
+export type DuplicateCheckInput = {
+  job_id: string;
+  user_id: string;
+  molecule_smiles: string;
+  solvent_smiles: string;
+  requested_at: string;
+};
+
+export type DuplicateCheckOutput = {
+  exact_molecule_match: boolean;
+  exact_solvent_pair_match: boolean;
+  scaffold_match: boolean;
+  nearest_training_similarity: number;
+  nearest_training_molecule_smiles: string;
+  warnings: string[];
+  error?: string;
+};
 
 export class PredictionJobValidationError extends Error {
   constructor(message: string) {
@@ -119,6 +198,61 @@ function isoDate(value: unknown, path: string): string {
   return date;
 }
 
+function desktopModelChoice(value: unknown, path: string): DesktopModelChoice {
+  const choice = nonEmptyString(value, path);
+  if (!isDesktopModelChoice(choice)) {
+    throw new PredictionJobValidationError(
+      `${path} must be one of: ${desktopModelChoices.join(", ")}`,
+    );
+  }
+  return choice as DesktopModelChoice;
+}
+
+function remoteModelChoice(value: unknown, path: string): RemoteModelChoice {
+  const choice = nonEmptyString(value, path);
+  if (!remoteModelChoices.includes(choice as RemoteModelChoice)) {
+    throw new PredictionJobValidationError(
+      `${path} must serialize to one of: ${remoteModelChoices.join(", ")}`,
+    );
+  }
+  return choice as RemoteModelChoice;
+}
+
+export function toRemoteModelChoice(choice: DesktopModelChoice): RemoteModelChoice {
+  switch (choice) {
+    case "hybrid_full":
+      return "hybrid";
+    case "graph":
+      return "graph_model_later";
+    default:
+      return remoteModelChoice(choice, "input.model_choice");
+  }
+}
+
+export function toRemotePredictionJobInput(input: PredictionJobInput): RemotePredictionJobInput {
+  return {
+    ...input,
+    model_choice: toRemoteModelChoice(input.model_choice),
+  };
+}
+
+export function validateRemotePredictionJobInput(value: unknown): RemotePredictionJobInput {
+  const input = record(value, "input");
+  exactKeys(
+    input,
+    ["job_id", "user_id", "molecule_smiles", "solvent_smiles", "model_choice", "requested_at"],
+    "input",
+  );
+  return {
+    job_id: nonEmptyString(input.job_id, "input.job_id"),
+    user_id: nonEmptyString(input.user_id, "input.user_id"),
+    molecule_smiles: nonEmptyString(input.molecule_smiles, "input.molecule_smiles"),
+    solvent_smiles: nonEmptyString(input.solvent_smiles, "input.solvent_smiles"),
+    model_choice: remoteModelChoice(input.model_choice, "input.model_choice"),
+    requested_at: isoDate(input.requested_at, "input.requested_at"),
+  };
+}
+
 function exactKeys(value: Record<string, unknown>, allowed: string[], path: string) {
   const extra = Object.keys(value).find((key) => !allowed.includes(key));
   if (extra) {
@@ -126,83 +260,192 @@ function exactKeys(value: Record<string, unknown>, allowed: string[], path: stri
   }
 }
 
-function parseApplicabilityDomain(value: unknown, path: string): ApplicabilityDomain {
-  const item = record(value, path);
-  exactKeys(item, ["in_domain", "score", "message"], path);
-  if (typeof item.in_domain !== "boolean") {
-    throw new PredictionJobValidationError(`${path}.in_domain must be a boolean`);
+function optionalNonEmptyString(value: unknown, path: string): string | undefined {
+  if (value === undefined) return undefined;
+  return nonEmptyString(value, path);
+}
+
+function finiteNumber(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new PredictionJobValidationError(`${path} must be a finite number`);
   }
-  if (typeof item.score !== "number" || !Number.isFinite(item.score) || item.score < 0 || item.score > 1) {
-    throw new PredictionJobValidationError(`${path}.score must be between 0 and 1`);
+  return value;
+}
+
+function parsePredictionInterval(value: unknown, path: string): PredictionInterval {
+  const interval = record(value, path);
+  exactKeys(interval, ["lower", "upper", "coverage"], path);
+  const lower = finiteNumber(interval.lower, `${path}.lower`);
+  const upper = finiteNumber(interval.upper, `${path}.upper`);
+  const coverage = finiteNumber(interval.coverage, `${path}.coverage`);
+  if (lower > upper) {
+    throw new PredictionJobValidationError(`${path}.lower must be less than or equal to ${path}.upper`);
   }
+  if (coverage < 0 || coverage > 1) {
+    throw new PredictionJobValidationError(`${path}.coverage must be between 0 and 1`);
+  }
+  return { lower, upper, coverage };
+}
+
+function parsePredictionIntervals(value: unknown, path: string): PredictionIntervals | undefined {
+  if (value === undefined) return undefined;
+  const intervals = record(value, path);
+  exactKeys(intervals, ["absorption_nm", "emission_nm", "quantum_yield"], path);
   return {
-    in_domain: item.in_domain,
-    score: item.score,
-    ...(item.message === undefined
-      ? {}
-      : { message: nonEmptyString(item.message, `${path}.message`) }),
+    ...(intervals.absorption_nm === undefined ? {} : {
+      absorption_nm: parsePredictionInterval(intervals.absorption_nm, `${path}.absorption_nm`),
+    }),
+    ...(intervals.emission_nm === undefined ? {} : {
+      emission_nm: parsePredictionInterval(intervals.emission_nm, `${path}.emission_nm`),
+    }),
+    ...(intervals.quantum_yield === undefined ? {} : {
+      quantum_yield: parsePredictionInterval(intervals.quantum_yield, `${path}.quantum_yield`),
+    }),
   };
 }
 
-function parseResultApplicabilityDomain(
-  value: unknown,
+function parseApplicabilityTarget(value: unknown, path: string): PredictionApplicabilityTarget {
+  const target = record(value, path);
+  exactKeys(target, ["outside_applicability_domain"], path);
+  if (typeof target.outside_applicability_domain !== "boolean") {
+    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+  }
+  return { outside_applicability_domain: target.outside_applicability_domain };
+}
+
+function parseApplicabilityDomain(value: unknown, path: string): PredictionApplicabilityDomain | undefined {
+  if (value === undefined) return undefined;
+  const domain = record(value, path);
+  exactKeys(domain, ["outside_applicability_domain", "targets"], path);
+  if (typeof domain.outside_applicability_domain !== "boolean") {
+    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+  }
+  const targets = domain.targets === undefined ? undefined : record(domain.targets, `${path}.targets`);
+  if (targets) {
+    exactKeys(targets, ["absorption", "emission", "quantum_yield"], `${path}.targets`);
+  }
+  return {
+    outside_applicability_domain: domain.outside_applicability_domain,
+    ...(targets === undefined ? {} : {
+      targets: {
+        ...(targets.absorption === undefined ? {} : {
+          absorption: parseApplicabilityTarget(targets.absorption, `${path}.targets.absorption`),
+        }),
+        ...(targets.emission === undefined ? {} : {
+          emission: parseApplicabilityTarget(targets.emission, `${path}.targets.emission`),
+        }),
+        ...(targets.quantum_yield === undefined ? {} : {
+          quantum_yield: parseApplicabilityTarget(targets.quantum_yield, `${path}.targets.quantum_yield`),
+        }),
+      },
+    }),
+  };
+}
+
+function resolveOutsideApplicabilityDomain(
+  flatValue: unknown,
+  nestedValue: PredictionApplicabilityDomain | undefined,
   path: string,
-): ResultApplicabilityDomain {
+): boolean {
+  if (flatValue !== undefined && typeof flatValue !== "boolean") {
+    throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+  }
+  if (flatValue !== undefined && nestedValue !== undefined && flatValue !== nestedValue.outside_applicability_domain) {
+    throw new PredictionJobValidationError(
+      `${path}.outside_applicability_domain conflicts with ${path}.applicability_domain.outside_applicability_domain`,
+    );
+  }
+  if (nestedValue !== undefined) return nestedValue.outside_applicability_domain;
+  if (flatValue !== undefined) return flatValue;
+  throw new PredictionJobValidationError(`${path}.outside_applicability_domain must be a boolean`);
+}
+
+function parsePredictionItem(value: unknown, path: string): PredictionItem {
   const item = record(value, path);
   exactKeys(
     item,
     [
+      "model_name",
+      "predicted_absorption_nm",
+      "predicted_emission_nm",
+      "predicted_quantum_yield",
+      "predicted_stokes_shift_nm",
+      "predicted_stokes_shift_cm^-1",
+      "physically_valid_stokes",
       "nearest_training_similarity",
+      "nearest_training_smiles",
+      "confidence_label",
       "outside_applicability_domain",
-      "exact_molecule_match",
-      "exact_solvent_pair_match",
-      "scaffold_match",
+      "prediction_intervals",
+      "applicability_domain",
+      "brightness_class",
+      "warnings",
     ],
     path,
   );
+  function nullableFiniteNumber(key: string): number | null {
+    const itemValue = item[key];
+    if (itemValue === null) return null;
+    if (typeof itemValue !== "number" || !Number.isFinite(itemValue)) {
+      throw new PredictionJobValidationError(`${path}.${key} must be a finite number or null`);
+    }
+    return itemValue;
+  }
+  function optionalFiniteNumber(key: string): number | undefined {
+    const itemValue = item[key];
+    if (itemValue === undefined) return undefined;
+    if (typeof itemValue !== "number" || !Number.isFinite(itemValue)) {
+      throw new PredictionJobValidationError(`${path}.${key} must be a finite number`);
+    }
+    return itemValue;
+  }
   if (
     typeof item.nearest_training_similarity !== "number" ||
     !Number.isFinite(item.nearest_training_similarity) ||
     item.nearest_training_similarity < 0 ||
     item.nearest_training_similarity > 1
   ) {
-    throw new PredictionJobValidationError(
-      `${path}.nearest_training_similarity must be between 0 and 1`,
-    );
+    throw new PredictionJobValidationError(`${path}.nearest_training_similarity must be between 0 and 1`);
   }
-  for (const key of [
-    "outside_applicability_domain",
-    "exact_molecule_match",
-    "exact_solvent_pair_match",
-    "scaffold_match",
-  ]) {
-    if (typeof item[key] !== "boolean") {
-      throw new PredictionJobValidationError(`${path}.${key} must be a boolean`);
-    }
+  if (item.physically_valid_stokes !== undefined && typeof item.physically_valid_stokes !== "boolean") {
+    throw new PredictionJobValidationError(`${path}.physically_valid_stokes must be a boolean`);
   }
+  if (!Array.isArray(item.warnings)) {
+    throw new PredictionJobValidationError(`${path}.warnings must be an array`);
+  }
+  const applicabilityDomain = parseApplicabilityDomain(item.applicability_domain, `${path}.applicability_domain`);
+  const predictionIntervals = parsePredictionIntervals(item.prediction_intervals, `${path}.prediction_intervals`);
   return {
+    model_name: nonEmptyString(item.model_name, `${path}.model_name`),
+    predicted_absorption_nm: nullableFiniteNumber("predicted_absorption_nm"),
+    predicted_emission_nm: nullableFiniteNumber("predicted_emission_nm"),
+    predicted_quantum_yield: nullableFiniteNumber("predicted_quantum_yield"),
+    ...(optionalFiniteNumber("predicted_stokes_shift_nm") === undefined ? {} : {
+      predicted_stokes_shift_nm: optionalFiniteNumber("predicted_stokes_shift_nm"),
+    }),
+    ...(optionalFiniteNumber("predicted_stokes_shift_cm^-1") === undefined ? {} : {
+      "predicted_stokes_shift_cm^-1": optionalFiniteNumber("predicted_stokes_shift_cm^-1"),
+    }),
+    ...(item.physically_valid_stokes === undefined ? {} : {
+      physically_valid_stokes: item.physically_valid_stokes,
+    }),
     nearest_training_similarity: item.nearest_training_similarity,
-    outside_applicability_domain: item.outside_applicability_domain,
-    exact_molecule_match: item.exact_molecule_match,
-    exact_solvent_pair_match: item.exact_solvent_pair_match,
-    scaffold_match: item.scaffold_match,
-  };
-}
-
-function parsePredictionItem(value: unknown, path: string): PredictionItem {
-  const item = record(value, path);
-  exactKeys(item, ["property", "value", "unit", "model", "applicability_domain"], path);
-  if (typeof item.value !== "number" || !Number.isFinite(item.value)) {
-    throw new PredictionJobValidationError(`${path}.value must be a finite number`);
-  }
-  return {
-    property: nonEmptyString(item.property, `${path}.property`),
-    value: item.value,
-    unit: nonEmptyString(item.unit, `${path}.unit`),
-    model: nonEmptyString(item.model, `${path}.model`),
-    applicability_domain: parseApplicabilityDomain(
-      item.applicability_domain,
-      `${path}.applicability_domain`,
+    nearest_training_smiles: nonEmptyString(item.nearest_training_smiles, `${path}.nearest_training_smiles`),
+    ...(optionalNonEmptyString(item.confidence_label, `${path}.confidence_label`) === undefined ? {} : {
+      confidence_label: optionalNonEmptyString(item.confidence_label, `${path}.confidence_label`),
+    }),
+    outside_applicability_domain: resolveOutsideApplicabilityDomain(
+      item.outside_applicability_domain,
+      applicabilityDomain,
+      path,
+    ),
+    ...(predictionIntervals === undefined ? {} : { prediction_intervals: predictionIntervals }),
+    ...(applicabilityDomain === undefined ? {} : { applicability_domain: applicabilityDomain }),
+    ...(optionalNonEmptyString(item.brightness_class, `${path}.brightness_class`) === undefined ? {} : {
+      brightness_class: optionalNonEmptyString(item.brightness_class, `${path}.brightness_class`),
+    }),
+    warnings: item.warnings.map((warning, index) =>
+      nonEmptyString(warning, `${path}.warnings[${index}]`),
     ),
   };
 }
@@ -219,7 +462,23 @@ export const predictionJobInputSchema = schema<PredictionJobInput>((value) => {
     user_id: nonEmptyString(input.user_id, "input.user_id"),
     molecule_smiles: nonEmptyString(input.molecule_smiles, "input.molecule_smiles"),
     solvent_smiles: nonEmptyString(input.solvent_smiles, "input.solvent_smiles"),
-    model_choice: nonEmptyString(input.model_choice, "input.model_choice"),
+    model_choice: desktopModelChoice(input.model_choice, "input.model_choice"),
+    requested_at: isoDate(input.requested_at, "input.requested_at"),
+  };
+});
+
+export const duplicateCheckInputSchema = schema<DuplicateCheckInput>((value) => {
+  const input = record(value, "input");
+  exactKeys(
+    input,
+    ["job_id", "user_id", "molecule_smiles", "solvent_smiles", "requested_at"],
+    "input",
+  );
+  return {
+    job_id: nonEmptyString(input.job_id, "input.job_id"),
+    user_id: nonEmptyString(input.user_id, "input.user_id"),
+    molecule_smiles: nonEmptyString(input.molecule_smiles, "input.molecule_smiles"),
+    solvent_smiles: nonEmptyString(input.solvent_smiles, "input.solvent_smiles"),
     requested_at: isoDate(input.requested_at, "input.requested_at"),
   };
 });
@@ -235,14 +494,20 @@ export const predictionJobOutputSchema = schema<PredictionJobOutput>((value) => 
       "canonical_molecule_smiles",
       "canonical_solvent_smiles",
       "predictions",
-      "applicability_domain",
       "warnings",
       "error",
+      "completed_at_source",
     ],
     "output",
   );
   const job_id = nonEmptyString(output.job_id, "output.job_id");
   const completed_at = isoDate(output.completed_at, "output.completed_at");
+  if (
+    output.completed_at_source !== undefined &&
+    !["slurm", "sacct", "remote_file_mtime", "import_time"].includes(String(output.completed_at_source))
+  ) {
+    throw new PredictionJobValidationError("output.completed_at_source is not supported");
+  }
 
   if (!Array.isArray(output.predictions)) {
     throw new PredictionJobValidationError("output.predictions must be an array");
@@ -268,10 +533,9 @@ export const predictionJobOutputSchema = schema<PredictionJobOutput>((value) => 
       predictions: output.predictions.map((item, index) =>
         parsePredictionItem(item, `output.predictions[${index}]`),
       ),
-      applicability_domain: parseResultApplicabilityDomain(
-        output.applicability_domain,
-        "output.applicability_domain",
-      ),
+      ...(output.completed_at_source === undefined ? {} : {
+        completed_at_source: output.completed_at_source as PredictionJobSuccessOutput["completed_at_source"],
+      }),
       warnings: Array.isArray(output.warnings)
         ? output.warnings.map((warning, index) =>
             nonEmptyString(warning, `output.warnings[${index}]`),
@@ -298,6 +562,57 @@ export const predictionJobOutputSchema = schema<PredictionJobOutput>((value) => 
   );
 });
 
+export const duplicateCheckOutputSchema = schema<DuplicateCheckOutput>((value) => {
+  const output = record(value, "output");
+  exactKeys(
+    output,
+    [
+      "exact_molecule_match",
+      "exact_solvent_pair_match",
+      "scaffold_match",
+      "nearest_training_similarity",
+      "nearest_training_molecule_smiles",
+      "warnings",
+      "error",
+    ],
+    "output",
+  );
+  for (const key of ["exact_molecule_match", "exact_solvent_pair_match", "scaffold_match"]) {
+    if (typeof output[key] !== "boolean") {
+      throw new PredictionJobValidationError(`output.${key} must be a boolean`);
+    }
+  }
+  if (
+    typeof output.nearest_training_similarity !== "number" ||
+    !Number.isFinite(output.nearest_training_similarity) ||
+    output.nearest_training_similarity < 0 ||
+    output.nearest_training_similarity > 1
+  ) {
+    throw new PredictionJobValidationError(
+      "output.nearest_training_similarity must be between 0 and 1",
+    );
+  }
+  if (!Array.isArray(output.warnings)) {
+    throw new PredictionJobValidationError("output.warnings must be an array");
+  }
+  return {
+    exact_molecule_match: output.exact_molecule_match,
+    exact_solvent_pair_match: output.exact_solvent_pair_match,
+    scaffold_match: output.scaffold_match,
+    nearest_training_similarity: output.nearest_training_similarity,
+    nearest_training_molecule_smiles: nonEmptyString(
+      output.nearest_training_molecule_smiles,
+      "output.nearest_training_molecule_smiles",
+    ),
+    warnings: output.warnings.map((warning, index) =>
+      nonEmptyString(warning, `output.warnings[${index}]`),
+    ),
+    ...(output.error === undefined
+      ? {}
+      : { error: nonEmptyString(output.error, "output.error") }),
+  };
+});
+
 export function validatePredictionJobInput(value: unknown): PredictionJobInput {
   return predictionJobInputSchema.parse(value);
 }
@@ -306,10 +621,18 @@ export function validatePredictionJobOutput(value: unknown): PredictionJobOutput
   return predictionJobOutputSchema.parse(value);
 }
 
+export function validateDuplicateCheckInput(value: unknown): DuplicateCheckInput {
+  return duplicateCheckInputSchema.parse(value);
+}
+
+export function validateDuplicateCheckOutput(value: unknown): DuplicateCheckOutput {
+  return duplicateCheckOutputSchema.parse(value);
+}
+
 export type CreatePredictionJobInputOptions = {
   molecule_smiles: string;
   solvent_smiles: string;
-  model_choice: string;
+  model_choice: DesktopModelChoice;
 };
 
 export function createPredictionJobInput(
@@ -321,6 +644,23 @@ export function createPredictionJobInput(
     molecule_smiles: options.molecule_smiles,
     solvent_smiles: options.solvent_smiles,
     model_choice: options.model_choice,
+    requested_at: new Date().toISOString(),
+  });
+}
+
+export type CreateDuplicateCheckInputOptions = {
+  molecule_smiles: string;
+  solvent_smiles: string;
+};
+
+export function createDuplicateCheckInput(
+  options: CreateDuplicateCheckInputOptions,
+): DuplicateCheckInput {
+  return validateDuplicateCheckInput({
+    job_id: `duplicate-${crypto.randomUUID()}`,
+    user_id: "local_user",
+    molecule_smiles: options.molecule_smiles,
+    solvent_smiles: options.solvent_smiles,
     requested_at: new Date().toISOString(),
   });
 }

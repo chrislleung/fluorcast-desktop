@@ -2,39 +2,37 @@
   "job_id": "job-01JFC8X2W3D4E5F6G7H8J9K0M",
   "status": "succeeded",
   "completed_at": "2026-07-03T14:34:12.000Z",
+  "completed_at_source": "import_time",
   "canonical_molecule_smiles": "CCOc1ccc2nc(S(N)(=O)=O)sc2c1",
   "canonical_solvent_smiles": "CCO",
   "predictions": [
     {
-      "property": "emission_wavelength",
-      "value": 462.7,
-      "unit": "nm",
-      "model": "fluorcast-default",
-      "applicability_domain": {
-        "in_domain": true,
-        "score": 0.91,
-        "message": "Within the training-set chemical space"
-      }
+      "model_name": "extratrees",
+      "predicted_absorption_nm": 216.52233333333305,
+      "predicted_emission_nm": 407.6347333333333,
+      "predicted_quantum_yield": 0.05316220343705746,
+      "nearest_training_similarity": 0.42857142857142855,
+      "nearest_training_smiles": "CCC",
+      "confidence_label": "low-medium",
+      "outside_applicability_domain": true,
+      "warnings": [],
+      "predicted_stokes_shift_nm": 191.11240000000026,
+      "predicted_stokes_shift_cm^-1": 21652.845944993347,
+      "physically_valid_stokes": true
     },
     {
-      "property": "quantum_yield",
-      "value": 0.64,
-      "unit": "ratio",
-      "model": "fluorcast-default",
-      "applicability_domain": {
-        "in_domain": true,
-        "score": 0.88
-      }
+      "model_name": "mlp_large_alpha_1e-04",
+      "predicted_absorption_nm": null,
+      "predicted_emission_nm": 321.9827880859375,
+      "predicted_quantum_yield": -0.0015463866293430328,
+      "nearest_training_similarity": 0.42857142857142855,
+      "nearest_training_smiles": "CCC",
+      "confidence_label": "low-medium",
+      "outside_applicability_domain": true,
+      "warnings": []
     }
   ],
-  "applicability_domain": {
-    "nearest_training_similarity": 0.91,
-    "outside_applicability_domain": false,
-    "exact_molecule_match": false,
-    "exact_solvent_pair_match": false,
-    "scaffold_match": true
-  },
   "warnings": [
-    "Mock-style fixture output; not from a live NIBI run."
+    "Model file not found; skipping mlp_large_alpha_1e-04 absorption_nm."
   ]
 }

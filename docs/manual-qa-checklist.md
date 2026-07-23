@@ -1,73 +1,69 @@
 # Manual QA Checklist
 
-## SQLite Refresh Persistence
+Use `npm.cmd run tauri dev` for desktop checks. The Vite browser preview does not exercise Tauri shell, WSL, SSH, or SQLite integration.
 
-- Start the desktop app with `npm.cmd run tauri dev`.
-- Submit a mock prediction from the New Prediction page.
-- Wait for the job to complete.
-- Open the completed result.
-- Refresh the page while viewing the result.
-- Confirm the prediction result still appears.
-- Go to the Jobs page.
-- Open the completed job.
-- Confirm the prediction result still appears.
-- If a completed job has no saved result row, confirm the app shows: "This job is marked completed, but no saved result was found."
+## Final NIBI Acceptance
 
-## SQLite Persistence Debug Test
+- Start FluorCast.
+- Open Settings.
+- Select NIBI with Manual MFA.
+- Save these settings:
+  - WSL distribution: `Ubuntu`
+  - NIBI username: `chrisl`
+  - NIBI host: `nibi.alliancecan.ca`
+  - WSL private key path: `/home/cl/.ssh/fluorcast_nibi_ed25519`
+  - Remote project path: `/home/chrisl/scratch/FluorCast`
+  - Remote jobs path: `/home/chrisl/scratch/fluorcast-jobs`
+  - Python environment path: `/home/chrisl/scratch/FluorCast/.venv/bin/python`
+- Click Clean stale WSL session.
+- Click Start NIBI session.
+- Confirm the terminal receives `HOST` and `KEY` arguments and does not report `$1: unbound variable`.
+- Enter the NIBI password and Duo option `1`.
+- Approve Duo.
+- Return to Settings and click Test authenticated session.
+- Confirm the result includes `FLUORCAST_AUTH_OK`.
+- Click Run remote environment checks.
+- Confirm there is no second Duo prompt.
+- Submit one prediction from New Prediction.
+- Confirm exactly one Slurm job is submitted.
+- Confirm the Slurm job ID is persisted in Jobs.
+- Confirm polling changes from queued to running to a terminal state.
+- Confirm `stdout.log` and `stderr.log` are retrieved when available.
+- Confirm `output.json` is retrieved and parsed on success.
+- Restart the application.
+- Confirm the job and result still exist.
 
-- Run `npm.cmd run tauri dev`.
-- Open Diagnostics.
-- Click Refresh diagnostics.
-- Click Create mock persistence probe.
-- Confirm jobs count increased.
-- Confirm results count increased.
-- Open latest completed result.
-- Refresh the result page.
-- Confirm the same result still appears.
-- Close app fully.
-- Reopen app.
-- Open Diagnostics.
-- Confirm jobs/results counts persisted.
-- Open latest completed result.
-- Confirm the same result still appears.
+## Manual MFA Session
 
-## WSL Manual MFA ControlMaster Session
+- Confirm the Home page has no NIBI login button or automatic login workflow.
+- In Settings, confirm the visible NIBI Session buttons are ordered:
+  - Clean stale WSL session
+  - Start NIBI session
+  - Test authenticated session
+  - Run remote environment checks
+- Confirm Settings shows WSL distribution, resolved WSL user, resolved WSL HOME, NIBI target, resolved ControlPath, session status, and most recent result.
+- Confirm Advanced session diagnostics is collapsed by default.
+- Confirm the generated launcher uses:
+  `wt.exe new-tab --title "FluorCast NIBI Login" wsl.exe -d Ubuntu -- bash -- /home/cl/.fluorcast/scripts/start-nibi-login.sh chrisl@nibi.alliancecan.ca /home/cl/.ssh/fluorcast_nibi_ed25519`
+- Confirm Test authenticated session reuses:
+  `$HOME/.fluorcast/ssh/cm-nibi.sock`
+- Confirm Clean stale WSL session only affects:
+  `$HOME/.fluorcast/ssh/cm-nibi.sock`
 
-- Select Manual MFA login in Settings.
-- Confirm WSL backend is shown.
-- Confirm WSL setup key commands show:
-  `mkdir -p ~/.ssh ~/.fluorcast/ssh`
-  `cp /mnt/c/Users/<you>/.ssh/id_ed25519 ~/.ssh/fluorcast_nibi_ed25519`
-  `chmod 600 ~/.ssh/fluorcast_nibi_ed25519`
-- Start manual login should create or update WSL script files under:
-  `~/.fluorcast/scripts`
-- Confirm the start script path is:
-  `~/.fluorcast/scripts/start-nibi-login.sh`
-- Run or click Clean stale WSL session and confirm it uses:
-  `bash ~/.fluorcast/scripts/clean-nibi-session.sh`
-- Confirm the clean script content uses:
-  `ssh -S "$ctl" -O exit "$host" 2>/dev/null || true`
-  `rm -f "$ctl"`
-  `mkdir -p "$HOME/.fluorcast/ssh"`
-- Start manual NIBI login.
-- Confirm the start-login command does not contain `pkill -f`.
-- Confirm it checks for an active master before removing the socket:
-  `if ssh -S "$ctl" -O check "$host" >/dev/null 2>&1; then`
-- Confirm Windows Terminal or PowerShell runs:
-  `bash ~/.fluorcast/scripts/start-nibi-login.sh`
-- If an active session already exists, confirm the terminal says: "An active FluorCast NIBI session already exists."
-- Confirm a visible terminal opens. Prefer Windows Terminal; PowerShell is an acceptable fallback.
-- If terminal launch fails, run the displayed manual WSL command:
-  `bash ~/.fluorcast/scripts/start-nibi-login.sh`
-- If no terminal appears, open PowerShell, run `wsl -d Ubuntu`, run the displayed manual WSL command, complete Duo, then return to FluorCast.
-- If the terminal exits with code 15 before Duo appears, update the app and confirm the start-login command has no `pkill -f`.
-- Complete Duo/MFA once in the WSL-backed terminal.
-- Return to FluorCast and click Test authenticated session.
-- Check master with:
-  `ssh -S "$ctl" -O check "$host"`
-- Confirm the output includes `Master running`.
-- Test reuse with:
-  `ssh -S "$ctl" -o BatchMode=yes "$host" "echo FLUORCAST_AUTH_OK"`
-- Confirm the output is `FLUORCAST_AUTH_OK`.
-- Confirm there is no second Duo prompt during the `FLUORCAST_AUTH_OK` test.
-- Open Diagnostics and confirm effective backend is WSL, generated script path, launch command preview, launch method attempted, launch result, launch error code, WSL script file existence, and background command readiness are recorded.
+## Remote Work
+
+- Run remote environment checks only after `FLUORCAST_AUTH_OK`.
+- Confirm each check is reported as passed, failed, or not run.
+- Confirm checks cover project exists/readable, jobs directory create/write, Python exists/version, prediction entry point, `sbatch`, `squeue`, `sacct`, and create/read/delete smoke test.
+- Confirm upload and download do not open another terminal and do not prompt for Duo again.
+- Confirm Slurm submission uses:
+  `run_prediction_job.sbatch "<remote job directory>/input.json" "<remote job directory>/output.json"`
+- Click Submit three times rapidly and confirm one local submission and one Slurm job.
+- For an active job, click Cancel and confirm only the recorded Slurm job ID is cancelled.
+
+## Persistence
+
+- Submit a mock prediction and confirm its result opens.
+- Refresh the result page and confirm the saved result reloads by job ID.
+- Restart FluorCast and confirm persisted jobs, Slurm IDs, logs, and results remain.
+- Confirm completed results show Stokes shift when absorption and emission predictions are present.

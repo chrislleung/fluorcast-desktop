@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildManualSshCommand,
+  buildAllianceSupportRequest,
+  buildRestrictedPublicKey,
   defaultNibiSettings,
   hasShellMetacharacters,
   isAbsolutePath,
@@ -23,12 +25,15 @@ describe("NIBI settings validation", () => {
   it("uses generic NIBI defaults", () => {
     expect(defaultNibiSettings).toMatchObject({
       connection_mode: "mock",
+      manual_mfa_provider: "controlmaster",
       manual_mfa_ssh_backend: "wsl",
       nibi_username: "user",
       normal_login_host: "nibi.alliancecan.ca",
       robot_login_host: "robot.nibi.alliancecan.ca",
+      robot_key_restriction_from: "134.153.150.*",
+      robot_key_forced_command: "/cvmfs/soft.computecanada.ca/custom/bin/computecanada/allowed_commands/allowed_commands.sh",
       wsl_ssh_private_key_path: "$HOME/.ssh/fluorcast_nibi_ed25519",
-      wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-user-nibi.sock",
+      wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-nibi.sock",
       remote_project_path: "/home/user/scratch/FluorCast",
       remote_jobs_path: "/home/user/scratch/fluorcast-jobs",
       python_environment_path: "/home/user/scratch/FluorCast/.venv/bin/python",
@@ -38,19 +43,19 @@ describe("NIBI settings validation", () => {
     });
   });
 
-  it("requires username, host, and SSH key path in manual MFA mode", () => {
+  it("requires username, host, and WSL SSH key path in manual MFA mode", () => {
     const errors = validateNibiSettings({
       ...defaultNibiSettings,
       connection_mode: "interactive_mfa",
       normal_login_host: "",
       nibi_username: "",
-      ssh_private_key_path: "",
+      wsl_ssh_private_key_path: "",
     });
 
     expect(errors).toMatchObject({
       nibi_username: "Username is required for NIBI mode.",
       normal_login_host: "Normal login host is required for manual MFA mode.",
-      ssh_private_key_path: "SSH key path is required for manual MFA mode.",
+      wsl_ssh_private_key_path: "WSL private key path is required for manual MFA mode.",
     });
   });
 
@@ -97,6 +102,7 @@ describe("NIBI settings validation", () => {
   it("requires absolute remote and Python paths", () => {
     const errors = validateNibiSettings({
       ...defaultNibiSettings,
+      connection_mode: "interactive_mfa",
       remote_project_path: "scratch/ChemFluor_Project",
       remote_jobs_path: "fluorcast-jobs",
       python_environment_path: ".venv/bin/python",
@@ -109,21 +115,55 @@ describe("NIBI settings validation", () => {
     });
   });
 
+  it("does not validate hidden NIBI fields in mock mode", () => {
+    expect(validateNibiSettings({
+      ...defaultNibiSettings,
+      connection_mode: "mock",
+      ssh_private_key_path: "C:\\Users\\CL\\.ssh\\id_ed25519; stale",
+      remote_project_path: "relative/stale",
+      remote_jobs_path: "jobs|stale",
+      python_environment_path: "",
+    })).toEqual({});
+  });
+
   it("rejects shell metacharacters in path fields", () => {
     const errors = validateNibiSettings({
       ...defaultNibiSettings,
-      ssh_private_key_path: "C:\\Users\\CL\\.ssh\\id_ed25519; rm",
+      connection_mode: "interactive_mfa",
+      wsl_ssh_private_key_path: "/home/cl/.ssh/id_ed25519; rm",
       remote_project_path: "/home/chrisl/scratch/project$(whoami)",
       remote_jobs_path: "/home/chrisl/scratch/jobs|tee",
       python_environment_path: "/home/chrisl/project/.venv/bin/python`date`",
     });
 
     expect(errors).toMatchObject({
-      ssh_private_key_path: "Path contains unsupported shell metacharacters.",
+      wsl_ssh_private_key_path: "WSL private key path contains unsupported shell metacharacters.",
       remote_project_path: "Path contains unsupported shell metacharacters.",
       remote_jobs_path: "Path contains unsupported shell metacharacters.",
       python_environment_path: "Path contains unsupported shell metacharacters.",
     });
+  });
+
+  it("accepts supported WSL private-key home path forms", () => {
+    for (const wslPath of [
+      "/home/cl/.ssh/fluorcast_nibi_ed25519",
+      "$HOME/.ssh/fluorcast_nibi_ed25519",
+      "~/.ssh/fluorcast_nibi_ed25519",
+    ]) {
+      expect(validateNibiSettings({
+        ...defaultNibiSettings,
+        connection_mode: "interactive_mfa",
+        nibi_username: "chrisl",
+        wsl_ssh_private_key_path: wslPath,
+      }).wsl_ssh_private_key_path).toBeUndefined();
+    }
+
+    expect(validateNibiSettings({
+      ...defaultNibiSettings,
+      connection_mode: "interactive_mfa",
+      nibi_username: "chrisl",
+      wsl_ssh_private_key_path: "relative/key",
+    }).wsl_ssh_private_key_path).toBe("WSL private key path must be /home, $HOME/, or ~/.");
   });
 
   it("detects common absolute path forms", () => {
@@ -147,6 +187,15 @@ describe("NIBI settings validation", () => {
     });
   });
 
+  it("normalizes legacy and default Manual MFA providers", () => {
+    expect(normalizeNibiSettings({ manual_mfa_provider: "persistent_shell" }).manual_mfa_provider)
+      .toBe("persistent_shell");
+    expect(normalizeNibiSettings({ manual_mfa_provider: "controlmaster" }).manual_mfa_provider)
+      .toBe("controlmaster");
+    expect(normalizeNibiSettings({ manual_mfa_provider: "unexpected" }).manual_mfa_provider)
+      .toBe("controlmaster");
+  });
+
   it("saves and loads the manual SSH login confirmation setting shape", () => {
     const persisted = JSON.stringify(trimNibiSettings({
       ...defaultNibiSettings,
@@ -167,17 +216,57 @@ describe("NIBI settings validation", () => {
     })).toBe("ssh -i \"C:\\Users\\Alice\\.ssh\\id_ed25519\" alice@nibi.alliancecan.ca");
   });
 
-  it("does not expose old user-specific NIBI paths in user-facing docs", () => {
+  it("generates a restricted public key from public key text", () => {
+    expect(buildRestrictedPublicKey(
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest alice@laptop\n",
+      defaultNibiSettings,
+    )).toBe(
+      "restrict,from=\"134.153.150.*\",command=\"/cvmfs/soft.computecanada.ca/custom/bin/computecanada/allowed_commands/allowed_commands.sh\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest alice@laptop",
+    );
+  });
+
+  it("does not include private key text in restricted public key generation", () => {
+    const privateKeyText = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    const restricted = buildRestrictedPublicKey(
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest alice@laptop",
+      {
+        ...defaultNibiSettings,
+        ssh_private_key_path: privateKeyText,
+      },
+    );
+
+    expect(restricted).not.toContain("PRIVATE KEY");
+    expect(restricted).not.toContain(privateKeyText);
+  });
+
+  it("builds an Alliance support request with username and robot host", () => {
+    const request = buildAllianceSupportRequest({
+      ...defaultNibiSettings,
+      nibi_username: "alice",
+      robot_login_host: "robot.nibi.alliancecan.ca",
+    });
+
+    expect(request).toContain("Username: alice");
+    expect(request).toContain("Robot host: robot.nibi.alliancecan.ca");
+    expect(request).toContain("transfer input files with scp/sftp");
+    expect(request).toContain("submit jobs with sbatch");
+    expect(request).toContain("check jobs with squeue/sacct");
+    expect(request).toContain("download completed output files");
+  });
+
+  it("keeps setup docs generic while the manual QA checklist carries the workstation acceptance values", () => {
     const docs = [
       readFileSync(join(process.cwd(), "README.md"), "utf8"),
       readFileSync(join(process.cwd(), "docs", "nibi-setup.md"), "utf8"),
-      readFileSync(join(process.cwd(), "docs", "manual-qa-checklist.md"), "utf8"),
     ].join("\n");
+    const manualChecklist = readFileSync(join(process.cwd(), "docs", "manual-qa-checklist.md"), "utf8");
 
     expect(docs).not.toContain("chrisl");
     expect(docs).not.toContain("ChemFluor_Project");
     expect(docs).not.toContain("/home/chrisl");
     expect(docs).not.toContain("scratch/ChemFluor_Project");
+    expect(manualChecklist).toContain("/home/chrisl/scratch/FluorCast");
+    expect(manualChecklist).toContain("/home/cl/.ssh/fluorcast_nibi_ed25519");
   });
 
   it("trims values before persistence or validation", () => {

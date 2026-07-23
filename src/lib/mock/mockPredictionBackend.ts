@@ -1,6 +1,9 @@
 import mockPredictionOutputFixture from "./mock-prediction-output.fixture.json";
 import {
   validatePredictionJobOutput,
+  validateDuplicateCheckOutput,
+  type DuplicateCheckInput,
+  type DuplicateCheckOutput,
   type PredictionJobInput,
   type PredictionJobOutput,
 } from "../schemas";
@@ -75,6 +78,26 @@ export function createMockPredictionOutput(input: PredictionJobInput): Predictio
     job_id: input.job_id,
     canonical_molecule_smiles: input.molecule_smiles,
     canonical_solvent_smiles: input.solvent_smiles,
+  });
+}
+
+export function createMockDuplicateCheckOutput(input: DuplicateCheckInput): DuplicateCheckOutput {
+  const normalizedMolecule = input.molecule_smiles.trim();
+  const normalizedSolvent = input.solvent_smiles.trim();
+  const exactMolecule = normalizedMolecule.toUpperCase() === "CCO"
+    || normalizedMolecule.toLowerCase() === "c1ccccc1";
+  const exactPair = exactMolecule && normalizedSolvent === "O";
+  return validateDuplicateCheckOutput({
+    exact_molecule_match: exactMolecule,
+    exact_solvent_pair_match: exactPair,
+    scaffold_match: exactMolecule || normalizedMolecule.includes("c1"),
+    nearest_training_similarity: exactMolecule ? 1 : normalizedMolecule.includes("c1") ? 0.87 : 0.42,
+    nearest_training_molecule_smiles: exactMolecule ? normalizedMolecule : "c1ccccc1",
+    warnings: exactPair
+      ? ["This molecule-solvent pair is already present in training data."]
+      : exactMolecule
+        ? ["This molecule is present in training data with a different solvent."]
+        : [],
   });
 }
 

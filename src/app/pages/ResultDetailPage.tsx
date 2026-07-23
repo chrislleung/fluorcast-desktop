@@ -1,8 +1,6 @@
 import type { PredictionItem, PredictionJobOutput } from "../../lib/schemas";
 import {
   formatPredictionValue,
-  formatTargetName,
-  getApplicabilityConfidenceLabel,
   getBrightnessClass,
   getSpectralRegion,
 } from "../../lib/formatting";
@@ -15,14 +13,24 @@ function yesNo(value: boolean) {
   return value ? "Yes" : "No";
 }
 
-function derivedPredictionLabel(prediction: PredictionItem) {
-  if (prediction.unit === "nm" && prediction.property.includes("wavelength")) {
-    return getSpectralRegion(prediction.value);
-  }
-  if (prediction.property === "quantum_yield") {
-    return getBrightnessClass(prediction.value);
-  }
-  return "Not applicable";
+function formatNullablePredictionValue(value: number | null, unit: string) {
+  return value === null ? "Unavailable" : formatPredictionValue(value, unit);
+}
+
+function spectralLabel(value: number | null) {
+  return value === null ? "Unavailable" : getSpectralRegion(value);
+}
+
+function brightnessLabel(value: number | null) {
+  return value === null ? "Unavailable" : getBrightnessClass(value);
+}
+
+function modelWarnings(prediction: PredictionItem) {
+  return prediction.warnings.length > 0 ? prediction.warnings.join("; ") : "None";
+}
+
+function confidenceLabel(prediction: PredictionItem) {
+  return prediction.confidence_label ?? "Not available";
 }
 
 export function ResultDetailPage({ output }: ResultDetailPageProps) {
@@ -59,8 +67,6 @@ export function ResultDetailPage({ output }: ResultDetailPageProps) {
       </section>
     );
   }
-
-  const confidenceLabel = getApplicabilityConfidenceLabel(output.applicability_domain);
 
   return (
     <section className="result-detail" aria-label="Prediction result detail">
@@ -101,20 +107,48 @@ export function ResultDetailPage({ output }: ResultDetailPageProps) {
             <thead>
               <tr>
                 <th>Model name</th>
-                <th>Target</th>
-                <th>Prediction</th>
-                <th>Unit</th>
-                <th>Derived label</th>
+                <th>Absorption</th>
+                <th>Emission</th>
+                <th>Quantum yield</th>
+                <th>Stokes shift</th>
+                <th>Confidence</th>
+                <th>Warnings</th>
               </tr>
             </thead>
             <tbody>
               {output.predictions.map((prediction) => (
-                <tr key={`${prediction.model}-${prediction.property}`}>
-                  <td>{prediction.model}</td>
-                  <td>{formatTargetName(prediction.property)}</td>
-                  <td>{formatPredictionValue(prediction.value, prediction.unit)}</td>
-                  <td>{prediction.unit}</td>
-                  <td>{derivedPredictionLabel(prediction)}</td>
+                <tr key={prediction.model_name}>
+                  <td>{prediction.model_name}</td>
+                  <td>
+                    {formatNullablePredictionValue(prediction.predicted_absorption_nm, "nm")}
+                    <br />
+                    <span className="step-label">{spectralLabel(prediction.predicted_absorption_nm)}</span>
+                  </td>
+                  <td>
+                    {formatNullablePredictionValue(prediction.predicted_emission_nm, "nm")}
+                    <br />
+                    <span className="step-label">{spectralLabel(prediction.predicted_emission_nm)}</span>
+                  </td>
+                  <td>
+                    {formatNullablePredictionValue(prediction.predicted_quantum_yield, "ratio")}
+                    <br />
+                    <span className="step-label">{brightnessLabel(prediction.predicted_quantum_yield)}</span>
+                  </td>
+                  <td>
+                    {prediction.predicted_stokes_shift_nm === undefined
+                      ? "Unavailable"
+                      : formatPredictionValue(prediction.predicted_stokes_shift_nm, "nm")}
+                    {prediction["predicted_stokes_shift_cm^-1"] === undefined ? null : (
+                      <>
+                        <br />
+                        <span className="step-label">
+                          {formatPredictionValue(prediction["predicted_stokes_shift_cm^-1"], "cm^-1")} cm^-1
+                        </span>
+                      </>
+                    )}
+                  </td>
+                  <td>{confidenceLabel(prediction)}</td>
+                  <td>{modelWarnings(prediction)}</td>
                 </tr>
               ))}
             </tbody>
@@ -125,29 +159,20 @@ export function ResultDetailPage({ output }: ResultDetailPageProps) {
       <section className="result-section">
         <div className="section-heading">
           <h2>Applicability domain</h2>
-          <span>{confidenceLabel}</span>
+          <span>{output.predictions.length} models</span>
         </div>
         <div className="applicability-grid">
-          <div>
-            <span className="step-label">Nearest training similarity</span>
-            <strong>{formatPredictionValue(output.applicability_domain.nearest_training_similarity, "ratio")}</strong>
-          </div>
-          <div>
-            <span className="step-label">Outside applicability domain</span>
-            <strong>{yesNo(output.applicability_domain.outside_applicability_domain)}</strong>
-          </div>
-          <div>
-            <span className="step-label">Exact molecule match</span>
-            <strong>{yesNo(output.applicability_domain.exact_molecule_match)}</strong>
-          </div>
-          <div>
-            <span className="step-label">Exact solvent pair match</span>
-            <strong>{yesNo(output.applicability_domain.exact_solvent_pair_match)}</strong>
-          </div>
-          <div>
-            <span className="step-label">Scaffold match</span>
-            <strong>{yesNo(output.applicability_domain.scaffold_match)}</strong>
-          </div>
+          {output.predictions.map((prediction) => (
+            <div key={prediction.model_name}>
+              <span className="step-label">{prediction.model_name}</span>
+              <strong>{formatPredictionValue(prediction.nearest_training_similarity, "ratio")}</strong>
+              <p>
+                Nearest: <code>{prediction.nearest_training_smiles}</code>
+                <br />
+                Outside domain: {yesNo(prediction.outside_applicability_domain)}
+              </p>
+            </div>
+          ))}
         </div>
       </section>
 

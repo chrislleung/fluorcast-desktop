@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import validOutput from "../../tests/fixtures/prediction-output.success.example.json";
 import type { PredictionJobOutput } from "../lib/schemas";
@@ -19,6 +20,10 @@ const dbMock = vi.hoisted(() => ({
 }));
 
 vi.mock("../lib/db", () => dbMock);
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(),
+}));
 
 const completedJob = {
   id: "job-1",
@@ -49,6 +54,7 @@ describe("App", () => {
     dbMock.saveResult.mockResolvedValue(true);
     dbMock.saveSetting.mockResolvedValue(true);
     dbMock.updateJobStatus.mockResolvedValue(true);
+    vi.mocked(invoke).mockReset();
   });
 
   it("introduces the FluorCast prediction workflow", async () => {
@@ -110,10 +116,10 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /Open result/i }));
 
     expect(await screen.findByRole("heading", { name: "Prediction result" })).toBeInTheDocument();
-    expect(screen.getByText("Emission wavelength")).toBeInTheDocument();
-    expect(screen.getByText("Blue")).toBeInTheDocument();
-    expect(screen.getByText("Bright")).toBeInTheDocument();
-    expect(screen.getByText("High confidence")).toBeInTheDocument();
+    expect(screen.getAllByText("extratrees").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("mlp_large_alpha_1e-04").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("low-medium").length).toBeGreaterThan(0);
   });
 
   it("persists completed mock job results before marking the job completed", async () => {
@@ -156,7 +162,8 @@ describe("App", () => {
 
     expect(await screen.findByRole("heading", { name: "Prediction result" })).toBeInTheDocument();
     expect(dbMock.getJobWithResult).toHaveBeenCalledWith("job-1");
-    expect(screen.getByText("Emission wavelength")).toBeInTheDocument();
+    expect(screen.getAllByText("extratrees").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("mlp_large_alpha_1e-04").length).toBeGreaterThan(0);
   });
 
   it("keeps result routes loading while the database is not ready", async () => {
@@ -232,5 +239,112 @@ describe("App", () => {
 
     expect(container.querySelector(".app-shell")).toHaveStyle({ "--secondary": "#ffad91" });
     expect(dbMock.saveSetting).toHaveBeenCalledWith("secondaryColor", "#ffad91");
+  });
+
+  it("probes Manual MFA session on Jobs when stale state would block remote jobs", async () => {
+    dbMock.getSetting.mockImplementation(async (key: string) => (
+      key === "nibiSettings"
+        ? JSON.stringify({
+          connection_mode: "interactive_mfa",
+          backend_mode: "nibi",
+          manual_mfa_provider: "persistent_shell",
+          nibi_username: "alice",
+          normal_login_host: "nibi.alliancecan.ca",
+          ssh_private_key_path: "C:\\Users\\Alice\\.ssh\\fluorcast_nibi_ed25519",
+          wsl_ssh_private_key_path: "$HOME/.ssh/fluorcast_nibi_ed25519",
+          wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-alice-nibi.sock",
+          remote_project_path: "/home/alice/scratch/FluorCast",
+          remote_jobs_path: "/home/alice/scratch/fluorcast-jobs",
+          python_environment_path: "/home/alice/scratch/FluorCast/.venv/bin/python",
+        })
+        : null
+    ));
+    dbMock.listJobs.mockResolvedValue([{
+      id: "job-remote",
+      molecule_smiles: "CCO",
+      solvent_smiles: "O",
+      model_choice: "rf",
+      status: "submitted_to_slurm",
+      created_at: "2026-07-17T12:00:00.000Z",
+      remote_slurm_id: "12345",
+      remote_job_dir: "/home/alice/scratch/fluorcast-jobs/job-remote",
+    }]);
+    vi.mocked(invoke).mockResolvedValue({
+      status: "authenticated",
+      message: "Manual NIBI login is authenticated and background commands can reuse the session.",
+      control_path: "$HOME/.fluorcast/ssh/cm-alice-nibi.sock",
+      control_path_exists: true,
+      redacted_command_preview: "ssh -S <wsl_control_socket_path> alice@nibi.alliancecan.ca echo",
+      can_run_background_commands: true,
+      last_master_check_result: "Master running",
+      last_auth_ok_result: "FLUORCAST_AUTH_OK",
+      selected_backend: "wsl",
+      wsl_available: true,
+      wsl_ssh_available: true,
+    });
+
+    render(<App />);
+    await screen.findByRole("heading", { name: /from structure to signal/i });
+    fireEvent.click(screen.getByRole("button", { name: "Jobs" }));
+
+    expect(await screen.findByLabelText("Prediction job history")).toBeInTheDocument();
+    await vi.waitFor(() => {
+      expect(vi.mocked(invoke)).toHaveBeenCalledWith("test_manual_mfa_session", expect.any(Object));
+    });
+    expect(screen.queryByText("NIBI login required")).not.toBeInTheDocument();
+  });
+
+  it("shows reconnect panel when Jobs Manual MFA probe fails", async () => {
+    dbMock.getSetting.mockImplementation(async (key: string) => (
+      key === "nibiSettings"
+        ? JSON.stringify({
+          connection_mode: "interactive_mfa",
+          backend_mode: "nibi",
+          manual_mfa_provider: "persistent_shell",
+          nibi_username: "alice",
+          normal_login_host: "nibi.alliancecan.ca",
+          ssh_private_key_path: "C:\\Users\\Alice\\.ssh\\fluorcast_nibi_ed25519",
+          wsl_ssh_private_key_path: "$HOME/.ssh/fluorcast_nibi_ed25519",
+          wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-alice-nibi.sock",
+          remote_project_path: "/home/alice/scratch/FluorCast",
+          remote_jobs_path: "/home/alice/scratch/fluorcast-jobs",
+          python_environment_path: "/home/alice/scratch/FluorCast/.venv/bin/python",
+        })
+        : null
+    ));
+    dbMock.listJobs.mockResolvedValue([{
+      id: "job-remote",
+      molecule_smiles: "CCO",
+      solvent_smiles: "O",
+      model_choice: "rf",
+      status: "login_required",
+      created_at: "2026-07-17T12:00:00.000Z",
+      remote_slurm_id: "12345",
+      remote_job_dir: "/home/alice/scratch/fluorcast-jobs/job-remote",
+    }]);
+    vi.mocked(invoke).mockResolvedValue({
+      status: "disconnected",
+      message: "The SSH control session was not found or expired. Start manual login again.",
+      control_path: "$HOME/.fluorcast/ssh/cm-alice-nibi.sock",
+      control_path_exists: false,
+      redacted_command_preview: "ssh -S <wsl_control_socket_path> alice@nibi.alliancecan.ca echo",
+      can_run_background_commands: false,
+      last_master_check_result: "No such file or directory",
+      last_auth_ok_result: "",
+      selected_backend: "wsl",
+      wsl_available: true,
+      wsl_ssh_available: true,
+    });
+
+    render(<App />);
+    await screen.findByRole("heading", { name: /from structure to signal/i });
+    fireEvent.click(screen.getByRole("button", { name: "Jobs" }));
+
+    expect(await screen.findByText("NIBI login required")).toBeInTheDocument();
+    expect(screen.getByText(/Open Settings to start or test the NIBI session/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Test app session" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start manual NIBI login" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
   });
 });

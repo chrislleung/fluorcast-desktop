@@ -21,6 +21,9 @@ describe("database pure helpers", () => {
         local_completed_at: "2026-07-03T14:31:00.000Z",
         remote_slurm_id: null,
         remote_job_dir: "/scratch/job-1",
+        remote_input_path: "/scratch/job-1/input.json",
+        remote_output_path: "/scratch/job-1/output.json",
+        submitted_at: "2026-07-03T14:30:30.000Z",
         error_message: null,
       }),
     ).toEqual({
@@ -32,6 +35,9 @@ describe("database pure helpers", () => {
       created_at: "2026-07-03T14:30:00.000Z",
       completed_at: "2026-07-03T14:31:00.000Z",
       remote_job_dir: "/scratch/job-1",
+      remote_input_path: "/scratch/job-1/input.json",
+      remote_output_path: "/scratch/job-1/output.json",
+      submitted_at: "2026-07-03T14:30:30.000Z",
     });
   });
 
@@ -43,6 +49,38 @@ describe("database pure helpers", () => {
       status: "succeeded",
       predictions: expect.any(Array),
     });
+  });
+
+  it("round trips Hybrid metadata and missing confidence through persisted result JSON", () => {
+    const output = {
+      ...validOutput,
+      job_id: "job-1",
+      predictions: [{
+        ...validOutput.predictions[0],
+        model_name: "hybrid",
+        confidence_label: undefined,
+        outside_applicability_domain: false,
+        prediction_intervals: {
+          quantum_yield: { lower: -0.23344108221592028, upper: 0.9, coverage: 0.9 },
+        },
+        applicability_domain: {
+          outside_applicability_domain: false,
+          targets: {
+            absorption: { outside_applicability_domain: false },
+          },
+        },
+        brightness_class: "dim",
+      }],
+    } as PredictionJobOutput;
+
+    const parsed = parsePredictionResult(serializePredictionResult(output));
+
+    expect(parsed.status).toBe("succeeded");
+    if (parsed.status !== "succeeded") return;
+    expect(parsed.predictions[0].confidence_label).toBeUndefined();
+    expect(parsed.predictions[0].prediction_intervals?.quantum_yield?.lower).toBe(-0.23344108221592028);
+    expect(parsed.predictions[0].applicability_domain?.targets?.absorption?.outside_applicability_domain).toBe(false);
+    expect(parsed.predictions[0].brightness_class).toBe("dim");
   });
 
   it("returns a persisted job with a parsed and validated result", async () => {
@@ -60,6 +98,9 @@ describe("database pure helpers", () => {
           local_completed_at: "2026-07-03T14:31:00.000Z",
           remote_slurm_id: null,
           remote_job_dir: null,
+          remote_input_path: null,
+          remote_output_path: null,
+          submitted_at: null,
           error_message: null,
           job_id: "job-1",
           output_json: serializePredictionResult(output),
@@ -114,6 +155,9 @@ describe("database pure helpers", () => {
           local_completed_at: "2026-07-03T14:31:00.000Z",
           remote_slurm_id: null,
           remote_job_dir: null,
+          remote_input_path: null,
+          remote_output_path: null,
+          submitted_at: null,
           error_message: null,
           job_id: null,
           output_json: null,

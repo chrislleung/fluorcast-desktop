@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import validInput from "../../../tests/fixtures/prediction-input.example.json";
 import { validatePredictionJobOutput } from "../schemas";
 import {
+  createMockDuplicateCheckOutput,
   createMockPredictionOutput,
   mockPredictionOutputFixture,
   runMockPredictionJob,
@@ -32,9 +33,25 @@ describe("mock prediction backend", () => {
   it("rejects malformed mock output through schema validation", () => {
     const malformedOutput = {
       ...mockPredictionOutputFixture,
-      predictions: [{ ...mockPredictionOutputFixture.predictions[0], value: "462.7" }],
+      predictions: [{ ...mockPredictionOutputFixture.predictions[0], predicted_emission_nm: "462.7" }],
     };
 
-    expect(() => validatePredictionJobOutput(malformedOutput)).toThrow(/value/);
+    expect(() => validatePredictionJobOutput(malformedOutput)).toThrow(/predicted_emission_nm/);
+  });
+
+  it("returns a deterministic mock duplicate-check output", () => {
+    const output = createMockDuplicateCheckOutput({
+      job_id: "duplicate-job-1",
+      user_id: "local_user",
+      molecule_smiles: "CCO",
+      solvent_smiles: "O",
+      requested_at: "2026-07-17T12:00:00.000Z",
+    });
+
+    expect(output).toMatchObject({
+      exact_molecule_match: true,
+      exact_solvent_pair_match: true,
+      nearest_training_similarity: 1,
+    });
   });
 });

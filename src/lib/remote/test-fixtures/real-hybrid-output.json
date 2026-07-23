@@ -1,0 +1,53 @@
+{
+  "status": "success",
+  "job_id": "d5607546-105a-4c1a-a4e0-6cb13fcba3d9",
+  "canonical_molecule_smiles": "CCC",
+  "canonical_solvent_smiles": "O",
+  "predictions": [
+    {
+      "model_name": "hybrid",
+      "predicted_absorption_nm": 320.69705127630357,
+      "predicted_emission_nm": 501.3903336407451,
+      "predicted_stokes_shift_nm": 180.69328236444153,
+      "predicted_stokes_shift_cm^-1": 11237.535675197625,
+      "physically_valid_stokes": true,
+      "prediction_intervals": {
+        "absorption_nm": {
+          "lower": 269.8078535450293,
+          "upper": 371.58624900757786,
+          "coverage": 0.9
+        },
+        "emission_nm": {
+          "lower": 433.7084180663891,
+          "upper": 569.0722492151011,
+          "coverage": 0.9
+        },
+        "quantum_yield": {
+          "lower": -0.23344108221592028,
+          "upper": 0.4574246971469679,
+          "coverage": 0.9
+        }
+      },
+      "applicability_domain": {
+        "outside_applicability_domain": false,
+        "targets": {
+          "absorption": {
+            "outside_applicability_domain": false
+          },
+          "emission": {
+            "outside_applicability_domain": false
+          },
+          "quantum_yield": {
+            "outside_applicability_domain": false
+          }
+        }
+      },
+      "nearest_training_similarity": 1.0,
+      "nearest_training_smiles": "CCC",
+      "warnings": [],
+      "predicted_quantum_yield": 0.11199180746552381,
+      "brightness_class": "dim"
+    }
+  ],
+  "warnings": []
+}

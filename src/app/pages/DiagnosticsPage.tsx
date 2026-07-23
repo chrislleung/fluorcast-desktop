@@ -9,12 +9,16 @@ import {
   type PersistenceProbeResult,
 } from "../../lib/db";
 import type { NibiSettings } from "../../features/settings";
-import type { ManualMfaSessionUiState } from "../../lib/remote";
+import type { ManualMfaSessionUiState, SlurmPollingCoordinatorDiagnostics, SlurmPollingResult } from "../../lib/remote";
 
 type DiagnosticsPageProps = {
   isDatabaseReady: boolean;
   manualMfaSession?: ManualMfaSessionUiState;
   nibiSettings?: NibiSettings;
+  activeJobsCount?: number;
+  jobsPageLoginRequiredCount?: number;
+  latestPollingResult?: SlurmPollingResult | null;
+  pollingDiagnostics?: SlurmPollingCoordinatorDiagnostics | null;
   onOpenResult: (jobId: string) => void;
   onJobsRefresh: (jobs: JobWithResult[]) => void;
 };
@@ -28,6 +32,10 @@ export function DiagnosticsPage({
   isDatabaseReady,
   manualMfaSession,
   nibiSettings,
+  activeJobsCount = 0,
+  jobsPageLoginRequiredCount = 0,
+  latestPollingResult,
+  pollingDiagnostics,
   onOpenResult,
   onJobsRefresh,
 }: DiagnosticsPageProps) {
@@ -132,6 +140,36 @@ export function DiagnosticsPage({
               <div className="section-heading"><h2>Remote session</h2><span>{manualMfaSession.status.replaceAll("_", " ")}</span></div>
               <div className="diagnostic-grid">
                 <div><span className="step-label">Connection mode</span><strong>{nibiSettings.connection_mode}</strong></div>
+                <div><span className="step-label">Authenticated/manual session</span><strong>{manualMfaSession.status}</strong></div>
+                <div><span className="step-label">Robot access status</span><strong>{nibiSettings.robot_access_verified ? "verified" : "not verified"}</strong></div>
+                <div><span className="step-label">Active jobs count</span><strong>{activeJobsCount}</strong></div>
+                <div><span className="step-label">Jobs page login-required jobs</span><strong>{jobsPageLoginRequiredCount}</strong></div>
+                <div><span className="step-label">Jobs page recently blocked</span><strong>{manualMfaSession.jobs_page_login_required_at ? "Yes" : "No"}</strong></div>
+                <div><span className="step-label">Jobs page blocked timestamp</span><code>{manualMfaSession.jobs_page_login_required_at || "None"}</code></div>
+                <div><span className="step-label">Latest Slurm job ID</span><code>{latestPollingResult?.slurmJobId ?? "None"}</code></div>
+                <div><span className="step-label">Latest polling result</span><strong>{latestPollingResult?.status ?? "None"}</strong></div>
+                <div><span className="step-label">Polling coordinator</span><strong>{pollingDiagnostics?.coordinatorCount ?? 0}</strong></div>
+                <div><span className="step-label">Active poll timers</span><strong>{pollingDiagnostics?.activeTimerCount ?? 0}</strong></div>
+                <div><span className="step-label">In-flight polls</span><strong>{pollingDiagnostics?.inFlightRemoteRequestCount ?? 0}</strong></div>
+                <div><span className="step-label">Global queue length</span><strong>{pollingDiagnostics?.globalQueueLength ?? 0}</strong></div>
+                <div><span className="step-label">Global in-flight remote</span><strong>{pollingDiagnostics?.globalRunningRemoteRequestCount ?? 0}</strong></div>
+                <div><span className="step-label">Max global concurrency</span><strong>{pollingDiagnostics?.maxGlobalConcurrency ?? 1}</strong></div>
+                <div><span className="step-label">Queued jobs</span><code>{pollingDiagnostics?.queuedJobs.join(", ") || "None"}</code></div>
+                <div><span className="step-label">Currently executing job</span><code>{pollingDiagnostics?.currentlyExecutingJob ?? "None"}</code></div>
+                <div><span className="step-label">Coalesced requests</span><strong>{pollingDiagnostics?.coalescedRequestCount ?? 0}</strong></div>
+                <div><span className="step-label">Pollable job count</span><strong>{pollingDiagnostics?.pollableJobCount ?? 0}</strong></div>
+                <div><span className="step-label">Session health state</span><strong>{pollingDiagnostics?.sessionHealthState ?? "unknown"}</strong></div>
+                <div><span className="step-label">Session generation</span><strong>{pollingDiagnostics?.sessionGeneration ?? 0}</strong></div>
+                <div><span className="step-label">Session state source</span><strong>{pollingDiagnostics?.sessionStateSource ?? "unknown"}</strong></div>
+                <div><span className="step-label">Session checks in flight</span><strong>{pollingDiagnostics?.sessionHealthCheckInFlightCount ?? 0}</strong></div>
+                <div><span className="step-label">Last successful session check</span><code>{pollingDiagnostics?.lastSuccessfulSessionCheck ?? "None"}</code></div>
+                <div><span className="step-label">Last auth success</span><code>{pollingDiagnostics?.lastAuthSuccess ?? "None"}</code></div>
+                <div><span className="step-label">Last auth failure</span><code>{pollingDiagnostics?.lastAuthFailure ?? "None"}</code></div>
+                <div><span className="step-label">Last global writer</span><strong>{pollingDiagnostics?.lastGlobalStateWriter ?? "None"}</strong></div>
+                <div><span className="step-label">Last global reason</span><strong>{pollingDiagnostics?.lastGlobalStateWriteReason ?? "None"}</strong></div>
+                <div><span className="step-label">Stale session responses ignored</span><strong>{pollingDiagnostics?.staleSessionResponsesIgnored ?? 0}</strong></div>
+                <div><span className="step-label">Timed-out commands</span><strong>{pollingDiagnostics?.timedOutCommands ?? 0}</strong></div>
+                <div><span className="step-label">Polling session state</span><strong>{pollingDiagnostics?.authenticatedSessionState ?? "unknown"}</strong></div>
                 <div><span className="step-label">Selected Manual MFA SSH backend</span><strong>{nibiSettings.manual_mfa_ssh_backend}</strong></div>
                 <div><span className="step-label">Effective backend</span><strong>WSL</strong></div>
                 <div><span className="step-label">WSL available</span><strong>{boolLabel(manualMfaSession.wsl_available)}</strong></div>
@@ -142,11 +180,16 @@ export function DiagnosticsPage({
                 <div><span className="step-label">WSL key path</span><code>{nibiSettings.wsl_ssh_private_key_path}</code></div>
                 <div><span className="step-label">WSL control socket path</span><code>{nibiSettings.wsl_control_socket_path}</code></div>
                 <div><span className="step-label">Manual session status</span><strong>{manualMfaSession.status}</strong></div>
+                <div><span className="step-label">Parsed session status</span><strong>{manualMfaSession.parsed_session_status}</strong></div>
                 <div><span className="step-label">Control path exists</span><strong>{boolLabel(manualMfaSession.control_path_exists)}</strong></div>
                 <div><span className="step-label">Can run without password/Duo</span><strong>{boolLabel(manualMfaSession.can_run_background_commands)}</strong></div>
                 <div><span className="step-label">Session started</span><code>{manualMfaSession.session_started_at || "None"}</code></div>
                 <div><span className="step-label">Last successful command</span><code>{manualMfaSession.last_successful_command_at || "None"}</code></div>
+                <div><span className="step-label">Last manual session probe</span><code>{manualMfaSession.last_session_probe_at || "None"}</code></div>
+                <div><span className="step-label">Last session test exit code</span><strong>{manualMfaSession.last_session_test_exit_code ?? "None"}</strong></div>
                 <div><span className="step-label">Last session test result</span><strong>{manualMfaSession.last_session_test_result}</strong></div>
+                <div><span className="step-label">Last session test stdout</span><pre>{manualMfaSession.last_session_test_stdout || "(empty)"}</pre></div>
+                <div><span className="step-label">Last session test stderr</span><pre>{manualMfaSession.last_session_test_stderr || "(empty)"}</pre></div>
                 <div><span className="step-label">Last master check result</span><strong>{manualMfaSession.last_master_check_result || "None"}</strong></div>
                 <div><span className="step-label">Last FLUORCAST_AUTH_OK result</span><strong>{manualMfaSession.last_auth_ok_result || "None"}</strong></div>
                 <div><span className="step-label">Last terminal launch method</span><strong>{manualMfaSession.last_terminal_launch_method || "None"}</strong></div>
@@ -159,6 +202,12 @@ export function DiagnosticsPage({
                 <div><span className="step-label">WSL script file exists</span><strong>{boolLabel(manualMfaSession.last_script_file_exists)}</strong></div>
                 <div><span className="step-label">Manual WSL command</span><code>{manualMfaSession.manual_wsl_command || "None"}</code></div>
               </div>
+              {pollingDiagnostics?.jobsExcludedFromAutomaticPolling ? (
+                <details className="remote-check-details">
+                  <summary>Jobs excluded from automatic polling</summary>
+                  <pre>{JSON.stringify(pollingDiagnostics.jobsExcludedFromAutomaticPolling, null, 2)}</pre>
+                </details>
+              ) : null}
             </section>
           ) : null}
 

@@ -3,6 +3,7 @@ import {
   trimNibiSettings,
   validateNibiSettings,
 } from "../../features/settings";
+import { invoke } from "@tauri-apps/api/core";
 import type {
   RemoteCommandResult,
   RemoteCommandSpec,
@@ -17,8 +18,8 @@ export interface RemoteExecutor {
   validateLocalConfig(settings: NibiSettings): NibiSettingsErrors;
   testConnection(settings: NibiSettings): Promise<RemoteConnectionStatus>;
   runCommand(commandSpec: RemoteCommandSpec): Promise<RemoteCommandResult>;
-  uploadFile(localPath: string, remotePath: string): Promise<void>;
-  downloadFile(remotePath: string, localPath: string): Promise<void>;
+  uploadFile(localPath: string, remotePath: string, settings?: NibiSettings): Promise<void>;
+  downloadFile(remotePath: string, localPath: string, settings?: NibiSettings): Promise<void>;
   dispose(): Promise<void> | void;
 }
 
@@ -182,6 +183,7 @@ export class InteractiveMfaRemoteExecutor extends BaseRemoteExecutor {
   }
 
   async runCommand(commandSpec: RemoteCommandSpec): Promise<RemoteCommandResult> {
+    const settings = commandSpec.settings as NibiSettings | undefined;
     if (!this.isAuthenticated) {
       return {
         exit_code: 1,
@@ -192,11 +194,49 @@ export class InteractiveMfaRemoteExecutor extends BaseRemoteExecutor {
         redacted_command_preview: commandSpec.redacted_preview ?? commandSpec.executable,
       };
     }
-    return super.runCommand(commandSpec);
+    return invoke<RemoteCommandResult>("run_nibi_remote_command", {
+      mode: "interactive_mfa",
+      settings,
+      commandSpec,
+    });
+  }
+
+  async uploadFile(localPath: string, remotePath: string, settings?: NibiSettings): Promise<void> {
+    if (!this.isAuthenticated) {
+      throw new RemoteExecutionError(
+        "Log into NIBI first",
+        "manual_session_not_authenticated",
+      );
+    }
+    await invoke("upload_nibi_file", {
+      mode: "interactive_mfa",
+      settings,
+      localPath,
+      remotePath,
+    });
+  }
+
+  async downloadFile(remotePath: string, localPath: string, settings?: NibiSettings): Promise<void> {
+    if (!this.isAuthenticated) {
+      throw new RemoteExecutionError(
+        "Log into NIBI first",
+        "manual_session_not_authenticated",
+      );
+    }
+    await invoke("download_nibi_file", {
+      mode: "interactive_mfa",
+      settings,
+      remotePath,
+      localPath,
+    });
   }
 }
 
 export class RobotAutomationRemoteExecutor extends BaseRemoteExecutor {
+  private isVerified(settings?: NibiSettings): boolean {
+    return Boolean(settings && this.getConnectionStatus(settings).state === "robot_automation_ready");
+  }
+
   getMode(): RemoteConnectionMode {
     return "robot_automation";
   }
@@ -226,6 +266,55 @@ export class RobotAutomationRemoteExecutor extends BaseRemoteExecutor {
 
   async testConnection(settings: NibiSettings): Promise<RemoteConnectionStatus> {
     return this.getConnectionStatus(settings);
+  }
+
+  async runCommand(commandSpec: RemoteCommandSpec): Promise<RemoteCommandResult> {
+    const settings = commandSpec.settings as NibiSettings | undefined;
+    if (!this.isVerified(settings)) {
+      return {
+        exit_code: 1,
+        stdout: "",
+        stderr: "Robot automation access is not verified. Test robot automation before running background commands.",
+        duration_ms: 0,
+        command_label: commandSpec.label,
+        redacted_command_preview: commandSpec.redacted_preview ?? commandSpec.executable,
+      };
+    }
+    return invoke<RemoteCommandResult>("run_nibi_remote_command", {
+      mode: "robot_automation",
+      settings,
+      commandSpec,
+    });
+  }
+
+  async uploadFile(localPath: string, remotePath: string, settings?: NibiSettings): Promise<void> {
+    if (!this.isVerified(settings)) {
+      throw new RemoteExecutionError(
+        "Robot automation is not ready",
+        "robot_access_not_verified",
+      );
+    }
+    await invoke("upload_nibi_file", {
+      mode: "robot_automation",
+      settings,
+      localPath,
+      remotePath,
+    });
+  }
+
+  async downloadFile(remotePath: string, localPath: string, settings?: NibiSettings): Promise<void> {
+    if (!this.isVerified(settings)) {
+      throw new RemoteExecutionError(
+        "Robot automation access is not verified. Test robot automation before downloading files.",
+        "robot_access_not_verified",
+      );
+    }
+    await invoke("download_nibi_file", {
+      mode: "robot_automation",
+      settings,
+      remotePath,
+      localPath,
+    });
   }
 }
 
