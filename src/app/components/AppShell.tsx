@@ -1,6 +1,7 @@
 import type { CSSProperties, ReactNode } from "react";
 import type { NibiSettings } from "../../features/settings";
 import type { ManualMfaSessionUiState } from "../../lib/remote";
+import { FluorCastLogo } from "./FluorCastLogo";
 import { StatusBadge } from "./StatusBadge";
 
 export type AppPage = "home" | "prediction" | "jobs" | "settings" | "diagnostics" | "about" | "result";
@@ -15,32 +16,23 @@ const navigation: Array<{ id: Exclude<AppPage, "result">; label: string; icon: s
 ];
 
 type AppShellProps = {
-  accentColor: string;
+  appearanceStyle: CSSProperties;
   children: ReactNode;
   currentPage: AppPage;
   isManualMfaChecking?: boolean;
   manualMfaSession?: ManualMfaSessionUiState;
   nibiSettings: NibiSettings;
   onNavigate: (page: AppPage) => void;
-  secondaryColor: string;
-};
-
-type AccentStyle = CSSProperties & {
-  "--accent": string;
-  "--accent-color": string;
-  "--secondary": string;
-  "--secondary-color": string;
 };
 
 export function AppShell({
-  accentColor,
+  appearanceStyle,
   children,
   currentPage,
   isManualMfaChecking = false,
   manualMfaSession,
   nibiSettings,
   onNavigate,
-  secondaryColor,
 }: AppShellProps) {
   function isActivePage(page: AppPage) {
     return currentPage === page || (currentPage === "result" && page === "jobs");
@@ -55,15 +47,10 @@ export function AppShell({
   return (
     <div
       className="app-shell"
-      style={{
-        "--accent": accentColor,
-        "--accent-color": accentColor,
-        "--secondary": secondaryColor,
-        "--secondary-color": secondaryColor,
-      } as AccentStyle}
+      style={appearanceStyle}
     >
       <aside className="sidebar">
-        <div className="brand"><span className="mark">F</span><span>FluorCast</span></div>
+        <div className="brand"><span className="mark"><FluorCastLogo /></span><span>FluorCast</span></div>
 
         <nav className="side-nav" aria-label="Primary navigation">
           {navigation.map((item) => (

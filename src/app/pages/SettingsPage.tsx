@@ -1,99 +1,265 @@
-const accentPresets = [
-  { name: "Blue", value: "#8ab4ff" },
-  { name: "Violet", value: "#c4a7ff" },
-  { name: "Amber", value: "#f3c969" },
-  { name: "Rose", value: "#ff9bb3" },
-  { name: "Mint", value: "#8ee6c8" },
-] as const;
+import { useState } from "react";
+import {
+  appearanceColorTokens,
+  cssVariablesForPalette,
+  defaultAppearanceSettings,
+  defaultDarkPalette,
+  defaultLightPalette,
+  getContrastWarnings,
+  normalizeHexColor,
+  tokenLabels,
+  type AppearanceColorToken,
+  type AppearancePalette,
+  type AppearanceSettings,
+  type ThemeMode,
+} from "../../features/settings";
+import { FluorCastLogo } from "../components/FluorCastLogo";
 
-const secondaryPresets = [
-  { name: "Mint", value: "#8ee6c8" },
-  { name: "Amber", value: "#f3c969" },
-  { name: "Steel", value: "#9fb7c8" },
-  { name: "Coral", value: "#ffad91" },
-  { name: "Lilac", value: "#d6b8ff" },
-] as const;
+type EditingPalette = "light" | "dark";
 
 type SettingsPageProps = {
-  accentColor: string;
-  onAccentColorChange: (color: string) => void;
-  onSecondaryColorChange: (color: string) => void;
-  secondaryColor: string;
+  appearanceSettings: AppearanceSettings;
+  onAppearanceSettingsChange: (settings: AppearanceSettings) => void;
 };
 
 export function SettingsPage({
-  accentColor,
-  onAccentColorChange,
-  onSecondaryColorChange,
-  secondaryColor,
+  appearanceSettings,
+  onAppearanceSettingsChange,
 }: SettingsPageProps) {
+  const [editingPalette, setEditingPalette] = useState<EditingPalette>(
+    appearanceSettings.themeMode === "dark" ? "dark" : "light",
+  );
+  const [draftHexValues, setDraftHexValues] = useState<Partial<Record<EditingPalette, Partial<Record<AppearanceColorToken, string>>>>>({});
+  const [showResetAllConfirmation, setShowResetAllConfirmation] = useState(false);
+  const palette = editingPalette === "dark" ? appearanceSettings.darkPalette : appearanceSettings.lightPalette;
+  const warnings = getContrastWarnings(palette);
+
+  function updateSettings(next: AppearanceSettings) {
+    onAppearanceSettingsChange(next);
+  }
+
+  function updatePalette(token: AppearanceColorToken, rawValue: string) {
+    const normalized = normalizeHexColor(rawValue);
+    setDraftHexValues((current) => ({
+      ...current,
+      [editingPalette]: {
+        ...current[editingPalette],
+        [token]: rawValue,
+      },
+    }));
+    if (!normalized) {
+      return;
+    }
+
+    const nextPalette = { ...palette, [token]: normalized };
+    updateSettings({
+      ...appearanceSettings,
+      [editingPalette === "dark" ? "darkPalette" : "lightPalette"]: nextPalette,
+    });
+    setDraftHexValues((current) => ({
+      ...current,
+      [editingPalette]: {
+        ...current[editingPalette],
+        [token]: normalized,
+      },
+    }));
+  }
+
+  function displayValue(token: AppearanceColorToken) {
+    return draftHexValues[editingPalette]?.[token] ?? palette[token];
+  }
+
+  function resetCurrentPalette() {
+    updateSettings({
+      ...appearanceSettings,
+      [editingPalette === "dark" ? "darkPalette" : "lightPalette"]:
+        editingPalette === "dark" ? defaultDarkPalette : defaultLightPalette,
+    });
+    setDraftHexValues((current) => ({ ...current, [editingPalette]: {} }));
+  }
+
+  function resetAllAppearance() {
+    updateSettings(defaultAppearanceSettings);
+    setEditingPalette("light");
+    setDraftHexValues({});
+    setShowResetAllConfirmation(false);
+  }
+
   return (
-    <div className="page narrow-page">
+    <div className="page settings-page">
       <header className="page-header">
         <p className="eyebrow">Preferences</p>
         <h1>Settings</h1>
-        <p>Configure local workspace appearance preferences.</p>
+        <p>Customize the FluorCast appearance for this device.</p>
       </header>
 
-      <details className="form-card appearance-panel" aria-labelledby="appearance-heading">
-        <summary className="appearance-summary">
-          <span id="appearance-heading">Appearance</span>
-          <span>Local</span>
-        </summary>
-        <label>
-          <span>Accent color</span>
-          <div className="accent-controls">
-            <div className="accent-grid" role="group" aria-label="Accent presets">
-              {accentPresets.map((preset) => (
-                <button
-                  aria-label={`${preset.name} accent`}
-                  aria-pressed={accentColor.toLowerCase() === preset.value}
-                  className="accent-swatch"
-                  key={preset.value}
-                  onClick={() => onAccentColorChange(preset.value)}
-                  style={{ backgroundColor: preset.value }}
-                  type="button"
-                />
-              ))}
+      <section className="appearance-layout" aria-labelledby="appearance-heading">
+        <div className="appearance-editor">
+          <div className="section-heading">
+            <div>
+              <h2 id="appearance-heading">Appearance</h2>
+              <span>{editingPalette === "dark" ? "Editing dark palette" : "Editing light palette"}</span>
             </div>
-            <input
-              aria-label="Custom accent color"
-              className="color-input"
-              onChange={(event) => onAccentColorChange(event.target.value)}
-              type="color"
-              value={accentColor}
-            />
           </div>
-          <small>Accent color controls primary actions, active navigation, and key highlights.</small>
-        </label>
 
-        <label>
-          <span>Secondary color</span>
-          <div className="accent-controls">
-            <div className="accent-grid" role="group" aria-label="Secondary color presets">
-              {secondaryPresets.map((preset) => (
-                <button
-                  aria-label={`${preset.name} secondary`}
-                  aria-pressed={secondaryColor.toLowerCase() === preset.value}
-                  className="accent-swatch secondary-swatch"
-                  key={preset.value}
-                  onClick={() => onSecondaryColorChange(preset.value)}
-                  style={{ backgroundColor: preset.value }}
-                  type="button"
-                />
+          <fieldset className="segmented-field">
+            <legend>Theme mode</legend>
+            <div className="segmented-control">
+              {(["system", "light", "dark"] as ThemeMode[]).map((mode) => (
+                <label className="segmented-option" key={mode}>
+                  <input
+                    checked={appearanceSettings.themeMode === mode}
+                    name="theme-mode"
+                    onChange={() => updateSettings({ ...appearanceSettings, themeMode: mode })}
+                    type="radio"
+                  />
+                  <span>{mode[0].toUpperCase()}{mode.slice(1)}</span>
+                </label>
               ))}
             </div>
-            <input
-              aria-label="Custom secondary color"
-              className="color-input"
-              onChange={(event) => onSecondaryColorChange(event.target.value)}
-              type="color"
-              value={secondaryColor}
-            />
+          </fieldset>
+
+          <fieldset className="segmented-field">
+            <legend>Palette being edited</legend>
+            <div className="segmented-control">
+              {(["light", "dark"] as EditingPalette[]).map((mode) => (
+                <label className="segmented-option" key={mode}>
+                  <input
+                    checked={editingPalette === mode}
+                    name="editing-palette"
+                    onChange={() => setEditingPalette(mode)}
+                    type="radio"
+                  />
+                  <span>{mode[0].toUpperCase()}{mode.slice(1)} palette</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+
+          <div className="palette-grid">
+            {appearanceColorTokens.map((token) => {
+              const inputValue = displayValue(token);
+              const isInvalid = normalizeHexColor(inputValue) === null;
+              const inputId = `${editingPalette}-${token}-hex`;
+              const labelId = `${inputId}-label`;
+              const errorId = `${inputId}-error`;
+              return (
+                <div className="color-token-control" key={token}>
+                  <span id={labelId}>{tokenLabels[token]}</span>
+                  <div className="color-token-inputs">
+                    <input
+                      aria-label={`${tokenLabels[token]} color picker`}
+                      className="color-input"
+                      onChange={(event) => updatePalette(token, event.target.value)}
+                      type="color"
+                      value={palette[token]}
+                    />
+                    <input
+                      aria-describedby={isInvalid ? errorId : undefined}
+                      aria-invalid={isInvalid}
+                      aria-labelledby={labelId}
+                      id={inputId}
+                      onBlur={() => {
+                        const normalized = normalizeHexColor(inputValue);
+                        if (normalized) updatePalette(token, normalized);
+                      }}
+                      onChange={(event) => updatePalette(token, event.target.value)}
+                      type="text"
+                      value={inputValue}
+                    />
+                  </div>
+                  {isInvalid ? (
+                    <small className="field-error" id={errorId}>Use a 6-digit hex color, like #8ab4ff.</small>
+                  ) : null}
+                </div>
+              );
+            })}
           </div>
-          <small>Secondary color supports quieter buttons, cards, badges, and helper panels.</small>
-        </label>
-      </details>
+
+          {warnings.length > 0 ? (
+            <div className="contrast-warning-panel" role="status">
+              <h3>Contrast warnings</h3>
+              <ul>
+                {warnings.map((warning) => (
+                  <li key={warning.id}>
+                    {warning.label}: {warning.ratio}:1, target {warning.required}:1
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <p className="settings-note">The current palette passes the built-in contrast checks.</p>
+          )}
+
+          <div className="form-actions">
+            <span>Changes save immediately and each palette stays independent.</span>
+            <div className="button-row">
+              <button className="secondary-button" onClick={resetCurrentPalette} type="button">
+                Restore current palette defaults
+              </button>
+              <button
+                className="secondary-button danger-button"
+                onClick={() => setShowResetAllConfirmation(true)}
+                type="button"
+              >
+                Restore all appearance defaults
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <AppearancePreview palette={palette} />
+      </section>
+
+      {showResetAllConfirmation ? (
+        <div className="dialog-backdrop" role="presentation">
+          <div className="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="reset-appearance-heading">
+            <h2 id="reset-appearance-heading">Restore all appearance defaults?</h2>
+            <p>This replaces the selected mode and both custom palettes with FluorCast defaults.</p>
+            <div className="button-row">
+              <button className="secondary-button" onClick={() => setShowResetAllConfirmation(false)} type="button">
+                Cancel
+              </button>
+              <button className="primary-button" onClick={resetAllAppearance} type="button">
+                Restore defaults
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
+  );
+}
+
+function AppearancePreview({ palette }: { palette: AppearancePalette }) {
+  return (
+    <aside className="appearance-preview" style={cssVariablesForPalette(palette)} aria-label="Appearance live preview">
+      <div className="preview-shell">
+        <div className="preview-sidebar">
+          <span className="preview-logo" aria-hidden="true"><FluorCastLogo /></span>
+          <span className="preview-nav-active">Dashboard</span>
+          <span>Jobs</span>
+        </div>
+        <div className="preview-main">
+          <div className="preview-card">
+            <h2>Prediction setup</h2>
+            <p>Readable text, muted helper copy, borders, inputs, and controls all use the edited tokens.</p>
+            <input aria-label="Preview input" readOnly value="C1=CC=CC=C1" />
+            <div className="button-row preview-buttons">
+              <button className="primary-button" type="button">Run</button>
+              <button className="secondary-button" type="button">Save</button>
+            </div>
+            <div className="preview-state-grid" aria-label="Preview status colors">
+              <span className="preview-success">Success</span>
+              <span className="preview-warning">Warning</span>
+              <span className="preview-error">Error</span>
+              <span className="preview-info">Info</span>
+            </div>
+            <button className="preview-focus-target" type="button">Focused state</button>
+            <p className="preview-selection">Selected result row</p>
+          </div>
+        </div>
+      </div>
+    </aside>
   );
 }

@@ -14,21 +14,27 @@ import {
   type StoredPredictionJob,
 } from "../features/jobs";
 import {
+  applyAppearanceToDocument,
+  cssVariablesForPalette,
+  defaultAppearanceSettings,
   defaultNibiSettings,
+  loadAppearanceSettings,
   loadNibiSettings,
+  paletteForResolvedMode,
+  resolveThemeMode,
+  saveAppearanceSettings,
   saveNibiSettings,
+  type AppearanceSettings,
   type NibiSettings,
 } from "../features/settings";
 import {
   addJobEvent,
   deleteJobPermanently,
   getJobWithResult,
-  getSetting,
   initializeDatabase,
   listJobs,
   saveJob,
   saveResult,
-  saveSetting,
   updateJobStatus,
   updateJobNote,
   type JobWithResult,
@@ -51,9 +57,6 @@ import {
 } from "../lib/remote";
 import { PredictionJobValidationError } from "../lib/schemas";
 
-const ACCENT_COLOR_SETTING_KEY = "accentColor";
-const SECONDARY_COLOR_SETTING_KEY = "secondaryColor";
-const DEFAULT_SECONDARY_COLOR = "#8ee6c8";
 type DatabaseStatus = "initializing" | "ready" | "fatal";
 function getPageFromHash(): { page: AppPage; jobId: string | null } {
   const hash = window.location.hash.replace(/^#\/?/, "");
@@ -78,8 +81,10 @@ function setHashForPage(page: AppPage, jobId?: string | null) {
 export function App() {
   const initialLocation = getPageFromHash();
   const [currentPage, setCurrentPage] = useState<AppPage>(initialLocation.page);
-  const [accentColor, setAccentColor] = useState("#8ab4ff");
-  const [secondaryColor, setSecondaryColor] = useState(DEFAULT_SECONDARY_COLOR);
+  const [appearanceSettings, setAppearanceSettings] = useState<AppearanceSettings>(defaultAppearanceSettings);
+  const [systemPrefersDark, setSystemPrefersDark] = useState(
+    () => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true,
+  );
   const [nibiSettings, setNibiSettings] = useState<NibiSettings>(defaultNibiSettings);
   const [manualMfaSession, setManualMfaSession] = useState<ManualMfaSessionUiState>(
     defaultManualMfaSessionState,
@@ -134,6 +139,21 @@ export function App() {
     jobsStateRef.current = jobsState;
     selectedJobIdRef.current = selectedJobId;
   });
+
+  useEffect(() => {
+    const query = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!query) {
+      return;
+    }
+    const handleChange = (event: MediaQueryListEvent) => setSystemPrefersDark(event.matches);
+    setSystemPrefersDark(query.matches);
+    query.addEventListener("change", handleChange);
+    return () => query.removeEventListener("change", handleChange);
+  }, []);
+
+  useEffect(() => {
+    applyAppearanceToDocument(appearanceSettings, systemPrefersDark);
+  }, [appearanceSettings, systemPrefersDark]);
 
   const refreshJobsFromDatabase = useCallback(async () => {
     const persistedJobs = await listJobs();
@@ -251,13 +271,11 @@ export function App() {
         }
 
         const [
-          persistedAccentColor,
-          persistedSecondaryColor,
+          persistedAppearanceSettings,
           persistedNibiSettings,
           persistedJobs,
         ] = await Promise.all([
-          getSetting(ACCENT_COLOR_SETTING_KEY),
-          getSetting(SECONDARY_COLOR_SETTING_KEY),
+          loadAppearanceSettings(),
           loadNibiSettings(),
           listJobs(),
         ]);
@@ -266,12 +284,7 @@ export function App() {
           return;
         }
 
-        if (persistedAccentColor) {
-          setAccentColor(persistedAccentColor);
-        }
-        if (persistedSecondaryColor) {
-          setSecondaryColor(persistedSecondaryColor);
-        }
+        setAppearanceSettings(persistedAppearanceSettings);
         setNibiSettings(persistedNibiSettings);
         dispatchJobs({ type: "set_jobs", jobs: persistedJobs });
         setDatabaseStatus("ready");
@@ -876,16 +889,9 @@ export function App() {
     }
   }
 
-  function handleAccentColorChange(color: string) {
-    setAccentColor(color);
-    void saveSetting(ACCENT_COLOR_SETTING_KEY, color).catch((error: unknown) => {
-      setDatabaseError(error instanceof Error ? error.message : "Local setting failed to persist.");
-    });
-  }
-
-  function handleSecondaryColorChange(color: string) {
-    setSecondaryColor(color);
-    void saveSetting(SECONDARY_COLOR_SETTING_KEY, color).catch((error: unknown) => {
+  function handleAppearanceSettingsChange(settings: AppearanceSettings) {
+    setAppearanceSettings(settings);
+    void saveAppearanceSettings(settings).catch((error: unknown) => {
       setDatabaseError(error instanceof Error ? error.message : "Local setting failed to persist.");
     });
   }
@@ -1155,10 +1161,8 @@ export function App() {
       case "settings":
         return (
           <SettingsPage
-            accentColor={accentColor}
-            secondaryColor={secondaryColor}
-            onAccentColorChange={handleAccentColorChange}
-            onSecondaryColorChange={handleSecondaryColorChange}
+            appearanceSettings={appearanceSettings}
+            onAppearanceSettingsChange={handleAppearanceSettingsChange}
           />
         );
       case "diagnostics":
@@ -1184,13 +1188,17 @@ export function App() {
 
   return (
     <AppShell
-      accentColor={accentColor}
+      appearanceStyle={cssVariablesForPalette(
+        paletteForResolvedMode(
+          appearanceSettings,
+          resolveThemeMode(appearanceSettings.themeMode, systemPrefersDark),
+        ),
+      )}
       currentPage={currentPage}
       isManualMfaChecking={manualMfaJobStatus === "Testing the FluorCast Manual MFA session."}
       manualMfaSession={manualMfaSession}
       nibiSettings={nibiSettings}
       onNavigate={navigate}
-      secondaryColor={secondaryColor}
     >
       {databaseError ? (
         <div className="app-alert" role="status">

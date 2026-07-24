@@ -1,5 +1,6 @@
 import { getSetting, saveSetting } from "../../lib/db";
 import type { RemoteConnectionMode } from "../../lib/remote/types";
+export * from "./appearance";
 
 export const NIBI_SETTINGS_KEY = "nibiSettings";
 export const CANONICAL_WSL_CONTROL_SOCKET_PATH = "$HOME/.fluorcast/ssh/cm-nibi.sock";
