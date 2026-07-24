@@ -21,6 +21,7 @@ import {
 } from "../features/settings";
 import {
   addJobEvent,
+  deleteJobPermanently,
   getJobWithResult,
   getSetting,
   initializeDatabase,
@@ -29,6 +30,7 @@ import {
   saveResult,
   saveSetting,
   updateJobStatus,
+  updateJobNote,
   type JobWithResult,
 } from "../lib/db";
 import {
@@ -691,6 +693,31 @@ export function App() {
     return result;
   }, [createSelectedRemoteExecutor, nibiSettings, refreshJobsFromDatabase]);
 
+  const saveLocalJobNote = useCallback(async (jobId: string, note: string | null) => {
+    const saved = await updateJobNote(jobId, note);
+    if (saved) {
+      dispatchJobs({ type: "patch_job", id: jobId, patch: note ? { note } : { note: undefined } });
+      if (selectedJobIdRef.current === jobId) {
+        setSelectedJobDetail((current) => current ? { ...current, note: note ?? undefined } : current);
+      }
+    }
+    return saved;
+  }, []);
+
+  const deleteLocalJob = useCallback(async (jobId: string) => {
+    const deleted = await deleteJobPermanently(jobId);
+    if (deleted) {
+      dispatchJobs({ type: "remove_job", id: jobId });
+      if (selectedJobIdRef.current === jobId) {
+        setSelectedJobId(null);
+        setSelectedJobDetail(null);
+        setResultLoadError(null);
+        setHashForPage("jobs");
+      }
+    }
+    return deleted;
+  }, []);
+
   useEffect(() => {
     const diagnosticsUpdate = pollingDiagnosticsUpdateRef.current;
     const handleDiagnosticsChange = (diagnostics: SlurmPollingCoordinatorDiagnostics) => {
@@ -1121,6 +1148,8 @@ export function App() {
             onRefreshJobStatus={refreshRemoteJob}
             onCancelRemoteJob={cancelRemoteSlurmJob}
             onSubmitSlurmJob={submitRemoteSlurmJob}
+            onSaveJobNote={saveLocalJobNote}
+            onDeleteJobPermanently={deleteLocalJob}
           />
         );
       case "settings":

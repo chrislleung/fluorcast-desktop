@@ -1,4 +1,6 @@
+import { useEffect, useRef, useState } from "react";
 import type { StoredPredictionJob } from "../../features/jobs";
+import { JOB_NOTE_MAX_LENGTH } from "../../lib/db";
 import type { NibiSettings } from "../../features/settings";
 import {
   canManuallyRefreshSlurmJob,
@@ -23,6 +25,8 @@ type JobsPageProps = {
   onRefreshJobStatus?: (job: StoredPredictionJob, traceId: string) => Promise<unknown>;
   onCancelRemoteJob?: (job: StoredPredictionJob) => Promise<unknown>;
   onSubmitSlurmJob?: (job: StoredPredictionJob) => Promise<unknown>;
+  onSaveJobNote?: (jobId: string, note: string | null) => Promise<boolean>;
+  onDeleteJobPermanently?: (jobId: string) => Promise<boolean>;
 };
 
 const statusLabels: Record<StoredPredictionJob["status"], string> = {
@@ -86,6 +90,41 @@ function isActiveJobStatus(status: StoredPredictionJob["status"]) {
     || status === "running";
 }
 
+const deleteBlockedStatuses = new Set<StoredPredictionJob["status"]>([
+  "submitting",
+  "upload_waiting_for_login",
+  "uploaded_to_nibi",
+  "queued",
+  "submitted_to_slurm",
+  "running",
+]);
+
+const locallyDeletableStatuses = new Set<StoredPredictionJob["status"]>([
+  "queued_locally",
+  "completed",
+  "failed",
+  "cancelled",
+  "timed_out",
+  "timeout",
+  "upload_failed",
+  "slurm_submission_failed",
+  "robot_access_required",
+  "robot_auth_failed",
+  "output_missing",
+  "output_invalid",
+  "download_failed",
+]);
+
+function canDeleteLocally(job: StoredPredictionJob) {
+  if (deleteBlockedStatuses.has(job.status)) {
+    return false;
+  }
+  if (job.remote_slurm_id && !locallyDeletableStatuses.has(job.status)) {
+    return false;
+  }
+  return true;
+}
+
 function isManualSessionReady(manualMfaSession?: ManualMfaSessionUiState) {
   return manualMfaSession?.status === "authenticated" && manualMfaSession.can_run_background_commands;
 }
@@ -116,6 +155,10 @@ function safeFailureSummary(job: StoredPredictionJob) {
   return job.error_message?.split(/\n\n/)[0] ?? "Failed";
 }
 
+function shortJobId(jobId: string) {
+  return jobId.length > 12 ? `${jobId.slice(0, 8)}...` : jobId;
+}
+
 export function JobsPage({
   jobs,
   manualMfaSession,
@@ -128,10 +171,71 @@ export function JobsPage({
   onRefreshJobStatus,
   onCancelRemoteJob,
   onSubmitSlurmJob,
+  onSaveJobNote,
+  onDeleteJobPermanently,
   latestManualRefreshTraceByJob = {},
   latestGlobalBannerWriteTrace,
 }: JobsPageProps) {
   const refreshingJobs = new Set(refreshingJobIds);
+  const [editingNoteJobId, setEditingNoteJobId] = useState<string | null>(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteSavingJobId, setNoteSavingJobId] = useState<string | null>(null);
+  const [noteErrorByJob, setNoteErrorByJob] = useState<Record<string, string>>({});
+  const [deleteCandidate, setDeleteCandidate] = useState<StoredPredictionJob | null>(null);
+  const [deleteErrorByJob, setDeleteErrorByJob] = useState<Record<string, string>>({});
+  const [deleteDiagnosticByJob, setDeleteDiagnosticByJob] = useState<Record<string, string>>({});
+  const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
+  const [openMenuJobId, setOpenMenuJobId] = useState<string | null>(null);
+  const deleteDialogRef = useRef<HTMLDivElement | null>(null);
+  const deleteTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const menuTriggerRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const menuRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+  useEffect(() => {
+    if (deleteCandidate) {
+      deleteDialogRef.current?.focus();
+    } else {
+      deleteTriggerRef.current?.focus();
+    }
+  }, [deleteCandidate]);
+
+  useEffect(() => {
+    if (!openMenuJobId) {
+      return;
+    }
+
+    const menu = menuRefs.current[openMenuJobId];
+    const firstEnabledItem = menu?.querySelector<HTMLButtonElement>("button:not(:disabled)");
+    firstEnabledItem?.focus();
+
+    function handlePointerDown(event: MouseEvent) {
+      const target = event.target;
+      if (!(target instanceof Node) || !openMenuJobId) {
+        return;
+      }
+      const menuElement = menuRefs.current[openMenuJobId];
+      const triggerElement = menuTriggerRefs.current[openMenuJobId];
+      if (menuElement?.contains(target) || triggerElement?.contains(target)) {
+        return;
+      }
+      setOpenMenuJobId(null);
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setOpenMenuJobId(null);
+        menuTriggerRefs.current[openMenuJobId]?.focus();
+      }
+    }
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [openMenuJobId]);
 
   function refreshJobStatus(job: StoredPredictionJob) {
     const traceId = createRefreshTraceId();
@@ -148,6 +252,279 @@ export function JobsPage({
     if (window.confirm(`Cancel Slurm job ${job.remote_slurm_id}?`)) {
       void onCancelRemoteJob?.(job);
     }
+  }
+
+  function startNoteEdit(job: StoredPredictionJob) {
+    setEditingNoteJobId(job.id);
+    setNoteDraft(job.note ?? "");
+    setNoteErrorByJob((current) => ({ ...current, [job.id]: "" }));
+  }
+
+  function selectNoteMenuItem(job: StoredPredictionJob) {
+    startNoteEdit(job);
+    setOpenMenuJobId(null);
+  }
+
+  async function saveNote(job: StoredPredictionJob, overrideDraft?: string) {
+    if (!onSaveJobNote || noteSavingJobId) return;
+    const normalizedNote = (overrideDraft ?? noteDraft).trim() || null;
+    setNoteSavingJobId(job.id);
+    setNoteErrorByJob((current) => ({ ...current, [job.id]: "" }));
+    try {
+      const saved = await onSaveJobNote(job.id, normalizedNote);
+      if (!saved) {
+        throw new Error("Local note could not be saved.");
+      }
+      setEditingNoteJobId(null);
+      setNoteDraft("");
+    } catch (error) {
+      setNoteErrorByJob((current) => ({
+        ...current,
+        [job.id]: error instanceof Error ? error.message : "Local note could not be saved.",
+      }));
+    } finally {
+      setNoteSavingJobId(null);
+    }
+  }
+
+  function closeDeleteDialog() {
+    setDeleteCandidate(null);
+  }
+
+  async function confirmPermanentDelete() {
+    if (!deleteCandidate || !onDeleteJobPermanently || deletingJobId) return;
+    if (!canDeleteLocally(deleteCandidate)) {
+      setDeleteErrorByJob((current) => ({
+        ...current,
+        [deleteCandidate.id]: "Cancel the remote job and wait for it to reach a terminal state before deleting it locally.",
+      }));
+      closeDeleteDialog();
+      return;
+    }
+
+    setDeletingJobId(deleteCandidate.id);
+    setDeleteErrorByJob((current) => ({ ...current, [deleteCandidate.id]: "" }));
+    setDeleteDiagnosticByJob((current) => ({ ...current, [deleteCandidate.id]: "" }));
+    try {
+      const deleted = await onDeleteJobPermanently(deleteCandidate.id);
+      if (!deleted) {
+        throw new Error("Local job could not be deleted.");
+      }
+      setEditingNoteJobId((current) => current === deleteCandidate.id ? null : current);
+      setNoteErrorByJob((current) => {
+        const next = { ...current };
+        delete next[deleteCandidate.id];
+        return next;
+      });
+      setDeleteDiagnosticByJob((current) => {
+        const next = { ...current };
+        delete next[deleteCandidate.id];
+        return next;
+      });
+      closeDeleteDialog();
+    } catch (error) {
+      const technicalDetails = typeof error === "object"
+        && error !== null
+        && "technicalDetails" in error
+        && typeof (error as { technicalDetails?: unknown }).technicalDetails === "string"
+        ? (error as { technicalDetails: string }).technicalDetails
+        : error instanceof Error
+          ? error.message
+          : "Local job could not be deleted.";
+      setDeleteErrorByJob((current) => ({
+        ...current,
+        [deleteCandidate.id]: "Local job could not be deleted.",
+      }));
+      setDeleteDiagnosticByJob((current) => ({
+        ...current,
+        [deleteCandidate.id]: technicalDetails,
+      }));
+      closeDeleteDialog();
+    } finally {
+      setDeletingJobId(null);
+    }
+  }
+
+  function renderJobNote(job: StoredPredictionJob) {
+    const isEditing = editingNoteJobId === job.id;
+    const hasNote = Boolean(job.note);
+    const remaining = JOB_NOTE_MAX_LENGTH - noteDraft.length;
+    const showCount = isEditing && remaining <= 200;
+    const textareaId = `job-note-${job.id}`;
+    const errorId = `job-note-error-${job.id}`;
+
+    if (!hasNote && !isEditing) {
+      return null;
+    }
+
+    return (
+      <section className="job-note-area" aria-label={`Note for job ${job.id}`}>
+        {hasNote && !isEditing ? (
+          <p className="job-note-text">{job.note}</p>
+        ) : null}
+        {isEditing ? (
+          <div className="job-note-editor">
+            <label htmlFor={textareaId}>
+              Job note
+              <textarea
+                aria-describedby={noteErrorByJob[job.id] ? errorId : undefined}
+                id={textareaId}
+                maxLength={JOB_NOTE_MAX_LENGTH}
+                onChange={(event) => setNoteDraft(event.target.value)}
+                rows={4}
+                value={noteDraft}
+              />
+            </label>
+            {showCount ? (
+              <span className="field-help">{noteDraft.length} / {JOB_NOTE_MAX_LENGTH}</span>
+            ) : null}
+            {noteErrorByJob[job.id] ? (
+              <p className="field-error" id={errorId} role="alert">{noteErrorByJob[job.id]}</p>
+            ) : null}
+            <div className="button-row job-note-actions">
+              {hasNote ? (
+                <button
+                  className="secondary-button compact-button cancel-button"
+                  disabled={noteSavingJobId === job.id}
+                  onClick={() => {
+                    void saveNote(job, "");
+                  }}
+                  type="button"
+                >
+                  Remove note
+                </button>
+              ) : null}
+              <button
+                className="secondary-button compact-button"
+                disabled={noteSavingJobId === job.id}
+                onClick={() => {
+                  setEditingNoteJobId(null);
+                  setNoteDraft(job.note ?? "");
+                }}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="secondary-button compact-button"
+                disabled={noteSavingJobId === job.id}
+                onClick={() => void saveNote(job)}
+                type="button"
+              >
+                {noteSavingJobId === job.id ? "Saving..." : "Save note"}
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </section>
+    );
+  }
+
+  function renderDeleteFeedback(job: StoredPredictionJob) {
+    const errorId = `job-delete-error-${job.id}`;
+    const diagnosticId = `job-delete-diagnostics-${job.id}`;
+    if (!deleteErrorByJob[job.id] && !deleteDiagnosticByJob[job.id]) {
+      return null;
+    }
+
+    return (
+      <section className="job-delete-feedback" aria-label={`Delete status for job ${job.id}`}>
+        {deleteErrorByJob[job.id] ? (
+          <p className="field-error" id={errorId} role="alert">{deleteErrorByJob[job.id]}</p>
+        ) : null}
+        {deleteDiagnosticByJob[job.id] ? (
+          <details className="remote-check-details job-detail-row" id={diagnosticId}>
+            <summary>Development diagnostics</summary>
+            <pre>{deleteDiagnosticByJob[job.id]}</pre>
+          </details>
+        ) : null}
+      </section>
+    );
+  }
+
+  function renderOverflowMenu(job: StoredPredictionJob) {
+    const isOpen = openMenuJobId === job.id;
+    const menuId = `job-overflow-menu-${job.id}`;
+    const deleteBlocked = !canDeleteLocally(job);
+    const deleteHelpId = `job-delete-menu-help-${job.id}`;
+    return (
+      <div
+        className="job-overflow"
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget)) {
+            setOpenMenuJobId((current) => current === job.id ? null : current);
+          }
+        }}
+      >
+        <button
+          aria-controls={menuId}
+          aria-expanded={isOpen}
+          aria-haspopup="menu"
+          aria-label={`More actions for job ${shortJobId(job.id)}`}
+          className="secondary-button compact-button icon-button overflow-menu-trigger"
+          onClick={(event) => {
+            menuTriggerRefs.current[job.id] = event.currentTarget;
+            setOpenMenuJobId((current) => current === job.id ? null : job.id);
+          }}
+          ref={(element) => {
+            menuTriggerRefs.current[job.id] = element;
+          }}
+          type="button"
+        >
+          <span aria-hidden="true">⋮</span>
+        </button>
+        {isOpen ? (
+          <div
+            aria-label={`Actions for job ${shortJobId(job.id)}`}
+            className="job-overflow-menu"
+            id={menuId}
+            ref={(element) => {
+              menuRefs.current[job.id] = element;
+            }}
+            role="menu"
+          >
+            <button
+              className="job-overflow-item"
+              onClick={() => selectNoteMenuItem(job)}
+              role="menuitem"
+              type="button"
+            >
+              {job.note ? "Edit note" : "Add note"}
+            </button>
+            {deleteBlocked ? (
+              <>
+                <button
+                  aria-describedby={deleteHelpId}
+                  className="job-overflow-item job-overflow-item-danger"
+                  disabled
+                  role="menuitem"
+                  type="button"
+                >
+                  Delete job permanently
+                </button>
+                <p className="job-overflow-help" id={deleteHelpId}>
+                  Cancel the remote job and wait for it to reach a terminal state before deleting it locally.
+                </p>
+              </>
+            ) : (
+              <button
+                className="job-overflow-item job-overflow-item-danger"
+                disabled={deletingJobId === job.id}
+                onClick={() => {
+                  deleteTriggerRef.current = menuTriggerRefs.current[job.id];
+                  setOpenMenuJobId(null);
+                  setDeleteCandidate(job);
+                }}
+                role="menuitem"
+                type="button"
+              >
+                Delete job permanently
+              </button>
+            )}
+          </div>
+        ) : null}
+      </div>
+    );
   }
 
   function renderJobActions(job: StoredPredictionJob) {
@@ -501,6 +878,7 @@ export function JobsPage({
                     </div>
                     <div className="job-card-actions" aria-label={`Actions for job ${job.id}`}>
                       {renderJobActions(job)}
+                      {renderOverflowMenu(job)}
                     </div>
                   </div>
 
@@ -525,6 +903,8 @@ export function JobsPage({
                     ) : null}
                   </dl>
 
+                  {renderJobNote(job)}
+
                   {job.remote_job_dir ? (
                     <details className="remote-check-details job-detail-row">
                       <summary>Remote folder</summary>
@@ -544,12 +924,76 @@ export function JobsPage({
                       <pre>{formatRefreshDiagnosticsText(latestManualRefreshTraceByJob[job.id], latestGlobalBannerWriteTrace)}</pre>
                     </details>
                   ) : null}
+                  {renderDeleteFeedback(job)}
                 </article>
               </li>
             ))}
           </ol>
         </section>
       )}
+      {deleteCandidate ? (
+        <div className="dialog-backdrop" role="presentation">
+          <div
+            aria-labelledby="delete-job-dialog-title"
+            aria-modal="true"
+            className="confirmation-dialog"
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                closeDeleteDialog();
+              }
+            }}
+            ref={deleteDialogRef}
+            role="dialog"
+            tabIndex={-1}
+          >
+            <h2 id="delete-job-dialog-title">Delete local job permanently?</h2>
+            <p>
+              The local job record will be permanently deleted. Locally stored results, events,
+              logs, and related records will also be deleted. This action cannot be undone.
+            </p>
+            <p>
+              The remote NIBI folder will not be deleted, and this action does not cancel an
+              active Slurm job.
+            </p>
+            <dl className="confirmation-details">
+              <div>
+                <dt>Local job ID</dt>
+                <dd><code>{deleteCandidate.id}</code></dd>
+              </div>
+              <div>
+                <dt>Created</dt>
+                <dd>{formatCreatedDate(deleteCandidate.created_at)}</dd>
+              </div>
+              <div>
+                <dt>Model choice</dt>
+                <dd>{deleteCandidate.model_choice}</dd>
+              </div>
+              <div>
+                <dt>Status</dt>
+                <dd>{statusLabels[deleteCandidate.status]}</dd>
+              </div>
+            </dl>
+            <div className="button-row">
+              <button
+                className="secondary-button compact-button"
+                disabled={deletingJobId === deleteCandidate.id}
+                onClick={closeDeleteDialog}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="secondary-button compact-button cancel-button"
+                disabled={deletingJobId === deleteCandidate.id}
+                onClick={() => void confirmPermanentDelete()}
+                type="button"
+              >
+                {deletingJobId === deleteCandidate.id ? "Deleting..." : "Permanently delete job"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

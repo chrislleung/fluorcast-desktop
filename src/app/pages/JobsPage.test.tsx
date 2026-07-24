@@ -1,4 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { StoredPredictionJob } from "../../features/jobs";
 import { defaultNibiSettings } from "../../features/settings";
@@ -15,6 +16,10 @@ const baseJob: StoredPredictionJob = {
   remote_slurm_id: "12345",
   remote_job_dir: "/home/alice/scratch/fluorcast-jobs/job-1",
 };
+
+function openJobMenu(jobId = "job-1") {
+  fireEvent.click(screen.getByRole("button", { name: `More actions for job ${jobId}` }));
+}
 
 describe("JobsPage recovery actions", () => {
   afterEach(() => {
@@ -580,5 +585,355 @@ describe("JobsPage recovery actions", () => {
 
     expect(window.confirm).toHaveBeenCalledWith("Cancel Slurm job 12345?");
     expect(cancel).toHaveBeenCalledWith(expect.objectContaining({ remote_slurm_id: "12345" }));
+  });
+
+  it("renders one overflow trigger per job card with job-specific accessible names", () => {
+    render(
+      <JobsPage
+        jobs={[
+          { ...baseJob, id: "job-1", status: "completed", remote_slurm_id: undefined },
+          { ...baseJob, id: "job-2", status: "running" },
+        ]}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByRole("button", { name: /More actions for job/ })).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "More actions for job job-1" })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("button", { name: "More actions for job job-2" })).toHaveAttribute("aria-controls", "job-overflow-menu-job-2");
+  });
+
+  it("opens only one overflow menu at a time and closes on outside click and Escape", () => {
+    render(
+      <JobsPage
+        jobs={[
+          { ...baseJob, id: "job-1", status: "completed", remote_slurm_id: undefined },
+          { ...baseJob, id: "job-2", status: "completed", remote_slurm_id: undefined },
+        ]}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    openJobMenu("job-1");
+    expect(screen.getByRole("menu", { name: "Actions for job job-1" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "More actions for job job-1" })).toHaveAttribute("aria-expanded", "true");
+
+    openJobMenu("job-2");
+    expect(screen.queryByRole("menu", { name: "Actions for job job-1" })).not.toBeInTheDocument();
+    expect(screen.getByRole("menu", { name: "Actions for job job-2" })).toBeInTheDocument();
+
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+
+    openJobMenu("job-1");
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("associates menu note actions with the correct job card", () => {
+    render(
+      <JobsPage
+        jobs={[
+          { ...baseJob, id: "job-1", status: "completed", remote_slurm_id: undefined },
+          { ...baseJob, id: "job-2", status: "completed", remote_slurm_id: undefined, note: "saved for job 2" },
+        ]}
+        onOpenResult={vi.fn()}
+        onSaveJobNote={vi.fn()}
+      />,
+    );
+
+    openJobMenu("job-2");
+    expect(screen.getByRole("menuitem", { name: "Edit note" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit note" }));
+
+    const jobOneCard = screen.getByRole("article", { name: "Job job-1" });
+    const jobTwoCard = screen.getByRole("article", { name: "Job job-2" });
+    expect(within(jobOneCard).queryByLabelText("Job note")).not.toBeInTheDocument();
+    expect(within(jobTwoCard).getByLabelText("Job note")).toHaveValue("saved for job 2");
+  });
+
+  it("does not invoke permanent deletion from disabled active-job menu items", () => {
+    const deleteJob = vi.fn();
+    render(
+      <JobsPage
+        jobs={[{ ...baseJob, status: "running" }]}
+        onOpenResult={vi.fn()}
+        onDeleteJobPermanently={deleteJob}
+      />,
+    );
+
+    openJobMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete job permanently" }));
+
+    expect(deleteJob).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByText(/Cancel the remote job and wait for it to reach a terminal state/i)).toBeInTheDocument();
+  });
+
+  it("shows Add note for a job without a note and opens only that job editor", () => {
+    render(
+      <JobsPage
+        jobs={[
+          { ...baseJob, id: "job-1", status: "completed", remote_slurm_id: undefined },
+          { ...baseJob, id: "job-2", status: "completed", remote_slurm_id: undefined },
+        ]}
+        onOpenResult={vi.fn()}
+        onSaveJobNote={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Add note" })).not.toBeInTheDocument();
+    openJobMenu("job-1");
+    expect(screen.getByRole("menuitem", { name: "Add note" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Add note" }));
+
+    expect(screen.getByLabelText("Job note")).toBeInTheDocument();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("saves, edits, cancels, and removes a note on the correct job card", async () => {
+    function Harness() {
+      const [jobs, setJobs] = useState<StoredPredictionJob[]>([
+        { ...baseJob, id: "job-1", status: "completed", remote_slurm_id: undefined },
+        { ...baseJob, id: "job-2", status: "completed", remote_slurm_id: undefined },
+      ]);
+      return (
+        <JobsPage
+          jobs={jobs}
+          onOpenResult={vi.fn()}
+          onSaveJobNote={async (jobId, note) => {
+            setJobs((current) => current.map((job) => (
+              job.id === jobId ? { ...job, note: note ?? undefined } : job
+            )));
+            return true;
+          }}
+        />
+      );
+    }
+
+    render(<Harness />);
+    openJobMenu("job-1");
+    fireEvent.click(screen.getByRole("menuitem", { name: "Add note" }));
+    fireEvent.change(screen.getByLabelText("Job note"), { target: { value: "first line\nsecond line" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save note" }));
+
+    expect(await screen.findByText((_, element) => (
+      element?.classList.contains("job-note-text") === true
+      && element.textContent === "first line\nsecond line"
+    ))).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit note" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add note" })).not.toBeInTheDocument();
+
+    openJobMenu("job-1");
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit note" }));
+    fireEvent.change(screen.getByLabelText("Job note"), { target: { value: "changed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByText((_, element) => (
+      element?.classList.contains("job-note-text") === true
+      && element.textContent === "first line\nsecond line"
+    ))).toBeInTheDocument();
+
+    openJobMenu("job-1");
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit note" }));
+    expect(screen.getByRole("button", { name: "Save note" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove note" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Remove note" }));
+    await waitFor(() => expect(screen.queryByText((_, element) => (
+      element?.classList.contains("job-note-text") === true
+      && element.textContent === "first line\nsecond line"
+    ))).not.toBeInTheDocument());
+  });
+
+  it("renders note content strictly as plain text", () => {
+    const { container } = render(
+      <JobsPage
+        jobs={[{
+          ...baseJob,
+          status: "completed",
+          remote_slurm_id: undefined,
+          note: "<script>alert('x')</script>\n<b>bold?</b>",
+        }]}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText((_, element) => (
+      element?.classList.contains("job-note-text") === true
+      && element.textContent === "<script>alert('x')</script>\n<b>bold?</b>"
+    ))).toBeInTheDocument();
+    expect(container.querySelector("script")).toBeNull();
+  });
+
+  it("disables duplicate note saves and preserves the saved note on failure", async () => {
+    const save = vi.fn(async () => {
+      throw new Error("disk is unavailable");
+    });
+    render(
+      <JobsPage
+        jobs={[{
+          ...baseJob,
+          status: "completed",
+          remote_slurm_id: undefined,
+          note: "saved note",
+        }]}
+        onOpenResult={vi.fn()}
+        onSaveJobNote={save}
+      />,
+    );
+
+    openJobMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit note" }));
+    fireEvent.change(screen.getByLabelText("Job note"), { target: { value: "next note" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save note" }));
+
+    expect(screen.getByRole("button", { name: "Saving..." })).toBeDisabled();
+    expect(await screen.findByText("disk is unavailable")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByText("saved note")).toBeInTheDocument();
+  });
+
+  it.each(["completed", "failed", "cancelled"] as const)(
+    "exposes permanent local deletion for %s jobs",
+    (status) => {
+      render(
+        <JobsPage
+          jobs={[{ ...baseJob, status, remote_slurm_id: undefined }]}
+          onOpenResult={vi.fn()}
+          onDeleteJobPermanently={vi.fn()}
+        />,
+      );
+
+      openJobMenu();
+      expect(screen.getByRole("menuitem", { name: "Delete job permanently" })).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Delete job permanently" })).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["running", "queued", "submitted_to_slurm", "submitting"] as const)(
+    "blocks permanent local deletion for %s jobs",
+    (status) => {
+      render(
+        <JobsPage
+          jobs={[{ ...baseJob, status }]}
+          onOpenResult={vi.fn()}
+          onDeleteJobPermanently={vi.fn()}
+        />,
+      );
+
+      openJobMenu();
+      expect(screen.getByRole("menuitem", { name: "Delete job permanently" })).toBeDisabled();
+      expect(screen.getByText(/Cancel the remote job and wait for it to reach a terminal state/i)).toBeInTheDocument();
+    },
+  );
+
+  it("requires confirmation before permanently deleting a local job and shows identity", async () => {
+    const deleteJob = vi.fn(async () => true);
+    render(
+      <JobsPage
+        jobs={[{ ...baseJob, status: "completed", remote_slurm_id: undefined }]}
+        onOpenResult={vi.fn()}
+        onDeleteJobPermanently={deleteJob}
+      />,
+    );
+
+    openJobMenu();
+
+    expect(deleteJob).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete job permanently" }));
+    expect(screen.getByRole("dialog", { name: "Delete local job permanently?" })).toBeInTheDocument();
+    expect(screen.getAllByText("job-1").length).toBeGreaterThan(1);
+    expect(screen.getAllByText("rf").length).toBeGreaterThan(1);
+    expect(screen.getAllByText("Completed").length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Permanently delete job" }));
+    await waitFor(() => expect(deleteJob).toHaveBeenCalledTimes(1));
+    expect(deleteJob).toHaveBeenCalledWith("job-1");
+  });
+
+  it("cancels the delete dialog without deleting", () => {
+    const deleteJob = vi.fn();
+    render(
+      <JobsPage
+        jobs={[{ ...baseJob, status: "completed", remote_slurm_id: undefined }]}
+        onOpenResult={vi.fn()}
+        onDeleteJobPermanently={deleteJob}
+      />,
+    );
+
+    openJobMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete job permanently" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(deleteJob).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("successful deletion removes the correct card and decrements the count", async () => {
+    function Harness() {
+      const [jobs, setJobs] = useState<StoredPredictionJob[]>([
+        { ...baseJob, id: "job-1", status: "completed", remote_slurm_id: undefined },
+        { ...baseJob, id: "job-2", status: "failed", remote_slurm_id: undefined },
+      ]);
+      return (
+        <JobsPage
+          jobs={jobs}
+          onOpenResult={vi.fn()}
+          onDeleteJobPermanently={async (jobId) => {
+            setJobs((current) => current.filter((job) => job.id !== jobId));
+            return true;
+          }}
+        />
+      );
+    }
+
+    render(<Harness />);
+    fireEvent.click(screen.getByRole("button", { name: "More actions for job job-1" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete job permanently" }));
+    fireEvent.click(screen.getByRole("button", { name: "Permanently delete job" }));
+
+    await waitFor(() => expect(screen.queryByText("job-1")).not.toBeInTheDocument());
+    expect(screen.getByText("1")).toBeInTheDocument();
+    expect(screen.getByText("job-2")).toBeInTheDocument();
+  });
+
+  it("failed deletion leaves the card visible, preserves the note, and exposes diagnostics for retry", async () => {
+    const deleteJob = vi.fn(async () => {
+      const error = new Error("Local job could not be deleted. delete results row failed: FOREIGN KEY constraint failed");
+      Object.assign(error, {
+        technicalDetails: [
+          "LOCAL_JOB_ID=job-1",
+          "DB_OPERATION=delete results row",
+          "SQL_STATEMENT=DELETE FROM results WHERE job_id = $1",
+          "DB_ERROR=FOREIGN KEY constraint failed",
+        ].join("\n"),
+      });
+      throw error;
+    });
+    const cancel = vi.fn();
+    render(
+      <JobsPage
+        jobs={[{ ...baseJob, status: "completed", remote_slurm_id: undefined, note: "saved note" }]}
+        onOpenResult={vi.fn()}
+        onCancelRemoteJob={cancel}
+        onDeleteJobPermanently={deleteJob}
+      />,
+    );
+
+    openJobMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete job permanently" }));
+    fireEvent.click(screen.getByRole("button", { name: "Permanently delete job" }));
+
+    expect(await screen.findByText("Local job could not be deleted.")).toBeInTheDocument();
+    expect(screen.getByText("saved note")).toBeInTheDocument();
+    expect(screen.getByText("Development diagnostics")).toBeInTheDocument();
+    expect(screen.getByText(/DB_OPERATION=delete results row/)).toBeInTheDocument();
+    expect(screen.getByText("job-1")).toBeInTheDocument();
+    expect(cancel).not.toHaveBeenCalled();
+
+    openJobMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete job permanently" }));
+    fireEvent.click(screen.getByRole("button", { name: "Permanently delete job" }));
+    await waitFor(() => expect(deleteJob).toHaveBeenCalledTimes(2));
   });
 });
