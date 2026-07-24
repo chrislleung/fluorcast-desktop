@@ -76,6 +76,16 @@ function isRemoteActive(job: StoredPredictionJob) {
     || job.status === "running";
 }
 
+function isActiveJobStatus(status: StoredPredictionJob["status"]) {
+  return status === "queued_locally"
+    || status === "submitting"
+    || status === "upload_waiting_for_login"
+    || status === "uploaded_to_nibi"
+    || status === "queued"
+    || status === "submitted_to_slurm"
+    || status === "running";
+}
+
 function isManualSessionReady(manualMfaSession?: ManualMfaSessionUiState) {
   return manualMfaSession?.status === "authenticated" && manualMfaSession.can_run_background_commands;
 }
@@ -140,6 +150,312 @@ export function JobsPage({
     }
   }
 
+  function renderJobActions(job: StoredPredictionJob) {
+    if (job.status === "completed") {
+      return (
+        <button
+          className="secondary-button compact-button"
+          onClick={() => onOpenResult(job.id)}
+          type="button"
+        >
+          Open result
+        </button>
+      );
+    }
+
+    if (job.status === "submitting") {
+      return <span>Submitting...</span>;
+    }
+
+    if (job.status === "uploaded_to_nibi" && onSubmitSlurmJob) {
+      return (
+        <button
+          className="secondary-button compact-button"
+          onClick={() => void onSubmitSlurmJob(job)}
+          type="button"
+        >
+          Submit to Slurm
+        </button>
+      );
+    }
+
+    if (job.status === "uploaded_to_nibi") {
+      return <span>Input uploaded. Submit to Slurm.</span>;
+    }
+
+    if (job.status === "slurm_submission_failed" && job.remote_slurm_id) {
+      return (
+        <>
+          <span>Submission accepted by Slurm</span>
+          {onRefreshJobStatus ? (
+            <button
+              className="secondary-button compact-button"
+              disabled={refreshingJobs.has(job.id)}
+              onClick={() => refreshJobStatus(job)}
+              type="button"
+            >
+              {refreshingJobs.has(job.id) ? "Refreshing..." : "Resume monitoring"}
+            </button>
+          ) : null}
+          {job.error_message ? (
+            <details className="remote-check-details">
+              <summary>Marker warning</summary>
+              <pre>{job.error_message}</pre>
+            </details>
+          ) : null}
+        </>
+      );
+    }
+
+    if (job.status === "slurm_submission_failed") {
+      return (
+        <>
+          <span>Submission failed</span>
+          {onSubmitSlurmJob ? (
+            <button
+              className="secondary-button compact-button"
+              onClick={() => void onSubmitSlurmJob(job)}
+              type="button"
+            >
+              Retry Slurm submission
+            </button>
+          ) : null}
+          {job.error_message ? (
+            <details className="remote-check-details">
+              <summary>Technical details</summary>
+              <pre>{job.error_message}</pre>
+            </details>
+          ) : null}
+        </>
+      );
+    }
+
+    if (job.status === "submitted_to_slurm" || job.status === "queued") {
+      return (
+        <>
+          <span>{job.remote_slurm_id ? "View queued job" : "Submitted to Slurm"}</span>
+          {onRefreshJobStatus ? (
+            <button
+              className="secondary-button compact-button"
+              disabled={refreshingJobs.has(job.id)}
+              onClick={() => refreshJobStatus(job)}
+              type="button"
+            >
+              {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
+            </button>
+          ) : null}
+          {onCancelRemoteJob && job.remote_slurm_id ? (
+            <button
+              className="secondary-button compact-button cancel-button"
+              onClick={() => confirmAndCancel(job)}
+              type="button"
+            >
+              Cancel remote job
+            </button>
+          ) : null}
+          {job.error_message ? (
+            <details className="remote-check-details">
+              <summary>Marker warning</summary>
+              <pre>{job.error_message}</pre>
+            </details>
+          ) : null}
+        </>
+      );
+    }
+
+    if (showReconnectPanel(job, nibiSettings, manualMfaSession)) {
+      return (
+        <section className="inline-action-panel" aria-label="NIBI login required">
+          <h3>NIBI login required</h3>
+          <p>
+            Open Settings to start or test the NIBI session, then return here to refresh or submit this job.
+          </p>
+          <div className="button-row">
+            <button
+              className="secondary-button compact-button"
+              onClick={onReconnect}
+              type="button"
+            >
+              Open Settings
+            </button>
+          </div>
+          {manualMfaStatus || manualMfaSession?.last_session_test_result ? (
+            <p className="connection-test-status">
+              {manualMfaStatus || manualMfaSession?.last_session_test_result}
+            </p>
+          ) : null}
+        </section>
+      );
+    }
+
+    if (job.status === "login_required" && isManualSessionReady(manualMfaSession) && canSubmitToSlurm(job) && onSubmitSlurmJob) {
+      return (
+        <button
+          className="secondary-button compact-button"
+          onClick={() => void onSubmitSlurmJob(job)}
+          type="button"
+        >
+          Submit to Slurm
+        </button>
+      );
+    }
+
+    if (job.status === "login_required" && isManualSessionReady(manualMfaSession) && canRefresh(job) && onRefreshJobStatus) {
+      return (
+        <button
+          className="secondary-button compact-button"
+          disabled={refreshingJobs.has(job.id)}
+          onClick={() => refreshJobStatus(job)}
+          type="button"
+        >
+          {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
+        </button>
+      );
+    }
+
+    if (job.status === "login_required") {
+      return (
+        <span>
+          {usesPersistentShell(nibiSettings)
+            ? "NIBI session required. Start a Manual MFA session and complete password + Duo."
+            : "Open Settings, start the NIBI session, then press Test authenticated session before continuing."}
+        </span>
+      );
+    }
+
+    if (job.status === "robot_access_required" || job.status === "robot_auth_failed") {
+      return (
+        <button
+          className="secondary-button compact-button"
+          onClick={onOpenRobotSetup}
+          type="button"
+        >
+          Open robot setup instructions
+        </button>
+      );
+    }
+
+    if (job.status === "output_missing" && canRefresh(job) && onRefreshJobStatus) {
+      return (
+        <button
+          className="secondary-button compact-button"
+          disabled={refreshingJobs.has(job.id)}
+          onClick={() => refreshJobStatus(job)}
+          type="button"
+        >
+          {refreshingJobs.has(job.id) ? "Refreshing..." : "Download result"}
+        </button>
+      );
+    }
+
+    if (job.status === "download_failed" && canRefresh(job) && onRefreshJobStatus) {
+      return (
+        <>
+          <span>{job.error_message ?? "The prediction completed, but FluorCast could not download output.json."}</span>
+          <button
+            className="secondary-button compact-button"
+            disabled={refreshingJobs.has(job.id)}
+            onClick={() => refreshJobStatus(job)}
+            type="button"
+          >
+            {refreshingJobs.has(job.id) ? "Refreshing..." : "Retry output download"}
+          </button>
+          {failureDetails(job) ? (
+            <details className="remote-check-details">
+              <summary>Failure details</summary>
+              <pre>{failureDetails(job)}</pre>
+            </details>
+          ) : null}
+        </>
+      );
+    }
+
+    if (job.status === "output_invalid" && canRefresh(job) && onRefreshJobStatus) {
+      return (
+        <>
+          <span>{job.error_message ?? "Remote output.json was downloaded but needs to be re-imported."}</span>
+          <button
+            className="secondary-button compact-button"
+            disabled={refreshingJobs.has(job.id)}
+            onClick={() => refreshJobStatus(job)}
+            type="button"
+          >
+            {refreshingJobs.has(job.id) ? "Refreshing..." : "Retry result import"}
+          </button>
+          {failureDetails(job) ? (
+            <details className="remote-check-details">
+              <summary>Failure details</summary>
+              <pre>{failureDetails(job)}</pre>
+            </details>
+          ) : null}
+        </>
+      );
+    }
+
+    if (
+      job.status === "failed"
+      || job.status === "upload_failed"
+      || job.status === "cancelled"
+      || job.status === "timed_out"
+      || job.status === "timeout"
+      || job.status === "unknown"
+    ) {
+      return (
+        <>
+          <span>{safeFailureSummary(job)}</span>
+          {failureDetails(job) ? (
+            <details className="remote-check-details">
+              <summary>Failure details</summary>
+              {job.slurm_stderr ? (
+                <>
+                  <span className="step-label">stderr.log</span>
+                  <pre>{job.slurm_stderr}</pre>
+                </>
+              ) : null}
+              <pre>{failureDetails(job)}</pre>
+            </details>
+          ) : null}
+        </>
+      );
+    }
+
+    if (isRemoteActive(job)) {
+      return (
+        <>
+          <span>{job.status === "running" ? "View running job" : "View queued job"}</span>
+          {onCancelRemoteJob && job.remote_slurm_id ? (
+            <button
+              className="secondary-button compact-button cancel-button"
+              onClick={() => confirmAndCancel(job)}
+              type="button"
+            >
+              Cancel remote job
+            </button>
+          ) : null}
+        </>
+      );
+    }
+
+    if (canRefresh(job) && onRefreshJobStatus) {
+      return (
+        <button
+          className="secondary-button compact-button"
+          disabled={refreshingJobs.has(job.id)}
+          onClick={() => refreshJobStatus(job)}
+          type="button"
+        >
+          {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
+        </button>
+      );
+    }
+
+    if (canSubmitToSlurm(job)) {
+      return <span>Input uploaded. Submit to Slurm.</span>;
+    }
+
+    return <span>Loading</span>;
+  }
+
   return (
     <div className="page narrow-page">
       <header className="page-header">
@@ -165,293 +481,73 @@ export function JobsPage({
             <h2>Local jobs</h2>
             <span>{jobs.length}</span>
           </div>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Created</th>
-                  <th>Local job ID</th>
-                  <th>Molecule SMILES</th>
-                  <th>Solvent SMILES</th>
-                  <th>Model choice</th>
-                  <th>Status</th>
-                  <th>Slurm</th>
-                  <th>Result</th>
-                </tr>
-              </thead>
-              <tbody>
-                {jobs.map((job) => (
-                  <tr key={job.id}>
-                    <td>{formatCreatedDate(job.created_at)}</td>
-                    <td><code>{job.id}</code></td>
-                    <td><code>{job.molecule_smiles}</code></td>
-                    <td><code>{job.solvent_smiles}</code></td>
-                    <td>{job.model_choice}</td>
-                    <td>
+          <ol className="job-list">
+            {jobs.map((job) => (
+              <li
+                className={isActiveJobStatus(job.status) ? "job-card job-card-active" : "job-card"}
+                key={job.id}
+              >
+                <article aria-label={`Job ${job.id}`}>
+                  <div className="job-card-header">
+                    <div className="job-card-status">
                       <span className={`job-status job-status-${job.status}`}>
                         {statusLabels[job.status]}
                       </span>
-                    </td>
-                    <td>{job.remote_slurm_id ? <code>{job.remote_slurm_id}</code> : "None"}</td>
-                    <td>
-                      {job.status === "completed" ? (
-                        <button
-                          className="secondary-button compact-button"
-                          onClick={() => onOpenResult(job.id)}
-                          type="button"
-                        >
-                          Open result
-                        </button>
-                      ) : job.status === "submitting" ? (
-                        <span>Submitting...</span>
-                      ) : job.status === "uploaded_to_nibi" && onSubmitSlurmJob ? (
-                        <button
-                          className="secondary-button compact-button"
-                          onClick={() => void onSubmitSlurmJob(job)}
-                          type="button"
-                        >
-                          Submit to Slurm
-                        </button>
-                      ) : job.status === "uploaded_to_nibi" ? (
-                        <span>Input uploaded. Submit to Slurm.</span>
-                      ) : job.status === "slurm_submission_failed" && job.remote_slurm_id ? (
-                        <>
-                          <span>Submission accepted by Slurm</span>
-                          {onRefreshJobStatus ? (
-                            <button
-                              className="secondary-button compact-button"
-                              disabled={refreshingJobs.has(job.id)}
-                              onClick={() => refreshJobStatus(job)}
-                              type="button"
-                            >
-                              {refreshingJobs.has(job.id) ? "Refreshing..." : "Resume monitoring"}
-                            </button>
-                          ) : null}
-                          {job.error_message ? (
-                            <details className="remote-check-details">
-                              <summary>Marker warning</summary>
-                              <pre>{job.error_message}</pre>
-                            </details>
-                          ) : null}
-                        </>
-                      ) : job.status === "slurm_submission_failed" ? (
-                        <>
-                          <span>Submission failed</span>
-                          {onSubmitSlurmJob ? (
-                            <button
-                              className="secondary-button compact-button"
-                              onClick={() => void onSubmitSlurmJob(job)}
-                              type="button"
-                            >
-                              Retry Slurm submission
-                            </button>
-                          ) : null}
-                          {job.error_message ? (
-                            <details className="remote-check-details">
-                              <summary>Technical details</summary>
-                              <pre>{job.error_message}</pre>
-                            </details>
-                          ) : null}
-                        </>
-                      ) : job.status === "submitted_to_slurm" || job.status === "queued" ? (
-                        <>
-                          <span>{job.remote_slurm_id ? "View queued job" : "Submitted to Slurm"}</span>
-                          {onRefreshJobStatus ? (
-                            <button
-                              className="secondary-button compact-button"
-                              disabled={refreshingJobs.has(job.id)}
-                              onClick={() => refreshJobStatus(job)}
-                              type="button"
-                            >
-                              {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
-                            </button>
-                          ) : null}
-                          {onCancelRemoteJob && job.remote_slurm_id ? (
-                            <button
-                              className="secondary-button compact-button"
-                              onClick={() => confirmAndCancel(job)}
-                              type="button"
-                            >
-                              Cancel remote job
-                            </button>
-                          ) : null}
-                          {job.error_message ? (
-                            <details className="remote-check-details">
-                              <summary>Marker warning</summary>
-                              <pre>{job.error_message}</pre>
-                            </details>
-                          ) : null}
-                        </>
-                      ) : showReconnectPanel(job, nibiSettings, manualMfaSession) ? (
-                        <section className="inline-action-panel" aria-label="NIBI login required">
-                          <h3>NIBI login required</h3>
-                          <p>
-                            Open Settings to start or test the NIBI session, then return here to refresh or submit this job.
-                          </p>
-                          <div className="button-row">
-                            <button
-                              className="secondary-button compact-button"
-                              onClick={onReconnect}
-                              type="button"
-                            >
-                              Open Settings
-                            </button>
-                          </div>
-                          {manualMfaStatus || manualMfaSession?.last_session_test_result ? (
-                            <p className="connection-test-status">
-                              {manualMfaStatus || manualMfaSession?.last_session_test_result}
-                            </p>
-                          ) : null}
-                        </section>
-                      ) : job.status === "login_required" && isManualSessionReady(manualMfaSession) && canSubmitToSlurm(job) && onSubmitSlurmJob ? (
-                        <button
-                          className="secondary-button compact-button"
-                          onClick={() => void onSubmitSlurmJob(job)}
-                          type="button"
-                        >
-                          Submit to Slurm
-                        </button>
-                      ) : job.status === "login_required" && isManualSessionReady(manualMfaSession) && canRefresh(job) && onRefreshJobStatus ? (
-                        <button
-                          className="secondary-button compact-button"
-                          disabled={refreshingJobs.has(job.id)}
-                          onClick={() => refreshJobStatus(job)}
-                          type="button"
-                        >
-                          {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
-                        </button>
-                      ) : job.status === "login_required" ? (
-                        <span>
-                          {usesPersistentShell(nibiSettings)
-                            ? "NIBI session required. Start a Manual MFA session and complete password + Duo."
-                            : "Open Settings, start the NIBI session, then press Test authenticated session before continuing."}
-                        </span>
-                      ) : job.status === "robot_access_required" || job.status === "robot_auth_failed" ? (
-                        <button
-                          className="secondary-button compact-button"
-                          onClick={onOpenRobotSetup}
-                          type="button"
-                        >
-                          Open robot setup instructions
-                        </button>
-                      ) : job.status === "output_missing" && canRefresh(job) && onRefreshJobStatus ? (
-                        <button
-                          className="secondary-button compact-button"
-                          disabled={refreshingJobs.has(job.id)}
-                          onClick={() => refreshJobStatus(job)}
-                          type="button"
-                        >
-                          {refreshingJobs.has(job.id) ? "Refreshing..." : "Download result"}
-                        </button>
-                      ) : job.status === "download_failed" && canRefresh(job) && onRefreshJobStatus ? (
-                        <>
-                          <span>{job.error_message ?? "The prediction completed, but FluorCast could not download output.json."}</span>
-                          <button
-                            className="secondary-button compact-button"
-                            disabled={refreshingJobs.has(job.id)}
-                            onClick={() => refreshJobStatus(job)}
-                            type="button"
-                          >
-                            {refreshingJobs.has(job.id) ? "Refreshing..." : "Retry output download"}
-                          </button>
-                          {failureDetails(job) ? (
-                            <details className="remote-check-details">
-                              <summary>Failure details</summary>
-                              <pre>{failureDetails(job)}</pre>
-                            </details>
-                          ) : null}
-                        </>
-                      ) : job.status === "output_invalid" && canRefresh(job) && onRefreshJobStatus ? (
-                        <>
-                          <span>{job.error_message ?? "Remote output.json was downloaded but needs to be re-imported."}</span>
-                          <button
-                            className="secondary-button compact-button"
-                            disabled={refreshingJobs.has(job.id)}
-                            onClick={() => refreshJobStatus(job)}
-                            type="button"
-                          >
-                            {refreshingJobs.has(job.id) ? "Refreshing..." : "Retry result import"}
-                          </button>
-                          {failureDetails(job) ? (
-                            <details className="remote-check-details">
-                              <summary>Failure details</summary>
-                              <pre>{failureDetails(job)}</pre>
-                            </details>
-                          ) : null}
-                        </>
-                      ) : job.status === "failed"
-                        || job.status === "upload_failed"
-                        || job.status === "cancelled"
-                        || job.status === "timed_out"
-                        || job.status === "timeout"
-                        || job.status === "unknown" ? (
-                        <>
-                          <span>{safeFailureSummary(job)}</span>
-                          {failureDetails(job) ? (
-                            <details className="remote-check-details">
-                              <summary>Failure details</summary>
-                              {job.slurm_stderr ? (
-                                <>
-                                  <span className="step-label">stderr.log</span>
-                                  <pre>{job.slurm_stderr}</pre>
-                                </>
-                              ) : null}
-                              <pre>{failureDetails(job)}</pre>
-                            </details>
-                          ) : null}
-                        </>
-                      ) : isRemoteActive(job) ? (
-                        <>
-                          <span>{job.status === "running" ? "View running job" : "View queued job"}</span>
-                          {onCancelRemoteJob && job.remote_slurm_id ? (
-                            <button
-                              className="secondary-button compact-button"
-                              onClick={() => confirmAndCancel(job)}
-                              type="button"
-                            >
-                              Cancel remote job
-                            </button>
-                          ) : null}
-                        </>
-                      ) : canRefresh(job) && onRefreshJobStatus ? (
-                        <button
-                          className="secondary-button compact-button"
-                          disabled={refreshingJobs.has(job.id)}
-                          onClick={() => refreshJobStatus(job)}
-                          type="button"
-                        >
-                          {refreshingJobs.has(job.id) ? "Refreshing..." : "Refresh status"}
-                        </button>
-                      ) : canSubmitToSlurm(job) ? (
-                        <span>Input uploaded. Submit to Slurm.</span>
-                      ) : (
-                        <span>Loading</span>
-                      )}
-                      {job.remote_job_dir ? (
-                        <details className="remote-check-details">
-                          <summary>Remote folder</summary>
-                          <code>{job.remote_job_dir}</code>
-                        </details>
-                      ) : null}
-                      {latestManualRefreshTraceByJob[job.id] || latestGlobalBannerWriteTrace ? (
-                        <details className="remote-check-details">
-                          <summary>Development diagnostics</summary>
-                          <button
-                            className="secondary-button compact-button"
-                            onClick={() => copyDiagnostics(job)}
-                            type="button"
-                          >
-                            Copy diagnostics
-                          </button>
-                          <pre>{formatRefreshDiagnosticsText(latestManualRefreshTraceByJob[job.id], latestGlobalBannerWriteTrace)}</pre>
-                        </details>
-                      ) : null}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                      <span className="job-card-created">{formatCreatedDate(job.created_at)}</span>
+                    </div>
+                    <div className="job-card-model">
+                      <span className="step-label">Model choice</span>
+                      <span>{job.model_choice}</span>
+                    </div>
+                    <div className="job-card-actions" aria-label={`Actions for job ${job.id}`}>
+                      {renderJobActions(job)}
+                    </div>
+                  </div>
+
+                  <dl className="job-metadata-grid">
+                    <div>
+                      <dt>Local job ID</dt>
+                      <dd><code className="job-metadata-value-wrap" title={job.id}>{job.id}</code></dd>
+                    </div>
+                    <div>
+                      <dt>Molecule SMILES</dt>
+                      <dd><code title={job.molecule_smiles}>{job.molecule_smiles}</code></dd>
+                    </div>
+                    <div>
+                      <dt>Solvent SMILES</dt>
+                      <dd><code title={job.solvent_smiles}>{job.solvent_smiles}</code></dd>
+                    </div>
+                    {job.remote_slurm_id ? (
+                      <div>
+                        <dt>Slurm ID</dt>
+                        <dd><code title={job.remote_slurm_id}>{job.remote_slurm_id}</code></dd>
+                      </div>
+                    ) : null}
+                  </dl>
+
+                  {job.remote_job_dir ? (
+                    <details className="remote-check-details job-detail-row">
+                      <summary>Remote folder</summary>
+                      <code title={job.remote_job_dir}>{job.remote_job_dir}</code>
+                    </details>
+                  ) : null}
+                  {latestManualRefreshTraceByJob[job.id] || latestGlobalBannerWriteTrace ? (
+                    <details className="remote-check-details job-detail-row">
+                      <summary>Development diagnostics</summary>
+                      <button
+                        className="secondary-button compact-button"
+                        onClick={() => copyDiagnostics(job)}
+                        type="button"
+                      >
+                        Copy diagnostics
+                      </button>
+                      <pre>{formatRefreshDiagnosticsText(latestManualRefreshTraceByJob[job.id], latestGlobalBannerWriteTrace)}</pre>
+                    </details>
+                  ) : null}
+                </article>
+              </li>
+            ))}
+          </ol>
         </section>
       )}
     </div>

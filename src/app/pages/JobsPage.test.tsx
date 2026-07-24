@@ -20,6 +20,120 @@ describe("JobsPage recovery actions", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
+
+  it("renders a running job as a readable full-width job item", () => {
+    const { container } = render(
+      <JobsPage
+        jobs={[baseJob]}
+        onOpenResult={vi.fn()}
+        onCancelRemoteJob={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelectorAll(".job-card")).toHaveLength(1);
+    expect(container.querySelector(".job-card-active")).toBeInTheDocument();
+    expect(screen.getByText("Running")).toBeInTheDocument();
+    expect(screen.getByText("View running job")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel remote job" })).toBeInTheDocument();
+  });
+
+  it("renders a queued job with active-job presentation", () => {
+    const { container } = render(
+      <JobsPage
+        jobs={[{ ...baseJob, status: "queued" }]}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector(".job-card-active")).toBeInTheDocument();
+    expect(screen.getByText("Queued")).toBeInTheDocument();
+    expect(screen.getByText("View queued job")).toBeInTheDocument();
+  });
+
+  it("keeps completed jobs opening results from the job item", () => {
+    const openResult = vi.fn();
+    render(
+      <JobsPage
+        jobs={[{ ...baseJob, status: "completed" }]}
+        onOpenResult={openResult}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open result" }));
+    expect(openResult).toHaveBeenCalledWith("job-1");
+  });
+
+  it("keeps disabled and loading refresh states correct", () => {
+    render(
+      <JobsPage
+        jobs={[{ ...baseJob, status: "output_missing" }]}
+        onOpenResult={vi.fn()}
+        onRefreshJobStatus={vi.fn()}
+        refreshingJobIds={["job-1"]}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Refreshing..." })).toBeDisabled();
+  });
+
+  it("shows long IDs and SMILES as complete DOM values without changing job order", () => {
+    const longMolecule = "C1=CC=C(C=C1)N=NC2=CC=C(C=C2)N(CCO)CCO".repeat(4);
+    const longSolvent = "O=C(N(C)C)N(C)C".repeat(4);
+    const firstJobId = "job-2026-07-17-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const secondJobId = "job-2026-07-17-ffffffff-1111-2222-3333-444444444444";
+    render(
+      <JobsPage
+        jobs={[
+          {
+            ...baseJob,
+            id: firstJobId,
+            molecule_smiles: longMolecule,
+            solvent_smiles: longSolvent,
+            remote_slurm_id: "182315601234567890",
+          },
+          { ...baseJob, id: secondJobId, status: "completed", remote_slurm_id: undefined },
+        ]}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("2")).toBeInTheDocument();
+    const localJobId = screen.getByText(firstJobId);
+    expect(localJobId).toBeInTheDocument();
+    expect(localJobId).toHaveTextContent(firstJobId);
+    expect(localJobId).toHaveClass("job-metadata-value-wrap");
+    expect(localJobId).not.toHaveClass("job-metadata-value-scroll");
+    expect(screen.getByText("182315601234567890")).toBeInTheDocument();
+    expect(screen.getByText(longMolecule)).toBeInTheDocument();
+    expect(screen.getByText(longSolvent)).toBeInTheDocument();
+    expect(screen.getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      expect.stringContaining(firstJobId),
+      expect.stringContaining(secondJobId),
+    ]);
+  });
+
+  it("keeps remote folder and development diagnostics collapsible beneath the job summary", () => {
+    render(
+      <JobsPage
+        jobs={[baseJob]}
+        latestManualRefreshTraceByJob={{
+          [baseJob.id]: {
+            traceId: "refresh-test",
+            localJobId: baseJob.id,
+            slurmId: "12345",
+            remoteJobDir: baseJob.remote_job_dir,
+            events: [],
+            rowStatusWrites: [],
+          },
+        }}
+        onOpenResult={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Remote folder").closest("details")).toHaveClass("job-detail-row");
+    expect(screen.getByText("Development diagnostics").closest("details")).toHaveClass("job-detail-row");
+  });
+
   it("points login-required Manual MFA jobs back to Settings", () => {
     const reconnect = vi.fn();
     render(

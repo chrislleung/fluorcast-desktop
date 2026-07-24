@@ -291,6 +291,8 @@ describe("App", () => {
     await vi.waitFor(() => {
       expect(vi.mocked(invoke)).toHaveBeenCalledWith("test_manual_mfa_session", expect.any(Object));
     });
+    expect(await screen.findByText(/Manual NIBI login is authenticated/)).toBeInTheDocument();
+    expect(screen.getByText("NIBI connected")).toBeInTheDocument();
     expect(screen.queryByText("NIBI login required")).not.toBeInTheDocument();
   });
 
