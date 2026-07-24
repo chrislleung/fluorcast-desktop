@@ -1085,7 +1085,14 @@ export function App() {
 
     switch (currentPage) {
       case "home":
-        return <HomePage />;
+        return (
+          <HomePage
+            manualMfaSession={manualMfaSession}
+            nibiSettings={nibiSettings}
+            onManualMfaSessionChange={(session) => updateLiveSessionState(session, "HomePage.onManualMfaSessionChange")}
+            onNibiSettingsSave={handleNibiSettingsSave}
+          />
+        );
       case "prediction":
         return (
           <NewPredictionPage
@@ -1120,12 +1127,8 @@ export function App() {
         return (
           <SettingsPage
             accentColor={accentColor}
-            manualMfaSession={manualMfaSession}
-            nibiSettings={nibiSettings}
             secondaryColor={secondaryColor}
             onAccentColorChange={handleAccentColorChange}
-            onManualMfaSessionChange={(session) => updateLiveSessionState(session, "SettingsPage.onManualMfaSessionChange")}
-            onNibiSettingsSave={handleNibiSettingsSave}
             onSecondaryColorChange={handleSecondaryColorChange}
           />
         );
@@ -1154,6 +1157,9 @@ export function App() {
     <AppShell
       accentColor={accentColor}
       currentPage={currentPage}
+      isManualMfaChecking={manualMfaJobStatus === "Testing the FluorCast Manual MFA session."}
+      manualMfaSession={manualMfaSession}
+      nibiSettings={nibiSettings}
       onNavigate={navigate}
       secondaryColor={secondaryColor}
     >

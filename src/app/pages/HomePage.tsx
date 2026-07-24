@@ -1,10 +1,26 @@
+import type { NibiSettings } from "../../features/settings";
+import { defaultManualMfaSessionState, type ManualMfaSessionUiState } from "../../lib/remote";
+import { ConnectionSettingsPanel } from "../components/ConnectionSettingsPanel";
+
 const capabilities = [
   { symbol: "λₐ", title: "Absorption", detail: "Predicted maximum absorption wavelength" },
   { symbol: "λₑ", title: "Emission", detail: "Predicted maximum emission wavelength" },
   { symbol: "Φ", title: "Quantum yield", detail: "Predicted fluorescence efficiency" },
 ];
 
-export function HomePage() {
+type HomePageProps = {
+  manualMfaSession?: ManualMfaSessionUiState;
+  nibiSettings: NibiSettings;
+  onManualMfaSessionChange?: (session: ManualMfaSessionUiState) => void;
+  onNibiSettingsSave: (settings: NibiSettings) => Promise<boolean>;
+};
+
+export function HomePage({
+  manualMfaSession = defaultManualMfaSessionState,
+  nibiSettings,
+  onManualMfaSessionChange,
+  onNibiSettingsSave,
+}: HomePageProps) {
   return (
     <div className="page home-page">
       <section className="home-hero">
@@ -32,6 +48,13 @@ export function HomePage() {
           the workflow, so users never need to work from the command line.
         </p>
       </section>
+
+      <ConnectionSettingsPanel
+        manualMfaSession={manualMfaSession}
+        nibiSettings={nibiSettings}
+        onManualMfaSessionChange={onManualMfaSessionChange}
+        onNibiSettingsSave={onNibiSettingsSave}
+      />
     </div>
   );
 }

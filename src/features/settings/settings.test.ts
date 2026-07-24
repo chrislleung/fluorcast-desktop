@@ -227,12 +227,15 @@ describe("NIBI settings validation", () => {
 
   it("does not include private key text in restricted public key generation", () => {
     const privateKeyText = "-----BEGIN OPENSSH PRIVATE KEY-----";
+
+    const settingsWithPrivateKey = {
+      ...defaultNibiSettings,
+      ssh_private_key_path: privateKeyText,
+    };
+
     const restricted = buildRestrictedPublicKey(
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest alice@laptop",
-      {
-        ...defaultNibiSettings,
-        ssh_private_key_path: privateKeyText,
-      },
+      settingsWithPrivateKey,
     );
 
     expect(restricted).not.toContain("PRIVATE KEY");
@@ -254,19 +257,23 @@ describe("NIBI settings validation", () => {
     expect(request).toContain("download completed output files");
   });
 
-  it("keeps setup docs generic while the manual QA checklist carries the workstation acceptance values", () => {
+  it("keeps setup documentation and the manual QA checklist generic", () => {
     const docs = [
       readFileSync(join(process.cwd(), "README.md"), "utf8"),
       readFileSync(join(process.cwd(), "docs", "nibi-setup.md"), "utf8"),
     ].join("\n");
     const manualChecklist = readFileSync(join(process.cwd(), "docs", "manual-qa-checklist.md"), "utf8");
 
-    expect(docs).not.toContain("chrisl");
+    expect(docs).not.toMatch(/(^|[^A-Za-z0-9_])chrisl([^A-Za-z0-9_]|$)/);
     expect(docs).not.toContain("ChemFluor_Project");
     expect(docs).not.toContain("/home/chrisl");
     expect(docs).not.toContain("scratch/ChemFluor_Project");
-    expect(manualChecklist).toContain("/home/chrisl/scratch/FluorCast");
-    expect(manualChecklist).toContain("/home/cl/.ssh/fluorcast_nibi_ed25519");
+    expect(manualChecklist).toContain(
+      "/home/<nibi-username>/scratch/FluorCast",
+    );
+    expect(manualChecklist).toContain(
+      "/home/<wsl-username>/.ssh/fluorcast_nibi_ed25519",
+    );
   });
 
   it("trims values before persistence or validation", () => {

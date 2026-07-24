@@ -1,4 +1,4 @@
-# Manual QA Checklist
+﻿# Manual QA Checklist
 
 Use `npm.cmd run tauri dev` for desktop checks. The Vite browser preview does not exercise Tauri shell, WSL, SSH, or SQLite integration.
 
@@ -9,12 +9,12 @@ Use `npm.cmd run tauri dev` for desktop checks. The Vite browser preview does no
 - Select NIBI with Manual MFA.
 - Save these settings:
   - WSL distribution: `Ubuntu`
-  - NIBI username: `chrisl`
+  - NIBI username: `<nibi-username>`
   - NIBI host: `nibi.alliancecan.ca`
-  - WSL private key path: `/home/cl/.ssh/fluorcast_nibi_ed25519`
-  - Remote project path: `/home/chrisl/scratch/FluorCast`
-  - Remote jobs path: `/home/chrisl/scratch/fluorcast-jobs`
-  - Python environment path: `/home/chrisl/scratch/FluorCast/.venv/bin/python`
+  - WSL private key path: `/home/username/.ssh/fluorcast_nibi_ed25519`
+  - Remote project path: `/home/<nibi-username>/scratch/FluorCast`
+  - Remote jobs path: `/home/<nibi-username>/scratch/fluorcast-jobs`
+  - Python environment path: `/home/<nibi-username>/scratch/FluorCast/.venv/bin/python`
 - Click Clean stale WSL session.
 - Click Start NIBI session.
 - Confirm the terminal receives `HOST` and `KEY` arguments and does not report `$1: unbound variable`.
@@ -44,7 +44,7 @@ Use `npm.cmd run tauri dev` for desktop checks. The Vite browser preview does no
 - Confirm Settings shows WSL distribution, resolved WSL user, resolved WSL HOME, NIBI target, resolved ControlPath, session status, and most recent result.
 - Confirm Advanced session diagnostics is collapsed by default.
 - Confirm the generated launcher uses:
-  `wt.exe new-tab --title "FluorCast NIBI Login" wsl.exe -d Ubuntu -- bash -- /home/cl/.fluorcast/scripts/start-nibi-login.sh chrisl@nibi.alliancecan.ca /home/cl/.ssh/fluorcast_nibi_ed25519`
+  `wt.exe new-tab --title "FluorCast NIBI Login" wsl.exe -d Ubuntu -- bash -- /home/<wsl-username>/.fluorcast/scripts/start-nibi-login.sh <nibi-username>@nibi.alliancecan.ca /home/<wsl-username>/.ssh/fluorcast_nibi_ed25519`
 - Confirm Test authenticated session reuses:
   `$HOME/.fluorcast/ssh/cm-nibi.sock`
 - Confirm Clean stale WSL session only affects:
@@ -67,3 +67,5 @@ Use `npm.cmd run tauri dev` for desktop checks. The Vite browser preview does no
 - Refresh the result page and confirm the saved result reloads by job ID.
 - Restart FluorCast and confirm persisted jobs, Slurm IDs, logs, and results remain.
 - Confirm completed results show Stokes shift when absorption and emission predictions are present.
+
+
