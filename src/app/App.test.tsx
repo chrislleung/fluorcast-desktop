@@ -8,6 +8,8 @@ import { App } from "./App";
 const dbMock = vi.hoisted(() => ({
   addJobEvent: vi.fn(),
   createMockPersistenceProbe: vi.fn(),
+  deleteJobPermanently: vi.fn(),
+  JOB_NOTE_MAX_LENGTH: 2000,
   getDatabaseDiagnostics: vi.fn(),
   getJobWithResult: vi.fn(),
   getSetting: vi.fn(),
@@ -17,6 +19,7 @@ const dbMock = vi.hoisted(() => ({
   saveResult: vi.fn(),
   saveSetting: vi.fn(),
   updateJobStatus: vi.fn(),
+  updateJobNote: vi.fn(),
 }));
 
 vi.mock("../lib/db", () => dbMock);
@@ -45,6 +48,7 @@ describe("App", () => {
     vi.clearAllMocks();
     dbMock.addJobEvent.mockResolvedValue(true);
     dbMock.createMockPersistenceProbe.mockResolvedValue({ pass: true });
+    dbMock.deleteJobPermanently.mockResolvedValue(true);
     dbMock.getDatabaseDiagnostics.mockResolvedValue(null);
     dbMock.getJobWithResult.mockResolvedValue(null);
     dbMock.getSetting.mockResolvedValue(null);
@@ -54,6 +58,7 @@ describe("App", () => {
     dbMock.saveResult.mockResolvedValue(true);
     dbMock.saveSetting.mockResolvedValue(true);
     dbMock.updateJobStatus.mockResolvedValue(true);
+    dbMock.updateJobNote.mockResolvedValue(true);
     vi.mocked(invoke).mockReset();
   });
 

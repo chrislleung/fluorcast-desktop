@@ -1,4 +1,5 @@
 import Database from "@tauri-apps/plugin-sql";
+import { invoke } from "@tauri-apps/api/core";
 import { createMockPredictionOutput } from "../mock";
 import {
   validatePredictionJobInput,
@@ -13,6 +14,8 @@ type SqlDatabase = {
   execute(query: string, bindValues?: unknown[]): Promise<unknown>;
   select<T>(query: string, bindValues?: unknown[]): Promise<T>;
 };
+
+type NativeDeleteJobTransaction = (jobId: string) => Promise<boolean | null>;
 
 type SettingsRow = {
   key: string;
@@ -39,6 +42,7 @@ type JobRow = {
   slurm_stderr?: string | null;
   submitted_command?: string | null;
   error_message: string | null;
+  note?: string | null;
 };
 
 type ResultRow = {
@@ -63,6 +67,23 @@ type LatestJobRow = {
   id: string;
   status: StoredJobStatus;
 };
+
+type ForeignKeyStatusRow = {
+  foreign_keys: number;
+};
+
+export const JOB_NOTE_MAX_LENGTH = 2000;
+
+const JOB_DEPENDENT_DELETE_STATEMENTS = [
+  {
+    operation: "delete job_events rows",
+    query: "DELETE FROM job_events WHERE job_id = $1",
+  },
+  {
+    operation: "delete results row",
+    query: "DELETE FROM results WHERE job_id = $1",
+  },
+] as const;
 
 export type DiagnosticJobSummary = {
   id: string;
@@ -119,6 +140,33 @@ export type JobWithResult = PersistedPredictionJob & {
   output?: PredictionJobOutput;
 };
 
+export class DatabaseDeleteJobError extends Error {
+  readonly jobId: string;
+  readonly operation: string;
+  readonly statement: string;
+  readonly technicalDetails: string;
+
+  constructor(options: {
+    jobId: string;
+    operation: string;
+    statement: string;
+    cause: unknown;
+  }) {
+    const causeMessage = sanitizeDatabaseError(options.cause);
+    super(`Local job could not be deleted. ${options.operation} failed: ${causeMessage}`);
+    this.name = "DatabaseDeleteJobError";
+    this.jobId = options.jobId;
+    this.operation = options.operation;
+    this.statement = options.statement;
+    this.technicalDetails = [
+      `LOCAL_JOB_ID=${options.jobId}`,
+      `DB_OPERATION=${options.operation}`,
+      `SQL_STATEMENT=${options.statement}`,
+      `DB_ERROR=${causeMessage}`,
+    ].join("\n");
+  }
+}
+
 let databasePromise: Promise<SqlDatabase | null> | null = null;
 
 function devLog(message: string, details?: unknown) {
@@ -140,12 +188,39 @@ async function getOpenDatabase(): Promise<SqlDatabase | null> {
   return databasePromise;
 }
 
+async function deleteJobWithNativeTransaction(jobId: string): Promise<boolean | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+
+  try {
+    return await invoke<boolean>("delete_local_job_permanently", { jobId });
+  } catch (error) {
+    throw new DatabaseDeleteJobError({
+      jobId,
+      operation: "native permanent local job delete transaction",
+      statement: "delete job_events; delete results; delete jobs",
+      cause: error,
+    });
+  }
+}
+
 function getRowsAffected(result: unknown): number | undefined {
   if (typeof result !== "object" || result === null || !("rowsAffected" in result)) {
     return undefined;
   }
   const rowsAffected = (result as { rowsAffected?: unknown }).rowsAffected;
   return typeof rowsAffected === "number" ? rowsAffected : undefined;
+}
+
+function sanitizeDatabaseError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message || error.name;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  return "Unknown SQLite error.";
 }
 
 async function tableExists(db: SqlDatabase, tableName: string): Promise<boolean> {
@@ -172,7 +247,10 @@ async function rowCount(db: SqlDatabase, tableName: string): Promise<number> {
   return rows[0]?.count ?? 0;
 }
 
-export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase | null>) {
+export function createDatabaseRepository(
+  openDatabase: () => Promise<SqlDatabase | null>,
+  nativeDeleteJobTransaction: NativeDeleteJobTransaction = async () => null,
+) {
   return {
     async initializeDatabase(): Promise<boolean> {
       const db = await openDatabase();
@@ -207,7 +285,8 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
           slurm_stdout TEXT,
           slurm_stderr TEXT,
           submitted_command TEXT,
-          error_message TEXT
+          error_message TEXT,
+          note TEXT
         )
       `);
       await addColumnIfMissing(db, "jobs", "remote_input_path", "TEXT");
@@ -219,6 +298,7 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
       await addColumnIfMissing(db, "jobs", "slurm_stdout", "TEXT");
       await addColumnIfMissing(db, "jobs", "slurm_stderr", "TEXT");
       await addColumnIfMissing(db, "jobs", "submitted_command", "TEXT");
+      await addColumnIfMissing(db, "jobs", "note", "TEXT");
       await db.execute(`
         CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_submission_id
         ON jobs(submission_id)
@@ -303,9 +383,10 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
             slurm_stdout,
             slurm_stderr,
             submitted_command,
-            error_message
+            error_message,
+            note
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
           ON CONFLICT(id) DO UPDATE SET
             molecule_smiles = excluded.molecule_smiles,
             solvent_smiles = excluded.solvent_smiles,
@@ -324,7 +405,8 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
             slurm_stdout = excluded.slurm_stdout,
             slurm_stderr = excluded.slurm_stderr,
             submitted_command = excluded.submitted_command,
-            error_message = excluded.error_message
+            error_message = excluded.error_message,
+            note = COALESCE(jobs.note, excluded.note)
         `,
         [
           job.id,
@@ -346,6 +428,7 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
           job.slurm_stderr ?? null,
           job.submitted_command ?? null,
           job.error_message ?? null,
+          normalizeJobNote(job.note),
         ],
       );
       devLog("saveJob complete", { jobId: job.id, rowsAffected: getRowsAffected(result) });
@@ -419,6 +502,95 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
       return true;
     },
 
+    async updateJobNote(jobId: string, note: string | null | undefined): Promise<boolean> {
+      const db = await openDatabase();
+      if (!db) {
+        return false;
+      }
+
+      const normalizedNote = normalizeJobNote(note);
+      const result = await db.execute(
+        "UPDATE jobs SET note = $1 WHERE id = $2",
+        [normalizedNote, jobId],
+      );
+      devLog("updateJobNote complete", { jobId, rowsAffected: getRowsAffected(result) });
+      return true;
+    },
+
+    async deleteJobPermanently(jobId: string): Promise<boolean> {
+      const nativeDeleted = await nativeDeleteJobTransaction(jobId);
+      if (nativeDeleted !== null) {
+        return nativeDeleted;
+      }
+
+      const db = await openDatabase();
+      if (!db) {
+        return false;
+      }
+
+      const existingRows = await db.select<CountRow[]>(
+        "SELECT COUNT(*) AS count FROM jobs WHERE id = $1",
+        [jobId],
+      );
+      if ((existingRows[0]?.count ?? 0) === 0) {
+        return false;
+      }
+
+      let operation = "begin permanent local job delete transaction";
+      let statement = "BEGIN IMMEDIATE TRANSACTION";
+      let transactionStarted = false;
+      const foreignKeyRows = await db.select<ForeignKeyStatusRow[]>("PRAGMA foreign_keys");
+      devLog("deleteJobPermanently starting", {
+        jobId,
+        foreignKeysEnabled: foreignKeyRows[0]?.foreign_keys === 1,
+        dependentTables: JOB_DEPENDENT_DELETE_STATEMENTS.map((item) => item.operation),
+      });
+
+      try {
+        await db.execute(statement);
+        transactionStarted = true;
+
+        for (const dependentDelete of JOB_DEPENDENT_DELETE_STATEMENTS) {
+          operation = dependentDelete.operation;
+          statement = dependentDelete.query;
+          await db.execute(statement, [jobId]);
+        }
+
+        operation = "delete jobs row";
+        statement = "DELETE FROM jobs WHERE id = $1";
+        const result = await db.execute(statement, [jobId]);
+
+        operation = "commit permanent local job delete transaction";
+        statement = "COMMIT";
+        await db.execute("COMMIT");
+
+        const rowsAffected = getRowsAffected(result);
+        if (rowsAffected !== undefined && rowsAffected > 0) {
+          return true;
+        }
+
+        const remainingRows = await db.select<CountRow[]>(
+          "SELECT COUNT(*) AS count FROM jobs WHERE id = $1",
+          [jobId],
+        );
+        return (remainingRows[0]?.count ?? 0) === 0;
+      } catch (error) {
+        if (transactionStarted) {
+          try {
+            await db.execute("ROLLBACK");
+          } catch {
+            // Preserve the original delete failure.
+          }
+        }
+        throw new DatabaseDeleteJobError({
+          jobId,
+          operation,
+          statement,
+          cause: error,
+        });
+      }
+    },
+
     async saveResult(
       jobId: string,
       output: PredictionJobOutput,
@@ -471,7 +643,8 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
           slurm_stdout,
           slurm_stderr,
           submitted_command,
-          error_message
+          error_message,
+          note
         FROM jobs
         ORDER BY local_created_at DESC
       `);
@@ -507,6 +680,7 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
             jobs.slurm_stderr,
             jobs.submitted_command,
             jobs.error_message,
+            jobs.note,
             results.job_id,
             results.output_json,
             results.downloaded_at
@@ -734,7 +908,7 @@ export function createDatabaseRepository(openDatabase: () => Promise<SqlDatabase
   };
 }
 
-const databaseRepository = createDatabaseRepository(getOpenDatabase);
+const databaseRepository = createDatabaseRepository(getOpenDatabase, deleteJobWithNativeTransaction);
 
 export function jobRowToStoredJob(row: JobRow): PersistedPredictionJob {
   return {
@@ -757,7 +931,19 @@ export function jobRowToStoredJob(row: JobRow): PersistedPredictionJob {
     ...(row.slurm_stderr ? { slurm_stderr: row.slurm_stderr } : {}),
     ...(row.submitted_command ? { submitted_command: row.submitted_command } : {}),
     ...(row.error_message ? { error_message: row.error_message } : {}),
+    ...(row.note ? { note: row.note } : {}),
   };
+}
+
+export function normalizeJobNote(note: string | null | undefined): string | null {
+  const normalized = note?.trim() ?? "";
+  if (!normalized) {
+    return null;
+  }
+  if (normalized.length > JOB_NOTE_MAX_LENGTH) {
+    throw new RangeError(`Job note cannot exceed ${JOB_NOTE_MAX_LENGTH} characters.`);
+  }
+  return normalized;
 }
 
 export function serializePredictionResult(output: PredictionJobOutput) {
@@ -804,6 +990,14 @@ export async function updateJobStatus(
   } = {},
 ): Promise<boolean> {
   return databaseRepository.updateJobStatus(jobId, status, options);
+}
+
+export async function updateJobNote(jobId: string, note: string | null | undefined): Promise<boolean> {
+  return databaseRepository.updateJobNote(jobId, note);
+}
+
+export async function deleteJobPermanently(jobId: string): Promise<boolean> {
+  return databaseRepository.deleteJobPermanently(jobId);
 }
 
 export async function saveResult(

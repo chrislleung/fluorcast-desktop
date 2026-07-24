@@ -47,6 +47,7 @@ export type StoredPredictionJob = {
   submitted_command?: string;
   output?: PredictionJobOutput;
   error_message?: string;
+  note?: string;
 };
 
 export type JobsState = {
@@ -58,6 +59,7 @@ export type JobsAction =
   | { type: "add_job"; job: StoredPredictionJob }
   | { type: "update_status"; id: string; status: Exclude<StoredJobStatus, "completed" | "failed" | "upload_failed">; remote_job_dir?: string; remote_input_path?: string; remote_output_path?: string; remote_slurm_id?: string; submission_id?: string; submitted_at?: string; slurm_state?: string; slurm_exit_code?: string; slurm_stdout?: string; slurm_stderr?: string; submitted_command?: string; error_message?: string }
   | { type: "patch_job"; id: string; patch: Partial<StoredPredictionJob> }
+  | { type: "remove_job"; id: string }
   | { type: "complete_job"; id: string; completed_at: string; output: PredictionJobOutput }
   | { type: "fail_job"; id: string; completed_at: string; error_message: string }
   | { type: "upload_failed"; id: string; completed_at: string; error_message: string };
@@ -129,6 +131,10 @@ export function jobsReducer(state: JobsState, action: JobsAction): JobsState {
         ...job,
         ...action.patch,
       }));
+    case "remove_job":
+      return {
+        jobs: state.jobs.filter((job) => job.id !== action.id),
+      };
     case "complete_job":
       return replaceJob(state, action.id, (job) => unchangedOrNext(job, {
         ...job,
