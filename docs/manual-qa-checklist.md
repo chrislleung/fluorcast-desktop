@@ -7,7 +7,7 @@ Use `npm.cmd run tauri dev` for desktop checks. The Vite browser preview does no
 - Confirm System mode follows the Windows light/dark preference and updates while FluorCast is running.
 - Confirm Light and Dark modes switch immediately.
 - Restart FluorCast and confirm the selected mode and both palettes persist.
-- Edit every semantic color token and confirm the application plus live preview update.
+- Edit every semantic color token and confirm the application updates.
 - Confirm Light palette and Dark palette edits remain independent.
 - Confirm Restore current palette defaults affects only the palette being edited.
 - Confirm Restore all appearance defaults shows confirmation and restores mode plus both palettes.

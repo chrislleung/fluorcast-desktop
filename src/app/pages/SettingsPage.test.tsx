@@ -63,13 +63,13 @@ describe("SettingsPage", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("updates the live preview from color controls", () => {
+  it("updates the real color controls from hex input", () => {
     renderSettings();
 
     fireEvent.change(document.getElementById("light-primary-hex") as HTMLInputElement, { target: { value: "#123456" } });
 
-    const preview = screen.getByLabelText("Appearance live preview");
-    expect(preview).toHaveStyle({ "--color-primary": "#123456" });
+    expect(screen.getByLabelText("Primary color picker")).toHaveValue("#123456");
+    expect(document.getElementById("light-primary-hex")).toHaveValue("#123456");
   });
 
   it("requires confirmation before restoring all appearance defaults", () => {

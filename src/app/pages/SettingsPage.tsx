@@ -1,7 +1,6 @@
 import { useState } from "react";
 import {
   appearanceColorTokens,
-  cssVariablesForPalette,
   defaultAppearanceSettings,
   defaultDarkPalette,
   defaultLightPalette,
@@ -9,11 +8,9 @@ import {
   normalizeHexColor,
   tokenLabels,
   type AppearanceColorToken,
-  type AppearancePalette,
   type AppearanceSettings,
   type ThemeMode,
 } from "../../features/settings";
-import { FluorCastLogo } from "../components/FluorCastLogo";
 
 type EditingPalette = "light" | "dark";
 
@@ -208,7 +205,6 @@ export function SettingsPage({
           </div>
         </div>
 
-        <AppearancePreview palette={palette} />
       </section>
 
       {showResetAllConfirmation ? (
@@ -228,38 +224,5 @@ export function SettingsPage({
         </div>
       ) : null}
     </div>
-  );
-}
-
-function AppearancePreview({ palette }: { palette: AppearancePalette }) {
-  return (
-    <aside className="appearance-preview" style={cssVariablesForPalette(palette)} aria-label="Appearance live preview">
-      <div className="preview-shell">
-        <div className="preview-sidebar">
-          <span className="preview-logo" aria-hidden="true"><FluorCastLogo /></span>
-          <span className="preview-nav-active">Dashboard</span>
-          <span>Jobs</span>
-        </div>
-        <div className="preview-main">
-          <div className="preview-card">
-            <h2>Prediction setup</h2>
-            <p>Readable text, muted helper copy, borders, inputs, and controls all use the edited tokens.</p>
-            <input aria-label="Preview input" readOnly value="C1=CC=CC=C1" />
-            <div className="button-row preview-buttons">
-              <button className="primary-button" type="button">Run</button>
-              <button className="secondary-button" type="button">Save</button>
-            </div>
-            <div className="preview-state-grid" aria-label="Preview status colors">
-              <span className="preview-success">Success</span>
-              <span className="preview-warning">Warning</span>
-              <span className="preview-error">Error</span>
-              <span className="preview-info">Info</span>
-            </div>
-            <button className="preview-focus-target" type="button">Focused state</button>
-            <p className="preview-selection">Selected result row</p>
-          </div>
-        </div>
-      </div>
-    </aside>
   );
 }
