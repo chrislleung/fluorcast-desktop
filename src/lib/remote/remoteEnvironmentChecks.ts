@@ -19,6 +19,7 @@ export type RemoteEnvironmentCheckId =
   | "squeue"
   | "sacct"
   | "prediction_entry_point"
+  | "slurm_prediction_script"
   | "tree_model_artifacts"
   | "neural_model_artifacts"
   | "absorption_hybrid_artifacts"
@@ -39,6 +40,28 @@ export type RemoteEnvironmentCheckRow = RemoteEnvironmentCheckDefinition & {
   status: RemoteEnvironmentCheckStatus;
   message: string;
   result?: RemoteCommandResult;
+};
+
+export type EnvironmentCheckResult = {
+  id: RemoteEnvironmentCheckId;
+  status: "passed" | "failed" | "running" | "not_run";
+  summary: string;
+  detail?: string | null;
+};
+
+export type EnvironmentCheckReport = {
+  status: string;
+  checks: EnvironmentCheckResult[];
+  started_at: string;
+  completed_at: string;
+  duration_ms: number;
+  operation_name: string;
+  timed_out: boolean;
+  process_exit_code?: number | null;
+  process_visibility: "hidden" | "visible";
+  backend_process_launches: number;
+  wsl_process_launches: number;
+  ssh_remote_sessions: number;
 };
 
 export type RemoteEnvironmentReadiness = {
@@ -114,6 +137,7 @@ function modelDirectoryCheck(
 export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): RemoteEnvironmentCheckDefinition[] {
   const trimmed = trimNibiSettings(settings);
   const predictionScriptPath = `${trimmed.remote_project_path}/scripts/run_prediction_job.py`;
+  const slurmScriptPath = `${trimmed.remote_project_path}/slurm/run_prediction_job.sbatch`;
   const jobsCommand = `mkdir -p ${shellQuote(trimmed.remote_jobs_path)} && test -d ${shellQuote(trimmed.remote_jobs_path)}`;
   const checks: RemoteEnvironmentCheckDefinition[] = [];
 
@@ -264,6 +288,19 @@ export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): 
       successMessage: "Prediction entry point exists.",
       failureMessage: "Prediction entry point was not found.",
     },
+    {
+      id: "slurm_prediction_script",
+      name: "Slurm prediction script exists",
+      optional: false,
+      commandSpec: withSettings({
+        label: "Slurm prediction script exists",
+        executable: "test",
+        args: ["-f", slurmScriptPath],
+        redacted_preview: `test -f ${shellQuote(slurmScriptPath)}`,
+      }, trimmed),
+      successMessage: "Slurm prediction script exists.",
+      failureMessage: "Slurm prediction script was not found.",
+    },
     modelDirectoryCheck(
       "tree_model_artifacts",
       "Tree model artifacts exist",
@@ -345,6 +382,47 @@ export function resultToRemoteEnvironmentRow(
     status: passed ? "passed" : "failed",
     message,
     result,
+  };
+}
+
+export function reportToRemoteEnvironmentRows(
+  definitions: RemoteEnvironmentCheckDefinition[],
+  report: EnvironmentCheckReport,
+): RemoteEnvironmentCheckRow[] {
+  const resultById = new Map(report.checks.map((check) => [check.id, check]));
+  return definitions.map((definition) => {
+    const check = resultById.get(definition.id);
+    if (!check) {
+      return {
+        ...definition,
+        status: "failed",
+        message: "Remote environment check was not returned by the backend.",
+        result: createReportCommandResult(definition, report, 1, ""),
+      };
+    }
+    return {
+      ...definition,
+      status: check.status === "passed" ? "passed" : "failed",
+      message: check.summary,
+      result: createReportCommandResult(definition, report, check.status === "passed" ? 0 : 1, check.detail ?? ""),
+    };
+  });
+}
+
+function createReportCommandResult(
+  definition: RemoteEnvironmentCheckDefinition,
+  report: EnvironmentCheckReport,
+  exitCode: number,
+  detail: string,
+): RemoteCommandResult {
+  return {
+    exit_code: exitCode,
+    stdout: detail,
+    stderr: exitCode === 0 ? "" : detail,
+    duration_ms: report.duration_ms,
+    command_label: definition.name,
+    redacted_command_preview: "run_nibi_environment_checks",
+    timed_out: report.timed_out,
   };
 }
 

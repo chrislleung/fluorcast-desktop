@@ -603,6 +603,43 @@ describe("HomePage", () => {
       if (command === "test_manual_mfa_session") {
         return buildAuthenticatedSessionResult();
       }
+      if (command === "run_nibi_environment_checks") {
+        return {
+          status: "failed",
+          started_at: "2026-07-27T00:00:00.000Z",
+          completed_at: "2026-07-27T00:00:00.010Z",
+          duration_ms: 10,
+          operation_name: "run_nibi_environment_checks",
+          timed_out: false,
+          process_exit_code: 1,
+          process_visibility: "hidden",
+          backend_process_launches: 1,
+          wsl_process_launches: 1,
+          ssh_remote_sessions: 1,
+          checks: [
+            { id: "authenticated_session", status: "passed", summary: "Authenticated session reuse returned FLUORCAST_AUTH_OK." },
+            ...[
+              "remote_project_path",
+              "remote_project_readable",
+              "remote_jobs_path",
+              "remote_jobs_writable",
+              "python_environment_exists",
+              "python_environment_runs",
+              "prediction_entry_point",
+              "slurm_prediction_script",
+              "sbatch",
+              "squeue",
+              "tree_model_artifacts",
+              "neural_model_artifacts",
+              "absorption_hybrid_artifacts",
+              "emission_hybrid_artifacts",
+              "quantum_yield_hybrid_artifacts",
+              "upload_read_delete_smoke",
+            ].map((id) => ({ id, status: "passed", summary: "ok" })),
+            { id: "sacct", status: "failed", summary: "sacct is unavailable.", detail: "sacct missing" },
+          ],
+        };
+      }
       return {
         exit_code: payload.commandSpec.args?.includes("sacct") ? 1 : 0,
         stdout: payload.commandSpec.args?.includes("sacct") ? "" : "ok",
@@ -642,6 +679,58 @@ describe("HomePage", () => {
     expect(await screen.findByText("Remote environment needs attention")).toBeInTheDocument();
     expect(screen.getByText("sacct is unavailable.")).toBeInTheDocument();
     expect(screen.getAllByText("Technical details").length).toBeGreaterThan(0);
+  });
+
+  it("runs remote environment checks as one single-flight backend invocation", async () => {
+    let resolveReport: (value: unknown) => void = () => undefined;
+    coreMock.invoke.mockImplementation((command) => {
+      if (command === "run_nibi_environment_checks") {
+        return new Promise((resolve) => {
+          resolveReport = resolve;
+        });
+      }
+      return Promise.resolve(buildAuthenticatedSessionResult());
+    });
+
+    renderHome({
+      connection_mode: "interactive_mfa",
+      nibi_username: "alice",
+    }, {
+      manualMfaSession: {
+        ...defaultManualMfaSessionState,
+        status: "authenticated",
+        can_run_background_commands: true,
+      },
+    });
+
+    const button = screen.getByRole("button", { name: "Run remote environment checks" });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    expect(coreMock.invoke.mock.calls.filter(([command]) => command === "run_nibi_environment_checks")).toHaveLength(1);
+    await Promise.resolve();
+    expect(coreMock.invoke.mock.calls.filter(([command]) => command === "run_nibi_environment_checks")).toHaveLength(1);
+
+    resolveReport({
+      status: "passed",
+      checks: [{
+        id: "authenticated_session",
+        status: "passed",
+        summary: "Authenticated session reuse returned FLUORCAST_AUTH_OK.",
+      }],
+      started_at: "2026-07-27T00:00:00.000Z",
+      completed_at: "2026-07-27T00:00:00.001Z",
+      duration_ms: 1,
+      operation_name: "run_nibi_environment_checks",
+      timed_out: false,
+      process_exit_code: 0,
+      process_visibility: "hidden",
+      backend_process_launches: 1,
+      wsl_process_launches: 1,
+      ssh_remote_sessions: 1,
+    });
+    await waitFor(() => expect(button).toBeEnabled());
   });
 
   it("renders only one copy of each connection-related control", () => {

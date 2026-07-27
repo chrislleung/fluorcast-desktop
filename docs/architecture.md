@@ -16,6 +16,10 @@ Job metadata and status snapshots will be stored locally on the researcher's com
 
 A Rust-side connector will use SSH for remote commands, SFTP for file transfer, and Slurm commands for job submission and status. Its responsibilities are to create a remote job directory, upload `input.json`, submit the model repository's prediction entrypoint, poll job state, and download `output.json` and relevant logs. The connector boundary keeps remote-system details out of React components.
 
+On Windows, only the Manual MFA password/Duo login terminal is intentionally visible. All background subprocesses, including WSL, SSH, SCP, capability probes, Slurm commands, uploads, downloads, polling, cleanup, and log/result retrieval, must use the centralized Rust hidden process runner in `src-tauri/src/process.rs`. Adding direct background `Command::new` calls outside that runner is prohibited; the documented `wt.exe` Manual MFA launcher is the only visible exception.
+
+Remote environment checks are batched into one frontend invoke and one backend WSL operation that reuses the authenticated SSH ControlMaster socket for one remote shell session. Production installer testing is required for process-window behavior because GUI release executables can differ from development mode.
+
 ### Prediction engine
 
 The existing ChemFluor/FluorCast model repository on NIBI remains the sole prediction engine. It owns the trained models, scientific dependencies, inference code, and NIBI execution environment. The desktop repository must not vendor or fork those assets.
