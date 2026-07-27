@@ -87,6 +87,25 @@ p { color: var(--color-text-muted); line-height: 1.65; }
 .info-panel { display: grid; grid-template-columns: .8fr 1.2fr; gap: 50px; margin-top: 18px; padding: 28px 30px; border-left: 2px solid var(--color-secondary); background: var(--color-secondary-soft); }
 .info-panel p { margin: 0; }
 .step-label { display: block; margin-bottom: 7px; color: var(--color-text-dim); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+.required-nibi-setup { display: grid; gap: 16px; margin-top: 18px; border: 1px solid color-mix(in srgb, var(--color-warning) 42%, var(--color-border-soft)); border-radius: 8px; padding: clamp(20px, 3vw, 28px); background: color-mix(in srgb, var(--color-warning) 8%, rgba(11, 12, 15, .58)); }
+.required-nibi-setup > p { margin: 0; }
+.required-nibi-setup-toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; border: 0; border-bottom: 1px solid var(--color-border-soft); padding: 0 0 19px; color: var(--color-text); background: transparent; text-align: left; }
+.required-nibi-setup-toggle span:first-child { color: var(--color-text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; }
+.required-nibi-setup-toggle:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 4px; border-radius: 6px; }
+.setup-chevron { display: grid; place-items: center; width: 28px; min-width: 28px; height: 28px; border: 1px solid var(--color-border-soft); border-radius: 999px; color: var(--color-primary-strong); background: var(--color-primary-soft); font-size: 15px; font-weight: 800; }
+.required-nibi-setup-content { display: grid; gap: 16px; }
+.required-nibi-setup .diagnostic-grid { margin-top: 0; }
+.nibi-setup-instructions .numbered-setup-steps { display: grid; gap: 16px; padding-left: 0; list-style: none; }
+.nibi-setup-instructions .numbered-setup-steps > li { display: grid; gap: 10px; min-width: 0; border-top: 1px solid var(--color-border-soft); padding-top: 14px; }
+.nibi-setup-instructions { display: grid; gap: 12px; padding: 14px; }
+.command-block { display: grid; gap: 8px; min-width: 0; }
+.command-block-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--color-text-dim); font-size: 12px; font-weight: 750; }
+.command-block pre { margin: 0; overflow-x: auto; border: 1px solid var(--color-border); border-radius: 8px; padding: 12px; color: var(--color-text); background: var(--color-code-background); font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.readiness-checklist-panel { display: grid; gap: 8px; border: 1px solid var(--color-border-soft); border-radius: 8px; padding: 14px; background: rgba(11, 12, 15, .42); }
+.readiness-checklist-panel p { margin: 0; font-size: 13px; }
+.readiness-checklist { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.readiness-checklist li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; align-items: start; border: 1px solid var(--color-border); border-radius: 8px; padding: 10px; background: var(--color-surface-elevated); color: var(--color-text); font-size: 12px; font-weight: 650; }
+.readiness-checklist li span:first-child { color: var(--color-primary-strong); }
 
 .form-card, .empty-state, .about-card { border: 1px solid color-mix(in srgb, var(--color-secondary) 18%, var(--color-border-soft)); border-radius: 14px; background: rgba(17, 18, 22, .82); box-shadow: 0 24px 70px rgba(0, 0, 0, .22); }
 .form-card { display: flex; flex-direction: column; gap: 24px; padding: clamp(24px, 4vw, 38px); }
@@ -313,6 +332,7 @@ td code { overflow-wrap: anywhere; color: var(--color-text); font-size: 12px; }
   .home-hero { padding: 2vh 0 3.5vh; }
   .capability-grid, .connection-mode-grid { grid-template-columns: 1fr; }
   .info-panel { grid-template-columns: 1fr; gap: 14px; }
+  .readiness-checklist { grid-template-columns: 1fr; }
   .field-row { grid-template-columns: 1fr; }
   .key-help-grid { grid-template-columns: 1fr; }
   .field-with-button { grid-template-columns: 1fr; }

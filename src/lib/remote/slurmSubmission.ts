@@ -88,6 +88,37 @@ function preflightFailureDetails(result: Awaited<ReturnType<RemoteExecutor["runC
   return buildTechnicalDetails(result.stdout, result.stderr) || result.redacted_command_preview;
 }
 
+function preflightFailureMessage(
+  label: string,
+  result: Awaited<ReturnType<RemoteExecutor["runCommand"]>>,
+  settings: NibiSettings,
+) {
+  const details = preflightFailureDetails(result);
+  const lower = details.toLowerCase();
+
+  if (
+    lower.includes("permission denied")
+    || lower.includes("connection timed out")
+    || lower.includes("could not resolve hostname")
+    || lower.includes("connection refused")
+    || lower.includes("no route to host")
+  ) {
+    return classifyRemoteCommandFailure(result, "ssh").message;
+  }
+  if (label === "Verify FluorCast repository directory") {
+    return `Missing remote repository at ${settings.remote_project_path}. Open "Required Nibi setup" on Home and complete the clone or update instructions. Slurm job was not submitted.`;
+  }
+  if (label === "Verify Python environment executable") {
+    return `Missing environment at ~/scratch/chemfluor_env. Expected executable: ${settings.python_environment_path}. Open "Required Nibi setup" on Home and complete the environment instructions. Slurm job was not submitted.`;
+  }
+  if (label.startsWith("Verify model artifacts: ")) {
+    const directory = label.replace("Verify model artifacts: ", "");
+    return `Missing model artifacts: ${directory}. Complete the training instructions in "Required Nibi setup". Slurm job was not submitted.`;
+  }
+
+  return `${label} failed. Slurm job was not submitted.`;
+}
+
 function markerFailureMessage(result: Awaited<ReturnType<RemoteExecutor["runCommand"]>>) {
   const text = [result.stdout, result.stderr].filter(Boolean).join("\n");
   if (result.exit_code === 50 || text.includes("MARKER_ERROR=PATH_EMPTY")) {
@@ -294,6 +325,13 @@ async function submitPredictionSlurmJobOnce(
 
   const slurmScriptPath = remoteProjectChildPath(trimmed.remote_project_path, "slurm/run_prediction_job.sbatch");
   const predictionScriptPath = remoteProjectChildPath(trimmed.remote_project_path, "scripts/run_prediction_job.py");
+  const modelDirectories = [
+    "models/experiments_fluodb",
+    "models/neural_experiments_fluodb",
+    "models/production_hybrid/absorption_nm",
+    "models/production_hybrid/emission_nm",
+    "models/production_hybrid/quantum_yield",
+  ];
   const remoteJobDir = normalizeAbsoluteRemotePath(submissionJob.remote_job_dir ?? remoteParentPath(remoteInputPath, "Remote input path"), "Remote job directory");
   const remoteOutputParent = remoteParentPath(remoteOutputPath, "Remote output path");
   const remoteStdoutPath = `${remoteJobDir}/stdout.log`;
@@ -371,6 +409,21 @@ async function submitPredictionSlurmJobOnce(
       settings: trimmed,
       redacted_preview: "test -r <remote_project>/scripts/run_prediction_job.py",
     }],
+    ["Verify Python environment executable", {
+      executable: "test",
+      args: ["-x", trimmed.python_environment_path],
+      settings: trimmed,
+      redacted_preview: "test -x <python_environment_path>",
+    }],
+    ...modelDirectories.map((directory): [string, Parameters<RemoteExecutor["runCommand"]>[0]] => [
+      `Verify model artifacts: ${directory}`,
+      {
+        executable: "test",
+        args: ["-d", remoteProjectChildPath(trimmed.remote_project_path, directory)],
+        settings: trimmed,
+        redacted_preview: `test -d <remote_project>/${directory}`,
+      },
+    ]),
     ["Verify input JSON exists", {
       executable: "test",
       args: ["-r", remoteInputPath],
@@ -403,7 +456,7 @@ async function submitPredictionSlurmJobOnce(
       const result: SlurmSubmissionResult = {
         jobId: job.id,
         status: "slurm_submission_failed",
-        message: `${label} failed. Slurm job was not submitted.`,
+        message: preflightFailureMessage(label, failure.result, trimmed),
         technicalDetails: preflightFailureDetails(failure.result),
       };
       await persistSubmissionResult(submissionJob, result, persistence);

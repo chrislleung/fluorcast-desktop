@@ -14,7 +14,7 @@ const settings = {
   nibi_username: "alice",
   remote_project_path: "/home/alice/scratch/FluorCast",
   remote_jobs_path: "/home/alice/scratch/fluorcast-jobs",
-  python_environment_path: "/home/alice/scratch/FluorCast/.venv/bin/python",
+  python_environment_path: "/home/alice/scratch/chemfluor_env/bin/python",
 };
 
 function result(exitCode: number, label = "check"): RemoteCommandResult {
@@ -87,7 +87,7 @@ describe("remote environment checks", () => {
 
     expect(check?.commandSpec).toMatchObject({
       executable: "test",
-      args: ["-x", "/home/alice/scratch/FluorCast/.venv/bin/python"],
+      args: ["-x", "/home/alice/scratch/chemfluor_env/bin/python"],
     });
   });
 
@@ -96,7 +96,7 @@ describe("remote environment checks", () => {
 
     expect(check?.commandSpec).toMatchObject({
       executable: "fluorcast-python-version",
-      args: ["/home/alice/scratch/FluorCast/.venv/bin/python"],
+      args: ["/home/alice/scratch/chemfluor_env/bin/python"],
     });
   });
 
@@ -125,6 +125,31 @@ describe("remote environment checks", () => {
       args: ["-v", "sacct"],
     });
     expect(checks.find((item) => item.id === "sacct")?.optional).toBe(false);
+  });
+
+  it("generates trained model artifact directory checks", () => {
+    const checks = buildRemoteEnvironmentCheckDefinitions(settings);
+
+    expect(checks.find((item) => item.id === "tree_model_artifacts")?.commandSpec).toMatchObject({
+      executable: "test",
+      args: ["-d", "/home/alice/scratch/FluorCast/models/experiments_fluodb"],
+    });
+    expect(checks.find((item) => item.id === "neural_model_artifacts")?.commandSpec).toMatchObject({
+      executable: "test",
+      args: ["-d", "/home/alice/scratch/FluorCast/models/neural_experiments_fluodb"],
+    });
+    expect(checks.find((item) => item.id === "absorption_hybrid_artifacts")?.commandSpec).toMatchObject({
+      executable: "test",
+      args: ["-d", "/home/alice/scratch/FluorCast/models/production_hybrid/absorption_nm"],
+    });
+    expect(checks.find((item) => item.id === "emission_hybrid_artifacts")?.commandSpec).toMatchObject({
+      executable: "test",
+      args: ["-d", "/home/alice/scratch/FluorCast/models/production_hybrid/emission_nm"],
+    });
+    expect(checks.find((item) => item.id === "quantum_yield_hybrid_artifacts")?.commandSpec).toMatchObject({
+      executable: "test",
+      args: ["-d", "/home/alice/scratch/FluorCast/models/production_hybrid/quantum_yield"],
+    });
   });
 
   it("generates upload/read/delete smoke test command", () => {

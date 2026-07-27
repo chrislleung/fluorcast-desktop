@@ -148,7 +148,7 @@ describe("NIBI settings validation", () => {
       wsl_control_socket_path: "$HOME/.fluorcast/ssh/cm-nibi.sock",
       remote_project_path: "/home/user/scratch/FluorCast",
       remote_jobs_path: "/home/user/scratch/fluorcast-jobs",
-      python_environment_path: "/home/user/scratch/FluorCast/.venv/bin/python",
+      python_environment_path: "/home/user/scratch/chemfluor_env/bin/python",
       default_model_choice: "all",
       manual_login_verified: false,
       robot_access_verified: false,

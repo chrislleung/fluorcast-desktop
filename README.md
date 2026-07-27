@@ -16,6 +16,23 @@ FluorCast Desktop is built with Tauri, React, TypeScript, Rust, and SQLite.
 > **Remote compute:** NIBI through the Digital Research Alliance of Canada  
 > **Authentication:** SSH plus Duo multi-factor authentication for normal user accounts
 
+## Release v1 provisioning model
+
+The first public release uses manual NIBI provisioning. FluorCast Desktop does not
+clone the model repository, install Python packages, train models, or bundle trained
+model artifacts in the desktop installer.
+
+Before remote predictions work, clone the official FluorCast repository on NIBI,
+create the Python environment, and train the required tree, neural, and hybrid
+models:
+
+- Official repository: <https://github.com/chrislleung/fluorcast>
+- Expected repository path: `~/scratch/FluorCast`
+- Expected environment path: `~/scratch/chemfluor_env`
+
+The Home page includes a collapsible **Required Nibi setup** guide with the
+desktop-specific commands and readiness checklist.
+
 ---
 
 ## Table of contents
@@ -288,27 +305,30 @@ If the repository is private, authenticate using a supported GitHub method.
 
 ### Create the Python environment
 
-The exact environment commands depend on the model repository and the current NIBI software stack. Follow the model repository’s environment documentation.
-
-A typical setup resembles:
+For the v1 desktop workflow, create the environment under the expected NIBI scratch
+path:
 
 ```bash
+module purge
 module load python/3.11
+module load gcc
+module load rdkit
 
-python -m venv .venv
-source .venv/bin/activate
+python -m venv --system-site-packages ~/scratch/chemfluor_env
+source ~/scratch/chemfluor_env/bin/activate
 
-python -m pip install --upgrade pip
+python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
+python -m pip install pytest typing_extensions matplotlib scipy
 ```
 
 Confirm the Python executable:
 
 ```bash
-realpath .venv/bin/python
+realpath ~/scratch/chemfluor_env/bin/python
 ```
 
-Confirm that the prediction entry point and model artifacts are present before using the desktop app.
+Confirm that the prediction entry point and trained model artifacts are present before using the desktop app. The desktop installer does not include trained models.
 
 ### Create the remote job directory
 
@@ -326,7 +346,7 @@ Remote jobs path:
 $HOME/scratch/fluorcast-jobs
 
 Python environment path:
-$HOME/scratch/FluorCast/.venv/bin/python
+$HOME/scratch/chemfluor_env/bin/python
 ```
 
 In the desktop app, use fully resolved paths such as:
@@ -334,7 +354,7 @@ In the desktop app, use fully resolved paths such as:
 ```text
 /home/<username>/scratch/FluorCast
 /home/<username>/scratch/fluorcast-jobs
-/home/<username>/scratch/FluorCast/.venv/bin/python
+/home/<username>/scratch/chemfluor_env/bin/python
 ```
 
 Do not enter `$HOME` or `~` unless the app explicitly documents support for shell expansion.
@@ -391,7 +411,7 @@ Remote jobs path:
  /home/<nibi-username>/scratch/fluorcast-jobs
 
 Python environment path:
- /home/<nibi-username>/scratch/FluorCast/.venv/bin/python
+ /home/<nibi-username>/scratch/chemfluor_env/bin/python
 ```
 
 ### 5. Save the settings
@@ -581,7 +601,7 @@ test -d /home/<username>/scratch/FluorCast && echo PROJECT_OK
 Verify:
 
 ```bash
-test -x /home/<username>/scratch/FluorCast/.venv/bin/python \
+test -x /home/<username>/scratch/chemfluor_env/bin/python \
   && echo PYTHON_OK
 ```
 
