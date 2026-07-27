@@ -209,8 +209,8 @@ td code { overflow-wrap: anywhere; color: var(--color-text); font-size: 12px; }
 .connection-mode-card small { grid-column: 2; color: var(--color-text-dim); font-weight: 400; line-height: 1.45; }
 .settings-subsection { display: grid; gap: 16px; border: 1px solid var(--color-border-soft); border-radius: 8px; padding: 16px; background: rgba(11, 12, 15, .42); }
 .compact-heading h3 { margin: 0; font-size: 16px; }
-.manual-login-panel, .robot-automation-panel, .remote-environment-panel, .connection-test-panel, .connection-status-panel { display: grid; gap: 14px; border: 1px solid var(--color-border-soft); border-radius: 8px; padding: 16px; background: rgba(11, 12, 15, .58); }
-.manual-login-panel p, .robot-automation-panel p, .remote-environment-panel p, .connection-test-panel p, .connection-status-panel p { margin: 6px 0 0; font-size: 13px; line-height: 1.5; }
+.manual-login-panel, .robot-automation-panel, .remote-environment-panel, .connection-test-panel, .connection-status-panel, .remote-setup-card { display: grid; gap: 14px; border: 1px solid var(--color-border-soft); border-radius: 8px; padding: 16px; background: rgba(11, 12, 15, .58); }
+.manual-login-panel p, .robot-automation-panel p, .remote-environment-panel p, .connection-test-panel p, .connection-status-panel p, .remote-setup-card p { margin: 6px 0 0; font-size: 13px; line-height: 1.5; }
 .connection-status-panel { gap: 6px; }
 .connection-status-panel span { color: var(--color-text-dim); font-size: 12px; }
 .manual-login-panel pre, .robot-automation-panel pre { margin: 0; overflow-x: auto; border: 1px solid var(--color-border); border-radius: 8px; padding: 11px 12px; color: var(--color-text); background: var(--color-code-background); font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -231,6 +231,9 @@ td code { overflow-wrap: anywhere; color: var(--color-text); font-size: 12px; }
 .remote-environment-summary[aria-expanded="true"] { border-bottom: 1px solid var(--color-border-soft); }
 .remote-environment-content { display: grid; gap: 14px; padding: 16px; }
 .remote-environment-content > .secondary-button { justify-self: start; }
+.remote-setup-card { margin-top: 18px; }
+.remote-setup-card .section-heading strong { align-self: start; color: var(--color-text); text-transform: capitalize; }
+.remote-advanced-content { display: grid; gap: 12px; padding-top: 12px; }
 .remote-checklist { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
 .remote-checklist > li { border: 1px solid var(--color-border); border-radius: 8px; padding: 12px; background: var(--color-surface-elevated); }
 .remote-check-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: start; }

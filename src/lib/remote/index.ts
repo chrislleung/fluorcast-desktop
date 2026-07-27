@@ -2,6 +2,7 @@ export * from "./RemoteExecutor";
 export * from "./duplicateCheck";
 export * from "./errors";
 export * from "./manualMfaSession";
+export * from "./provisioning";
 export * from "./remoteEnvironmentChecks";
 export * from "./refreshDiagnostics";
 export * from "./slurmPolling";

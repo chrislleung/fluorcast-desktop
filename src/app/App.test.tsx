@@ -12,12 +12,14 @@ const dbMock = vi.hoisted(() => ({
   JOB_NOTE_MAX_LENGTH: 2000,
   getDatabaseDiagnostics: vi.fn(),
   getJobWithResult: vi.fn(),
+  getRemoteProvisioningRecord: vi.fn(),
   getSetting: vi.fn(),
   initializeDatabase: vi.fn(),
   listJobs: vi.fn(),
   saveJob: vi.fn(),
   saveResult: vi.fn(),
   saveSetting: vi.fn(),
+  saveRemoteProvisioningRecord: vi.fn(),
   updateJobStatus: vi.fn(),
   updateJobNote: vi.fn(),
 }));
@@ -51,12 +53,14 @@ describe("App", () => {
     dbMock.deleteJobPermanently.mockResolvedValue(true);
     dbMock.getDatabaseDiagnostics.mockResolvedValue(null);
     dbMock.getJobWithResult.mockResolvedValue(null);
+    dbMock.getRemoteProvisioningRecord.mockResolvedValue(null);
     dbMock.getSetting.mockResolvedValue(null);
     dbMock.initializeDatabase.mockResolvedValue(true);
     dbMock.listJobs.mockResolvedValue([]);
     dbMock.saveJob.mockResolvedValue(true);
     dbMock.saveResult.mockResolvedValue(true);
     dbMock.saveSetting.mockResolvedValue(true);
+    dbMock.saveRemoteProvisioningRecord.mockResolvedValue(true);
     dbMock.updateJobStatus.mockResolvedValue(true);
     dbMock.updateJobNote.mockResolvedValue(true);
     vi.mocked(invoke).mockReset();

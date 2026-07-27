@@ -25,6 +25,7 @@ import {
   duplicateCheckMatchSummary,
   appErrorMessages,
   InteractiveMfaRemoteExecutor,
+  provisioningRecordStatus,
   runDuplicateCheck,
   type DuplicateCheckResult,
   type ManualMfaSessionUiState,
@@ -36,6 +37,7 @@ import {
   saveJob,
   updateJobStatus,
 } from "../../lib/db";
+import type { RemoteProvisioningRecord } from "../../lib/db";
 
 const modelChoices = [
   { value: "all", label: "All models" },
@@ -72,6 +74,7 @@ type NewPredictionPageProps = {
   onJobChange?: (job: StoredPredictionJob) => void | Promise<void>;
   onOpenResult?: (jobId: string) => void;
   onOpenSettings?: () => void;
+  remoteProvisioningRecord?: RemoteProvisioningRecord | null;
 };
 
 export function NewPredictionPage({
@@ -80,6 +83,7 @@ export function NewPredictionPage({
   onJobChange,
   onOpenResult,
   onOpenSettings,
+  remoteProvisioningRecord = null,
 }: NewPredictionPageProps = {}) {
   const [values, setValues] = useState<FormValues>({
     molecule_smiles: "",
@@ -98,6 +102,8 @@ export function NewPredictionPage({
   const submissionInProgressRef = useRef(false);
   const [isCheckingDuplicate, setIsCheckingDuplicate] = useState(false);
   const isRealNibi = nibiSettings.backend_mode === "nibi" && nibiSettings.connection_mode !== "mock";
+  const remoteProvisioningStatus = provisioningRecordStatus(remoteProvisioningRecord);
+  const isRemoteReadyForPrediction = !isRealNibi || remoteProvisioningStatus.ready;
 
   const previewJson = useMemo(
     () => (previewInput ? JSON.stringify(previewInput, null, 2) : ""),
@@ -172,6 +178,18 @@ export function NewPredictionPage({
 
     try {
       if (isRealNibi) {
+        if (!remoteProvisioningStatus.ready) {
+          const message = "Remote FluorCast setup is not ready. Open Home and complete Remote Setup before submitting real NIBI predictions.";
+          const blockedJob: StoredPredictionJob = {
+            ...submittingJob,
+            status: "connection_failed",
+            error_message: message,
+          };
+          setUploadedJob(blockedJob);
+          setSubmitStatus(message);
+          await onJobChange?.(blockedJob);
+          return;
+        }
         const remoteExecutor = createRemoteExecutor(nibiSettings.connection_mode);
         if (remoteExecutor instanceof InteractiveMfaRemoteExecutor) {
           remoteExecutor.setAuthenticated(
@@ -436,7 +454,7 @@ export function NewPredictionPage({
             <button
               aria-busy={isSubmitting}
               className="primary-button"
-              disabled={isSubmitting || isCheckingDuplicate}
+              disabled={isSubmitting || isCheckingDuplicate || !isRemoteReadyForPrediction}
               type="submit"
             >
               {isSubmitting
@@ -446,6 +464,11 @@ export function NewPredictionPage({
           </div>
         </div>
       </form>
+      {!isRemoteReadyForPrediction ? (
+        <p className="copy-status" role="status">
+          Remote FluorCast setup must report ready before real NIBI predictions can be submitted.
+        </p>
+      ) : null}
       {isSubmitting ? <p className="copy-status" role="status">Submitting...</p> : null}
       {submitStatus ? <p className="copy-status" role="status">{submitStatus}</p> : null}
 

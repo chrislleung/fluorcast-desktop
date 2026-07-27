@@ -30,6 +30,11 @@ export type NibiSettings = {
   remote_project_path: string;
   remote_jobs_path: string;
   python_environment_path: string;
+  remote_repository_url: string;
+  remote_environment_path: string;
+  remote_artifacts_path: string;
+  remote_model_bundle_path: string;
+  slurm_account: string;
   default_model_choice: string;
   manual_login_verified: boolean;
   robot_access_verified: boolean;
@@ -59,6 +64,11 @@ export const defaultNibiSettings: NibiSettings = {
   remote_project_path: "/home/user/scratch/FluorCast",
   remote_jobs_path: "/home/user/scratch/fluorcast-jobs",
   python_environment_path: "/home/user/scratch/FluorCast/.venv/bin/python",
+  remote_repository_url: "https://github.com/fluorcast/FluorCast.git",
+  remote_environment_path: "/home/user/scratch/FluorCast/.venv",
+  remote_artifacts_path: "/home/user/scratch/fluorcast-artifacts",
+  remote_model_bundle_path: "/home/user/scratch/fluorcast-artifacts/production-models",
+  slurm_account: "",
   default_model_choice: "all",
   manual_login_verified: false,
   robot_access_verified: false,
@@ -187,6 +197,23 @@ export function normalizeNibiSettings(value: unknown): NibiSettings {
       value.python_environment_path,
       defaultNibiSettings.python_environment_path,
     ),
+    remote_repository_url: stringValue(
+      value.remote_repository_url,
+      defaultNibiSettings.remote_repository_url,
+    ),
+    remote_environment_path: stringValue(
+      value.remote_environment_path,
+      stringValue(value.python_environment_path, defaultNibiSettings.python_environment_path).replace(/\/bin\/python$/, ""),
+    ),
+    remote_artifacts_path: stringValue(
+      value.remote_artifacts_path,
+      defaultNibiSettings.remote_artifacts_path,
+    ),
+    remote_model_bundle_path: stringValue(
+      value.remote_model_bundle_path,
+      defaultNibiSettings.remote_model_bundle_path,
+    ),
+    slurm_account: stringValue(value.slurm_account, defaultNibiSettings.slurm_account),
     default_model_choice: stringValue(
       value.default_model_choice,
       defaultNibiSettings.default_model_choice,
@@ -244,6 +271,9 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
       "remote_project_path",
       "remote_jobs_path",
       "python_environment_path",
+      "remote_environment_path",
+      "remote_artifacts_path",
+      "remote_model_bundle_path",
     ] as const
     : [
       "ssh_private_key_path",
@@ -252,6 +282,10 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
       "remote_project_path",
       "remote_jobs_path",
       "python_environment_path",
+      "remote_environment_path",
+      "remote_artifacts_path",
+      "remote_model_bundle_path",
+      "slurm_account",
     ] as const;
 
   for (const field of shellCheckedFields) {
@@ -283,12 +317,21 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
       "remote_project_path",
       "remote_jobs_path",
       "python_environment_path",
+      "remote_environment_path",
+      "remote_artifacts_path",
+      "remote_model_bundle_path",
     ] as const) {
       if (!trimmed[field]) {
         errors[field] = "Path is required.";
       } else if (!isAbsolutePath(trimmed[field])) {
         errors[field] = "Path must be absolute.";
       }
+    }
+    if (trimmed.remote_repository_url && /[\0\r\n`$<>]/.test(trimmed.remote_repository_url)) {
+      errors.remote_repository_url = "Repository URL contains unsupported shell metacharacters.";
+    }
+    if (trimmed.slurm_account && !/^[A-Za-z0-9_.-]+$/.test(trimmed.slurm_account)) {
+      errors.slurm_account = "Slurm account/RAP may contain only letters, numbers, underscore, dash, and dot.";
     }
   }
 
@@ -343,6 +386,11 @@ export function trimNibiSettings(settings: NibiSettings): NibiSettings {
     remote_project_path: settings.remote_project_path.trim(),
     remote_jobs_path: settings.remote_jobs_path.trim(),
     python_environment_path: settings.python_environment_path.trim(),
+    remote_repository_url: settings.remote_repository_url.trim(),
+    remote_environment_path: settings.remote_environment_path.trim(),
+    remote_artifacts_path: settings.remote_artifacts_path.trim(),
+    remote_model_bundle_path: settings.remote_model_bundle_path.trim(),
+    slurm_account: settings.slurm_account.trim(),
     default_model_choice: settings.default_model_choice.trim(),
     manual_login_verified: manualLoginVerified,
     robot_access_verified: settings.robot_access_verified,

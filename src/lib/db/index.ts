@@ -72,6 +72,18 @@ type ForeignKeyStatusRow = {
   foreign_keys: number;
 };
 
+type RemoteProvisioningRow = {
+  id: string;
+  operation: RemoteProvisioningRecord["operation"];
+  stage: string;
+  ready: number;
+  status_json: string;
+  setup_slurm_id: string | null;
+  training_slurm_id: string | null;
+  error_message: string | null;
+  updated_at: string;
+};
+
 export const JOB_NOTE_MAX_LENGTH = 2000;
 
 const JOB_DEPENDENT_DELETE_STATEMENTS = [
@@ -106,6 +118,7 @@ export type DatabaseDiagnostics = {
     results: boolean;
     job_events: boolean;
     settings: boolean;
+    remote_provisioning: boolean;
   };
   jobsCount: number;
   resultsCount: number;
@@ -134,6 +147,27 @@ export type PersistenceProbeResult = {
 export type PersistedPredictionJob = StoredPredictionJob & {
   remote_slurm_id?: string;
   remote_job_dir?: string;
+};
+
+export type RemoteProvisioningOperation =
+  | "check"
+  | "install"
+  | "repair_environment"
+  | "install_models"
+  | "training"
+  | "validation"
+  | "cancel_training";
+
+export type RemoteProvisioningRecord = {
+  id: "remote_fluorcast";
+  operation: RemoteProvisioningOperation;
+  stage: string;
+  ready: boolean;
+  status_json: string;
+  setup_slurm_id?: string;
+  training_slurm_id?: string;
+  error_message?: string;
+  updated_at: string;
 };
 
 export type JobWithResult = PersistedPredictionJob & {
@@ -318,6 +352,19 @@ export function createDatabaseRepository(
           event_type TEXT NOT NULL,
           message TEXT,
           created_at TEXT NOT NULL
+        )
+      `);
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS remote_provisioning (
+          id TEXT PRIMARY KEY,
+          operation TEXT NOT NULL,
+          stage TEXT NOT NULL,
+          ready INTEGER NOT NULL,
+          status_json TEXT NOT NULL,
+          setup_slurm_id TEXT,
+          training_slurm_id TEXT,
+          error_message TEXT,
+          updated_at TEXT NOT NULL
         )
       `);
 
@@ -736,10 +783,11 @@ export function createDatabaseRepository(
         initializedSuccessfully: false,
         tables: {
           jobs: false,
-          results: false,
-          job_events: false,
-          settings: false,
-        },
+        results: false,
+        job_events: false,
+        settings: false,
+        remote_provisioning: false,
+      },
         jobsCount: 0,
         resultsCount: 0,
         latestJobId: null,
@@ -766,6 +814,7 @@ export function createDatabaseRepository(
           results: await tableExists(db, "results"),
           job_events: await tableExists(db, "job_events"),
           settings: await tableExists(db, "settings"),
+          remote_provisioning: await tableExists(db, "remote_provisioning"),
         };
 
         if (diagnostics.tables.jobs) {
@@ -905,6 +954,77 @@ export function createDatabaseRepository(
         };
       }
     },
+
+    async saveRemoteProvisioningRecord(
+      record: RemoteProvisioningRecord,
+    ): Promise<boolean> {
+      const db = await openDatabase();
+      if (!db) {
+        return false;
+      }
+
+      await db.execute(
+        `
+          INSERT INTO remote_provisioning (
+            id,
+            operation,
+            stage,
+            ready,
+            status_json,
+            setup_slurm_id,
+            training_slurm_id,
+            error_message,
+            updated_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          ON CONFLICT(id) DO UPDATE SET
+            operation = excluded.operation,
+            stage = excluded.stage,
+            ready = excluded.ready,
+            status_json = excluded.status_json,
+            setup_slurm_id = COALESCE(excluded.setup_slurm_id, remote_provisioning.setup_slurm_id),
+            training_slurm_id = COALESCE(excluded.training_slurm_id, remote_provisioning.training_slurm_id),
+            error_message = excluded.error_message,
+            updated_at = excluded.updated_at
+        `,
+        [
+          record.id,
+          record.operation,
+          record.stage,
+          record.ready ? 1 : 0,
+          record.status_json,
+          record.setup_slurm_id ?? null,
+          record.training_slurm_id ?? null,
+          record.error_message ?? null,
+          record.updated_at,
+        ],
+      );
+      return true;
+    },
+
+    async getRemoteProvisioningRecord(): Promise<RemoteProvisioningRecord | null> {
+      const db = await openDatabase();
+      if (!db) {
+        return null;
+      }
+
+      const rows = await db.select<RemoteProvisioningRow[]>(`
+        SELECT
+          id,
+          operation,
+          stage,
+          ready,
+          status_json,
+          setup_slurm_id,
+          training_slurm_id,
+          error_message,
+          updated_at
+        FROM remote_provisioning
+        WHERE id = 'remote_fluorcast'
+        LIMIT 1
+      `);
+      return rows[0] ? provisioningRowToRecord(rows[0]) : null;
+    },
   };
 }
 
@@ -952,6 +1072,20 @@ export function serializePredictionResult(output: PredictionJobOutput) {
 
 export function parsePredictionResult(outputJson: string): PredictionJobOutput {
   return validatePredictionJobOutput(JSON.parse(outputJson));
+}
+
+function provisioningRowToRecord(row: RemoteProvisioningRow): RemoteProvisioningRecord {
+  return {
+    id: "remote_fluorcast",
+    operation: row.operation,
+    stage: row.stage,
+    ready: row.ready === 1,
+    status_json: row.status_json,
+    ...(row.setup_slurm_id ? { setup_slurm_id: row.setup_slurm_id } : {}),
+    ...(row.training_slurm_id ? { training_slurm_id: row.training_slurm_id } : {}),
+    ...(row.error_message ? { error_message: row.error_message } : {}),
+    updated_at: row.updated_at,
+  };
 }
 
 export async function initializeDatabase(): Promise<boolean> {
@@ -1031,4 +1165,14 @@ export async function getDatabaseDiagnostics(): Promise<DatabaseDiagnostics> {
 
 export async function createMockPersistenceProbe(): Promise<PersistenceProbeResult> {
   return databaseRepository.createMockPersistenceProbe();
+}
+
+export async function saveRemoteProvisioningRecord(
+  record: RemoteProvisioningRecord,
+): Promise<boolean> {
+  return databaseRepository.saveRemoteProvisioningRecord(record);
+}
+
+export async function getRemoteProvisioningRecord(): Promise<RemoteProvisioningRecord | null> {
+  return databaseRepository.getRemoteProvisioningRecord();
 }

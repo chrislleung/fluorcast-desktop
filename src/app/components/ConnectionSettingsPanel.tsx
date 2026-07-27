@@ -1186,6 +1186,86 @@ export function ConnectionSettingsPanel({
             </span>
           ) : null}
         </label>
+
+        <label>
+          <span>Remote repository URL</span>
+          <input
+            aria-describedby="remote_repository_url-error"
+            aria-invalid={errors.remote_repository_url ? "true" : "false"}
+            name="remote_repository_url"
+            onChange={(event) => updateField("remote_repository_url", event.target.value)}
+            value={values.remote_repository_url}
+          />
+          {errors.remote_repository_url ? (
+            <span className="field-error" id="remote_repository_url-error">
+              {errors.remote_repository_url}
+            </span>
+          ) : null}
+        </label>
+
+        <label>
+          <span>Remote environment path</span>
+          <input
+            aria-describedby="remote_environment_path-error"
+            aria-invalid={errors.remote_environment_path ? "true" : "false"}
+            name="remote_environment_path"
+            onChange={(event) => updateField("remote_environment_path", event.target.value)}
+            value={values.remote_environment_path}
+          />
+          {errors.remote_environment_path ? (
+            <span className="field-error" id="remote_environment_path-error">
+              {errors.remote_environment_path}
+            </span>
+          ) : null}
+        </label>
+
+        <label>
+          <span>Remote artifacts path</span>
+          <input
+            aria-describedby="remote_artifacts_path-error"
+            aria-invalid={errors.remote_artifacts_path ? "true" : "false"}
+            name="remote_artifacts_path"
+            onChange={(event) => updateField("remote_artifacts_path", event.target.value)}
+            value={values.remote_artifacts_path}
+          />
+          {errors.remote_artifacts_path ? (
+            <span className="field-error" id="remote_artifacts_path-error">
+              {errors.remote_artifacts_path}
+            </span>
+          ) : null}
+        </label>
+
+        <label>
+          <span>Production model bundle path</span>
+          <input
+            aria-describedby="remote_model_bundle_path-error"
+            aria-invalid={errors.remote_model_bundle_path ? "true" : "false"}
+            name="remote_model_bundle_path"
+            onChange={(event) => updateField("remote_model_bundle_path", event.target.value)}
+            value={values.remote_model_bundle_path}
+          />
+          {errors.remote_model_bundle_path ? (
+            <span className="field-error" id="remote_model_bundle_path-error">
+              {errors.remote_model_bundle_path}
+            </span>
+          ) : null}
+        </label>
+
+        <label>
+          <span>Training Slurm account/RAP</span>
+          <input
+            aria-describedby="slurm_account-error"
+            aria-invalid={errors.slurm_account ? "true" : "false"}
+            name="slurm_account"
+            onChange={(event) => updateField("slurm_account", event.target.value)}
+            value={values.slurm_account}
+          />
+          {errors.slurm_account ? (
+            <span className="field-error" id="slurm_account-error">
+              {errors.slurm_account}
+            </span>
+          ) : null}
+        </label>
           </div>
         </details>
         ) : null}

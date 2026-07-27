@@ -4,7 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   validatePredictionJobInput,
 } from "../../lib/schemas";
+import { defaultNibiSettings } from "../../features/settings";
 import { NewPredictionPage } from "./NewPredictionPage";
+import type { RemoteProvisioningRecord } from "../../lib/db";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (command: string, args?: { commandSpec?: { executable?: string } }) => {
@@ -40,6 +42,43 @@ describe("NewPredictionPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
+
+  const readyProvisioningRecord: RemoteProvisioningRecord = {
+    id: "remote_fluorcast",
+    operation: "check",
+    stage: "ready",
+    ready: true,
+    setup_slurm_id: "111",
+    training_slurm_id: "222",
+    updated_at: "2026-07-27T10:00:00.000Z",
+    status_json: JSON.stringify({
+      schema_version: "1",
+      stage: "ready",
+      ready: true,
+      repository: {
+        status: "ok",
+        installed_version: "v0.1.0",
+        expected_ref: "v0.1.0",
+      },
+      environment: {
+        status: "ok",
+      },
+      data: {
+        status: "ok",
+      },
+      production_model: {
+        status: "ok",
+        installed_artifact_version: "production-models-2026-07-27",
+        expected_artifact_version: "production-models-2026-07-27",
+      },
+      smoke_test: {
+        status: "passed",
+      },
+      setup_slurm_id: "111",
+      training_slurm_id: "222",
+      last_checked_at: "2026-07-27T10:00:00.000Z",
+    }),
+  };
 
   it("rejects an empty molecule SMILES", () => {
     render(<NewPredictionPage />);
@@ -159,6 +198,7 @@ describe("NewPredictionPage", () => {
           can_run_background_commands: true,
         }}
         nibiSettings={{
+          ...defaultNibiSettings,
           connection_mode: "interactive_mfa",
           backend_mode: "nibi",
           manual_mfa_provider: "persistent_shell",
@@ -184,6 +224,7 @@ describe("NewPredictionPage", () => {
           manual_ssh_login_confirmed: true,
         }}
         onJobChange={handleJobChange}
+        remoteProvisioningRecord={readyProvisioningRecord}
       />,
     );
 
@@ -208,6 +249,40 @@ describe("NewPredictionPage", () => {
     }));
   });
 
+  it("blocks real NIBI prediction submission until remote setup is ready", async () => {
+    const handleJobChange = vi.fn();
+    render(
+      <NewPredictionPage
+        manualMfaSession={{
+          status: "authenticated",
+          message: "Ready",
+          can_run_background_commands: true,
+        }}
+        nibiSettings={{
+          ...defaultNibiSettings,
+          connection_mode: "interactive_mfa",
+          backend_mode: "nibi",
+          manual_mfa_provider: "persistent_shell",
+          nibi_username: "alice",
+          manual_login_verified: true,
+          manual_ssh_login_confirmed: true,
+        }}
+        onJobChange={handleJobChange}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText(/Molecule SMILES/i), {
+      target: { value: "CCO" },
+    });
+    fireEvent.change(screen.getByLabelText(/Solvent SMILES/i), {
+      target: { value: "O" },
+    });
+
+    expect(screen.getByRole("button", { name: /Submit to NIBI/i })).toBeDisabled();
+    expect(screen.getByText("Remote FluorCast setup must report ready before real NIBI predictions can be submitted."))
+      .toBeInTheDocument();
+  });
+
   it("ignores three rapid Submit to NIBI clicks and submits exactly one Slurm job", async () => {
     render(
       <NewPredictionPage
@@ -217,6 +292,7 @@ describe("NewPredictionPage", () => {
           can_run_background_commands: true,
         }}
         nibiSettings={{
+          ...defaultNibiSettings,
           connection_mode: "interactive_mfa",
           backend_mode: "nibi",
           manual_mfa_provider: "persistent_shell",
@@ -241,6 +317,7 @@ describe("NewPredictionPage", () => {
           last_manual_login_check_at: "",
           manual_ssh_login_confirmed: true,
         }}
+        remoteProvisioningRecord={readyProvisioningRecord}
       />,
     );
 
@@ -268,6 +345,7 @@ describe("NewPredictionPage", () => {
     render(
       <NewPredictionPage
         nibiSettings={{
+          ...defaultNibiSettings,
           connection_mode: "interactive_mfa",
           backend_mode: "nibi",
           manual_mfa_provider: "terminal_action",
@@ -293,6 +371,7 @@ describe("NewPredictionPage", () => {
           manual_ssh_login_confirmed: false,
         } as unknown as typeof defaultNibiSettings}
         onJobChange={handleJobChange}
+        remoteProvisioningRecord={readyProvisioningRecord}
       />,
     );
 

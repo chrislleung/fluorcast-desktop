@@ -31,12 +31,14 @@ import {
   addJobEvent,
   deleteJobPermanently,
   getJobWithResult,
+  getRemoteProvisioningRecord,
   initializeDatabase,
   listJobs,
   saveJob,
   saveResult,
   updateJobStatus,
   updateJobNote,
+  type RemoteProvisioningRecord,
   type JobWithResult,
 } from "../lib/db";
 import {
@@ -97,6 +99,7 @@ export function App() {
   const [databaseStatus, setDatabaseStatus] = useState<DatabaseStatus>("initializing");
   const [jobsState, dispatchJobs] = useReducer(jobsReducer, initialJobsState);
   const [latestPollingResult, setLatestPollingResult] = useState<SlurmPollingResult | null>(null);
+  const [remoteProvisioningRecord, setRemoteProvisioningRecord] = useState<RemoteProvisioningRecord | null>(null);
   const [pollingDiagnostics, setPollingDiagnostics] = useState<SlurmPollingCoordinatorDiagnostics | null>(null);
   const [manualMfaJobStatus, setManualMfaJobStatus] = useState("");
   const [lastJobsSessionProbeKey, setLastJobsSessionProbeKey] = useState("");
@@ -274,10 +277,12 @@ export function App() {
           persistedAppearanceSettings,
           persistedNibiSettings,
           persistedJobs,
+          persistedProvisioningRecord,
         ] = await Promise.all([
           loadAppearanceSettings(),
           loadNibiSettings(),
           listJobs(),
+          getRemoteProvisioningRecord(),
         ]);
 
         if (!isMounted) {
@@ -286,6 +291,7 @@ export function App() {
 
         setAppearanceSettings(persistedAppearanceSettings);
         setNibiSettings(persistedNibiSettings);
+        setRemoteProvisioningRecord(persistedProvisioningRecord);
         dispatchJobs({ type: "set_jobs", jobs: persistedJobs });
         setDatabaseStatus("ready");
       } catch (error) {
@@ -1124,6 +1130,9 @@ export function App() {
             nibiSettings={nibiSettings}
             onManualMfaSessionChange={(session) => updateLiveSessionState(session, "HomePage.onManualMfaSessionChange")}
             onNibiSettingsSave={handleNibiSettingsSave}
+            onProvisioningRecordChange={setRemoteProvisioningRecord}
+            onViewTrainingJobs={() => navigate("jobs")}
+            provisioningRecord={remoteProvisioningRecord}
           />
         );
       case "prediction":
@@ -1134,6 +1143,7 @@ export function App() {
             onJobChange={persistJobChange}
             onOpenResult={openResult}
             onOpenSettings={() => navigate("settings")}
+            remoteProvisioningRecord={remoteProvisioningRecord}
           />
         );
       case "jobs":

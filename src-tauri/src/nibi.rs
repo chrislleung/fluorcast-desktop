@@ -16,6 +16,9 @@ const ROBOT_AUTOMATION_OK: &str = "FLUORCAST_ROBOT_OK";
 const ROBOT_NOT_READY_MESSAGE: &str = "Robot automation is not ready. Manual login may work, but automatic FluorCast job submission requires robot-node access with a restricted public key.";
 const PERSISTENT_SHELL_TIMEOUT: Duration = Duration::from_secs(60);
 const PERSISTENT_SHELL_LOG_LIMIT: usize = 128_000;
+const EXPECTED_FLUORCAST_REPOSITORY_REF: &str = "v0.1.0";
+const EXPECTED_MODEL_ARTIFACT_VERSION: &str = "production-models-2026-07-27";
+const EXPECTED_PROVISIONING_SCHEMA_VERSION: &str = "1";
 
 static PERSISTENT_SHELL: OnceLock<Mutex<Option<PersistentShell>>> = OnceLock::new();
 static MANUAL_MFA_TERMINAL_LAUNCH: OnceLock<Mutex<()>> = OnceLock::new();
@@ -47,6 +50,16 @@ pub struct NibiSettings {
     remote_project_path: String,
     remote_jobs_path: String,
     python_environment_path: String,
+    #[serde(default = "default_remote_repository_url")]
+    remote_repository_url: String,
+    #[serde(default = "default_remote_environment_path")]
+    remote_environment_path: String,
+    #[serde(default = "default_remote_artifacts_path")]
+    remote_artifacts_path: String,
+    #[serde(default = "default_remote_model_bundle_path")]
+    remote_model_bundle_path: String,
+    #[serde(default)]
+    slurm_account: String,
     manual_ssh_login_confirmed: bool,
 }
 
@@ -111,6 +124,29 @@ pub struct RemoteCommandResult {
     command_label: String,
     redacted_command_preview: String,
     timed_out: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProvisioningRequest {
+    #[serde(default = "default_expected_repository_ref")]
+    expected_repository_ref: String,
+    #[serde(default = "default_expected_artifact_version")]
+    expected_artifact_version: String,
+    #[serde(default = "default_expected_schema_version")]
+    expected_schema_version: String,
+    #[serde(default)]
+    training_account: String,
+    #[serde(default)]
+    confirmed: bool,
+    #[serde(default)]
+    slurm_job_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RemoteProvisioningCommandResult {
+    status_json: serde_json::Value,
+    raw: RemoteCommandResult,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -640,6 +676,103 @@ pub fn download_nibi_file(
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+#[tauri::command]
+pub fn check_remote_fluorcast_installation(
+    mode: String,
+    settings: NibiSettings,
+    request: RemoteProvisioningRequest,
+) -> Result<RemoteProvisioningCommandResult, String> {
+    run_remote_provisioning_action(
+        &mode,
+        &settings,
+        &request,
+        "Check remote FluorCast installation",
+        build_remote_provisioning_shell_command("check", &settings, &request)?,
+    )
+}
+
+#[tauri::command]
+pub fn provision_remote_fluorcast(
+    mode: String,
+    settings: NibiSettings,
+    request: RemoteProvisioningRequest,
+) -> Result<RemoteProvisioningCommandResult, String> {
+    run_remote_provisioning_action(
+        &mode,
+        &settings,
+        &request,
+        "Provision remote FluorCast installation",
+        build_remote_provisioning_shell_command("provision", &settings, &request)?,
+    )
+}
+
+#[tauri::command]
+pub fn install_remote_model_bundle(
+    mode: String,
+    settings: NibiSettings,
+    request: RemoteProvisioningRequest,
+) -> Result<RemoteProvisioningCommandResult, String> {
+    run_remote_provisioning_action(
+        &mode,
+        &settings,
+        &request,
+        "Install remote production model bundle",
+        build_remote_provisioning_shell_command("install-models", &settings, &request)?,
+    )
+}
+
+#[tauri::command]
+pub fn submit_remote_model_training(
+    mode: String,
+    settings: NibiSettings,
+    request: RemoteProvisioningRequest,
+) -> Result<RemoteProvisioningCommandResult, String> {
+    if !request.confirmed {
+        return Err(
+            "Retraining requires explicit confirmation because it consumes allocation.".to_string(),
+        );
+    }
+    validate_slurm_account(&request.training_account)?;
+    run_remote_provisioning_action(
+        &mode,
+        &settings,
+        &request,
+        "Submit remote model training",
+        build_remote_provisioning_shell_command("train", &settings, &request)?,
+    )
+}
+
+#[tauri::command]
+pub fn get_remote_provisioning_status(
+    mode: String,
+    settings: NibiSettings,
+    request: RemoteProvisioningRequest,
+) -> Result<RemoteProvisioningCommandResult, String> {
+    run_remote_provisioning_action(
+        &mode,
+        &settings,
+        &request,
+        "Get remote provisioning status",
+        build_remote_provisioning_shell_command("status", &settings, &request)?,
+    )
+}
+
+#[tauri::command]
+pub fn cancel_remote_provisioning_training(
+    mode: String,
+    settings: NibiSettings,
+    request: RemoteProvisioningRequest,
+) -> Result<RemoteProvisioningCommandResult, String> {
+    validate_slurm_job_id(&request.slurm_job_id)?;
+    run_remote_provisioning_action(
+        &mode,
+        &settings,
+        &request,
+        "Cancel remote provisioning training",
+        build_remote_provisioning_shell_command("cancel-training", &settings, &request)?,
+    )
 }
 
 #[tauri::command]
@@ -1548,6 +1681,229 @@ fn run_remote_invocation_result(
             redacted_command_preview: preview,
             timed_out: false,
         }),
+    }
+}
+
+fn run_remote_provisioning_action(
+    mode: &str,
+    settings: &NibiSettings,
+    request: &RemoteProvisioningRequest,
+    label: &str,
+    remote_command: String,
+) -> Result<RemoteProvisioningCommandResult, String> {
+    validate_provisioning_settings(settings)?;
+    validate_version_pin(&request.expected_repository_ref, "Expected repository ref")?;
+    validate_version_pin(
+        &request.expected_artifact_version,
+        "Expected artifact version",
+    )?;
+    validate_version_pin(
+        &request.expected_schema_version,
+        "Expected provisioning schema version",
+    )?;
+
+    let result = if mode == "interactive_mfa" {
+        run_manual_mfa_remote_command_result(
+            settings,
+            &remote_command,
+            label.to_string(),
+            Some(redacted_provisioning_preview(label)),
+        )?
+    } else if mode == "robot_automation" {
+        let invocation = build_robot_remote_invocation(settings, &remote_command)?;
+        run_remote_invocation_result(
+            invocation,
+            label.to_string(),
+            Some(redacted_provisioning_preview(label)),
+        )?
+    } else {
+        return Err(
+            "Remote provisioning requires Manual MFA or Robot automation mode.".to_string(),
+        );
+    };
+
+    let status_json = parse_remote_provisioning_json(&result.stdout)
+        .map_err(|error| format!("{error}\nSTDERR={}", result.stderr.trim()))?;
+    Ok(RemoteProvisioningCommandResult {
+        status_json,
+        raw: result,
+    })
+}
+
+fn build_remote_provisioning_shell_command(
+    action: &str,
+    settings: &NibiSettings,
+    request: &RemoteProvisioningRequest,
+) -> Result<String, String> {
+    validate_provisioning_settings(settings)?;
+    validate_version_pin(&request.expected_repository_ref, "Expected repository ref")?;
+    validate_version_pin(
+        &request.expected_artifact_version,
+        "Expected artifact version",
+    )?;
+    validate_version_pin(
+        &request.expected_schema_version,
+        "Expected provisioning schema version",
+    )?;
+    validate_simple_action(action)?;
+    if action == "train" {
+        validate_slurm_account(&request.training_account)?;
+    }
+    if action == "cancel-training" {
+        validate_slurm_job_id(&request.slurm_job_id)?;
+    }
+
+    let script_path = format!(
+        "{}/scripts/desktop_provisioning.py",
+        settings.remote_project_path.trim_end_matches('/')
+    );
+    let mut args = vec![
+        shell_quote(action),
+        "--repo".to_string(),
+        shell_quote(&settings.remote_project_path),
+        "--repo-url".to_string(),
+        shell_quote(&settings.remote_repository_url),
+        "--environment".to_string(),
+        shell_quote(&settings.remote_environment_path),
+        "--python".to_string(),
+        shell_quote(&settings.python_environment_path),
+        "--artifacts".to_string(),
+        shell_quote(&settings.remote_artifacts_path),
+        "--model-bundle".to_string(),
+        shell_quote(&settings.remote_model_bundle_path),
+        "--expected-ref".to_string(),
+        shell_quote(&request.expected_repository_ref),
+        "--expected-artifact-version".to_string(),
+        shell_quote(&request.expected_artifact_version),
+        "--schema-version".to_string(),
+        shell_quote(&request.expected_schema_version),
+        "--json".to_string(),
+    ];
+    if action == "train" {
+        args.push("--account".to_string());
+        args.push(shell_quote(&request.training_account));
+    }
+    if action == "cancel-training" {
+        args.push("--slurm-job-id".to_string());
+        args.push(shell_quote(&request.slurm_job_id));
+    }
+
+    let bootstrap = format!(
+        r#"set -euo pipefail
+REPO={repo}
+SCRIPT={script}
+if [ "$1" = "provision" ] && [ ! -e "$REPO" ]; then
+  mkdir -p "$(dirname "$REPO")"
+  git clone --branch "$15" -- "$5" "$REPO"
+fi
+if [ ! -f "$SCRIPT" ]; then
+  printf '{{"schema_version":%s,"stage":"failed","ready":false,"repository":{{"status":"missing","expected_ref":%s}},"environment":{{"status":"unknown"}},"data":{{"status":"unknown"}},"production_model":{{"status":"unknown","expected_artifact_version":%s}},"smoke_test":{{"status":"unknown"}},"last_checked_at":"%s","error":"Remote provisioning script is missing."}}\n' "$19" "$15" "$17" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  exit 44
+fi
+if [ "$1" != "check" ] && [ "$1" != "status" ] && [ "$1" != "cancel-training" ]; then
+  mkdir -p "$11"
+  if ! mkdir "$11/provisioning.lock" 2>/dev/null; then
+    printf '{{"schema_version":%s,"stage":"failed","ready":false,"repository":{{"status":"unknown","expected_ref":%s}},"environment":{{"status":"unknown"}},"data":{{"status":"unknown"}},"production_model":{{"status":"unknown","expected_artifact_version":%s}},"smoke_test":{{"status":"unknown"}},"last_checked_at":"%s","error":"Remote provisioning is already running."}}\n' "$19" "$15" "$17" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    exit 45
+  fi
+  trap 'rmdir "$11/provisioning.lock" 2>/dev/null || true' EXIT
+fi
+exec python3 "$SCRIPT" "$@""#,
+        repo = shell_quote(&settings.remote_project_path),
+        script = shell_quote(&script_path),
+    );
+    Ok(format!(
+        "bash -lc {} -- {}",
+        shell_quote(&bootstrap),
+        args.join(" ")
+    ))
+}
+
+fn parse_remote_provisioning_json(stdout: &str) -> Result<serde_json::Value, String> {
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| "Remote provisioning command did not emit structured JSON.".to_string())?;
+    serde_json::from_str(line.trim())
+        .map_err(|error| format!("Remote provisioning JSON could not be parsed: {error}"))
+}
+
+fn redacted_provisioning_preview(label: &str) -> String {
+    format!("{label}: desktop_provisioning.py --json <paths-redacted>")
+}
+
+fn validate_provisioning_settings(settings: &NibiSettings) -> Result<(), String> {
+    validate_remote_path(&settings.remote_project_path, "Remote repository path")?;
+    validate_remote_path(&settings.remote_jobs_path, "Remote jobs path")?;
+    validate_remote_path(&settings.python_environment_path, "Python environment path")?;
+    validate_remote_path(&settings.remote_environment_path, "Remote environment path")?;
+    validate_remote_path(&settings.remote_artifacts_path, "Remote artifacts path")?;
+    validate_remote_path(
+        &settings.remote_model_bundle_path,
+        "Production model bundle path",
+    )?;
+    validate_repository_url(&settings.remote_repository_url)?;
+    if !settings.slurm_account.trim().is_empty() {
+        validate_slurm_account(&settings.slurm_account)?;
+    }
+    Ok(())
+}
+
+fn validate_repository_url(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Remote repository URL is required.".to_string());
+    }
+    if trimmed.contains('\0')
+        || trimmed.contains('\r')
+        || trimmed.contains('\n')
+        || trimmed.contains('`')
+        || trimmed.contains('$')
+        || trimmed.contains('<')
+        || trimmed.contains('>')
+    {
+        return Err("Remote repository URL contains unsupported shell metacharacters.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_version_pin(value: &str, label: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} is required."));
+    }
+    if !trimmed.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/' | ':')
+    }) {
+        return Err(format!("{label} contains unsupported characters."));
+    }
+    Ok(())
+}
+
+fn validate_simple_action(value: &str) -> Result<(), String> {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_lowercase() || character == '-')
+    {
+        Ok(())
+    } else {
+        Err("Provisioning action contains unsupported characters.".to_string())
+    }
+}
+
+fn validate_slurm_account(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Training Slurm account/RAP is required.".to_string());
+    }
+    if trimmed
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        Ok(())
+    } else {
+        Err("Training Slurm account/RAP contains unsupported characters.".to_string())
     }
 }
 
@@ -4225,6 +4581,34 @@ fn default_wsl_distro() -> String {
     "Ubuntu".to_string()
 }
 
+fn default_remote_repository_url() -> String {
+    "https://github.com/fluorcast/FluorCast.git".to_string()
+}
+
+fn default_remote_environment_path() -> String {
+    "/home/user/scratch/FluorCast/.venv".to_string()
+}
+
+fn default_remote_artifacts_path() -> String {
+    "/home/user/scratch/fluorcast-artifacts".to_string()
+}
+
+fn default_remote_model_bundle_path() -> String {
+    "/home/user/scratch/fluorcast-artifacts/production-models".to_string()
+}
+
+fn default_expected_repository_ref() -> String {
+    EXPECTED_FLUORCAST_REPOSITORY_REF.to_string()
+}
+
+fn default_expected_artifact_version() -> String {
+    EXPECTED_MODEL_ARTIFACT_VERSION.to_string()
+}
+
+fn default_expected_schema_version() -> String {
+    EXPECTED_PROVISIONING_SCHEMA_VERSION.to_string()
+}
+
 fn validate_wsl_distro(value: &str) -> Result<(), String> {
     let distro = wsl_distro_name(value);
     if !distro
@@ -4521,6 +4905,11 @@ mod tests {
             remote_project_path: "/home/alice/scratch/FluorCast".to_string(),
             remote_jobs_path: "/home/alice/scratch/fluorcast-jobs".to_string(),
             python_environment_path: "/home/alice/scratch/FluorCast/.venv/bin/python".to_string(),
+            remote_repository_url: "https://github.com/fluorcast/FluorCast.git".to_string(),
+            remote_environment_path: "/home/alice/scratch/FluorCast/.venv".to_string(),
+            remote_artifacts_path: "/home/alice/scratch/fluorcast-artifacts".to_string(),
+            remote_model_bundle_path: "/home/alice/scratch/fluorcast-artifacts/production-models".to_string(),
+            slurm_account: "def-alice".to_string(),
             manual_ssh_login_confirmed: true,
         }
     }
@@ -4548,6 +4937,17 @@ mod tests {
             redacted_preview: Some(
                 "create/read/delete <remote_jobs_path>/.fluorcast-smoke-*.txt".to_string(),
             ),
+        }
+    }
+
+    fn provisioning_request() -> RemoteProvisioningRequest {
+        RemoteProvisioningRequest {
+            expected_repository_ref: EXPECTED_FLUORCAST_REPOSITORY_REF.to_string(),
+            expected_artifact_version: EXPECTED_MODEL_ARTIFACT_VERSION.to_string(),
+            expected_schema_version: EXPECTED_PROVISIONING_SCHEMA_VERSION.to_string(),
+            training_account: "def-alice".to_string(),
+            confirmed: true,
+            slurm_job_id: "123456".to_string(),
         }
     }
 
@@ -4709,6 +5109,57 @@ mod tests {
             RemoteCommand::PythonEnvironmentExists.to_shell_fragment(&settings),
             "test -e '/home/alice/scratch/FluorCast/.venv/bin/python'"
         );
+    }
+
+    #[test]
+    fn builds_provisioning_check_with_pinned_versions_and_quoted_paths() {
+        let mut settings = settings();
+        settings.remote_project_path = "/home/alice/scratch/Fluor Cast".to_string();
+        let command =
+            build_remote_provisioning_shell_command("check", &settings, &provisioning_request())
+                .unwrap();
+
+        assert!(command.starts_with("bash -lc '"));
+        assert!(command.contains("desktop_provisioning.py"));
+        assert!(command.contains("--expected-ref 'v0.1.0'"));
+        assert!(command.contains("--expected-artifact-version 'production-models-2026-07-27'"));
+        assert!(command.contains("--schema-version '1'"));
+        assert!(command.contains("--repo '/home/alice/scratch/Fluor Cast'"));
+    }
+
+    #[test]
+    fn training_provisioning_command_passes_validated_slurm_account() {
+        let command =
+            build_remote_provisioning_shell_command("train", &settings(), &provisioning_request())
+                .unwrap();
+
+        assert!(command.contains("--account 'def-alice'"));
+        assert!(validate_slurm_account("def-alice.rrg_1").is_ok());
+        assert!(validate_slurm_account("def-alice;rm").is_err());
+    }
+
+    #[test]
+    fn provisioning_command_rejects_unsafe_repository_url() {
+        let mut settings = settings();
+        settings.remote_repository_url = "https://example.test/repo.git\ncurl bad".to_string();
+
+        assert!(build_remote_provisioning_shell_command(
+            "check",
+            &settings,
+            &provisioning_request(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parses_last_structured_provisioning_json_only() {
+        let parsed = parse_remote_provisioning_json(
+            "human progress\n{\"schema_version\":\"1\",\"stage\":\"ready\",\"ready\":true}\n",
+        )
+        .unwrap();
+
+        assert_eq!(parsed["stage"], "ready");
+        assert!(parse_remote_provisioning_json("installation complete").is_err());
     }
 
     #[test]
