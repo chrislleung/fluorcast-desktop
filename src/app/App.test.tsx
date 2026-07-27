@@ -217,33 +217,45 @@ describe("App", () => {
     expect(await screen.findByText("This job is marked completed, but no saved result was found.")).toBeInTheDocument();
   });
 
-  it("updates the app accent color from settings", async () => {
+  it("updates the active app palette from settings", async () => {
     const { container } = render(<App />);
     await screen.findByRole("heading", { name: /from structure to signal/i });
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    fireEvent.click(await screen.findByText("Appearance"));
-    fireEvent.click(await screen.findByRole("button", { name: "Rose accent" }));
+    fireEvent.click(await screen.findByLabelText("Dark palette"));
+    fireEvent.change(document.getElementById("dark-primary-hex") as HTMLInputElement, {
+      target: { value: "#ff9bb3" },
+    });
 
-    expect(container.querySelector(".app-shell")).toHaveStyle({ "--accent": "#ff9bb3" });
+    expect(container.querySelector(".app-shell")).toHaveStyle({ "--color-primary": "#ff9bb3" });
   });
 
-  it("loads and updates the app secondary color from settings", async () => {
+  it("loads and updates saved appearance settings", async () => {
     dbMock.getSetting.mockImplementation(async (key: string) => (
-      key === "secondaryColor" ? "#f3c969" : null
+      key === "appearanceSettings"
+        ? JSON.stringify({
+          themeMode: "dark",
+          darkPalette: { secondary: "#f3c969" },
+        })
+        : null
     ));
 
     const { container } = render(<App />);
     await screen.findByRole("heading", { name: /from structure to signal/i });
 
-    expect(container.querySelector(".app-shell")).toHaveStyle({ "--secondary": "#f3c969" });
+    expect(container.querySelector(".app-shell")).toHaveStyle({ "--color-secondary": "#f3c969" });
 
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
-    fireEvent.click(await screen.findByText("Appearance"));
-    fireEvent.click(await screen.findByRole("button", { name: "Coral secondary" }));
+    fireEvent.click(await screen.findByLabelText("Dark palette"));
+    fireEvent.change(document.getElementById("dark-secondary-hex") as HTMLInputElement, {
+      target: { value: "#ffad91" },
+    });
 
-    expect(container.querySelector(".app-shell")).toHaveStyle({ "--secondary": "#ffad91" });
-    expect(dbMock.saveSetting).toHaveBeenCalledWith("secondaryColor", "#ffad91");
+    expect(container.querySelector(".app-shell")).toHaveStyle({ "--color-secondary": "#ffad91" });
+    expect(dbMock.saveSetting).toHaveBeenCalledWith(
+      "appearanceSettings",
+      expect.stringContaining("\"secondary\":\"#ffad91\""),
+    );
   });
 
   it("probes Manual MFA session on Jobs when stale state would block remote jobs", async () => {
@@ -355,3 +367,4 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
   });
 });
+

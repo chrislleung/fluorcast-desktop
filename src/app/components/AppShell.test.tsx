@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { defaultNibiSettings } from "../../features/settings";
+import { cssVariablesForPalette, defaultDarkPalette, defaultNibiSettings } from "../../features/settings";
 import type { NibiSettings } from "../../features/settings";
 import { defaultManualMfaSessionState, type ManualMfaSessionUiState } from "../../lib/remote";
 import { AppShell } from "./AppShell";
@@ -12,13 +12,12 @@ function renderShell(options: {
 } = {}) {
   return render(
     <AppShell
-      accentColor="#8ab4ff"
+      appearanceStyle={cssVariablesForPalette(defaultDarkPalette)}
       currentPage="home"
       isManualMfaChecking={options.isManualMfaChecking}
       manualMfaSession={options.manualMfaSession ?? defaultManualMfaSessionState}
       nibiSettings={options.nibiSettings ?? defaultNibiSettings}
       onNavigate={() => undefined}
-      secondaryColor="#8ee6c8"
     >
       <div>Shell content</div>
     </AppShell>,
@@ -78,7 +77,7 @@ describe("AppShell NIBI connection status", () => {
   it("updates when authenticated-session readiness changes", () => {
     const { rerender } = render(
       <AppShell
-        accentColor="#8ab4ff"
+        appearanceStyle={cssVariablesForPalette(defaultDarkPalette)}
         currentPage="jobs"
         manualMfaSession={defaultManualMfaSessionState}
         nibiSettings={{
@@ -87,7 +86,6 @@ describe("AppShell NIBI connection status", () => {
           connection_mode: "interactive_mfa",
         }}
         onNavigate={() => undefined}
-        secondaryColor="#8ee6c8"
       >
         <div>Shell content</div>
       </AppShell>,
@@ -97,7 +95,7 @@ describe("AppShell NIBI connection status", () => {
 
     rerender(
       <AppShell
-        accentColor="#8ab4ff"
+        appearanceStyle={cssVariablesForPalette(defaultDarkPalette)}
         currentPage="jobs"
         manualMfaSession={{
           ...defaultManualMfaSessionState,
@@ -110,7 +108,6 @@ describe("AppShell NIBI connection status", () => {
           connection_mode: "interactive_mfa",
         }}
         onNavigate={() => undefined}
-        secondaryColor="#8ee6c8"
       >
         <div>Shell content</div>
       </AppShell>,

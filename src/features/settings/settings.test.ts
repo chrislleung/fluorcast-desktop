@@ -1,21 +1,133 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  APPEARANCE_SETTINGS_KEY,
   buildManualSshCommand,
   buildAllianceSupportRequest,
   buildRestrictedPublicKey,
+  contrastRatio,
+  cssVariablesForPalette,
+  defaultAppearanceSettings,
+  defaultDarkPalette,
   defaultNibiSettings,
+  defaultLightPalette,
+  getContrastWarnings,
   hasShellMetacharacters,
   isAbsolutePath,
   isPublicSshKeyPath,
+  loadAppearanceSettings,
+  mergeLegacyAppearanceColors,
+  normalizeAppearancePalette,
+  normalizeAppearanceSettings,
+  normalizeHexColor,
   normalizeNibiSettings,
   PUBLIC_SSH_KEY_WARNING,
+  resolveThemeMode,
+  saveAppearanceSettings,
   trimNibiSettings,
   validateNibiSettings,
   validateNibiSettingsWarnings,
   type NibiSettings,
 } from "./index";
+
+const dbMock = vi.hoisted(() => ({
+  getSetting: vi.fn(),
+  saveSetting: vi.fn(),
+}));
+
+vi.mock("../../lib/db", () => dbMock);
+
+beforeEach(() => {
+  dbMock.getSetting.mockReset();
+  dbMock.saveSetting.mockReset();
+  dbMock.getSetting.mockResolvedValue(null);
+  dbMock.saveSetting.mockResolvedValue(true);
+});
+
+describe("appearance settings", () => {
+  it("normalizes 6-digit hex colors", () => {
+    expect(normalizeHexColor("8AB4ff")).toBe("#8ab4ff");
+    expect(normalizeHexColor("#123456")).toBe("#123456");
+    expect(normalizeHexColor("#abc")).toBeNull();
+    expect(normalizeHexColor("not-a-color")).toBeNull();
+  });
+
+  it("parses theme modes and falls back safely", () => {
+    expect(normalizeAppearanceSettings({ themeMode: "dark" }).themeMode).toBe("dark");
+    expect(normalizeAppearanceSettings({ themeMode: "unexpected" }).themeMode).toBe("system");
+    expect(resolveThemeMode("system", true)).toBe("dark");
+    expect(resolveThemeMode("system", false)).toBe("light");
+  });
+
+  it("keeps separate light and dark palettes", () => {
+    const normalized = normalizeAppearanceSettings({
+      lightPalette: { primary: "#123456" },
+      darkPalette: { primary: "#abcdef" },
+    });
+
+    expect(normalized.lightPalette.primary).toBe("#123456");
+    expect(normalized.darkPalette.primary).toBe("#abcdef");
+  });
+
+  it("falls back for malformed saved palette values", () => {
+    expect(normalizeAppearancePalette({ primary: "bad" }, defaultLightPalette).primary)
+      .toBe(defaultLightPalette.primary);
+    expect(normalizeAppearanceSettings("not json")).toEqual(defaultAppearanceSettings);
+  });
+
+  it("merges legacy accent and secondary colors into the dark palette", () => {
+    expect(mergeLegacyAppearanceColors(defaultAppearanceSettings, "#ff9bb3", "#f3c969").darkPalette)
+      .toMatchObject({
+        primary: "#ff9bb3",
+        accent: "#ff9bb3",
+        secondary: "#f3c969",
+        success: "#f3c969",
+      });
+  });
+
+  it("loads invalid stored appearance settings with defaults", async () => {
+    dbMock.getSetting.mockImplementation(async (key: string) => (
+      key === APPEARANCE_SETTINGS_KEY ? "{bad json" : null
+    ));
+
+    await expect(loadAppearanceSettings()).resolves.toEqual(defaultAppearanceSettings);
+  });
+
+  it("persists a normalized appearance round trip shape", async () => {
+    await saveAppearanceSettings({
+      ...defaultAppearanceSettings,
+      themeMode: "dark",
+      darkPalette: {
+        ...defaultDarkPalette,
+        primary: "#ABCDEF",
+      },
+    });
+
+    expect(dbMock.saveSetting).toHaveBeenCalledWith(
+      APPEARANCE_SETTINGS_KEY,
+      expect.stringContaining("\"primary\":\"#abcdef\""),
+    );
+  });
+
+  it("generates semantic CSS variables", () => {
+    expect(cssVariablesForPalette(defaultDarkPalette)).toMatchObject({
+      "--color-primary": defaultDarkPalette.primary,
+      "--color-surface-elevated": defaultDarkPalette.surfaceElevated,
+      "--color-selection": defaultDarkPalette.selection,
+    });
+  });
+
+  it("calculates WCAG contrast ratios", () => {
+    expect(contrastRatio("#000000", "#ffffff")).toBe(21);
+    expect(contrastRatio("#ffffff", "#ffffff")).toBe(1);
+  });
+
+  it("ships default palettes with no built-in contrast warnings", () => {
+    expect(getContrastWarnings(defaultLightPalette)).toEqual([]);
+    expect(getContrastWarnings(defaultDarkPalette)).toEqual([]);
+  });
+});
 
 describe("NIBI settings validation", () => {
   it("accepts the suggested mock defaults", () => {

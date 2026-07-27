@@ -1,57 +1,107 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
+import type { AppearanceSettings } from "../../features/settings";
+import { defaultAppearanceSettings } from "../../features/settings";
 import { SettingsPage } from "./SettingsPage";
 
-function renderSettings() {
-  return render(
-    <SettingsPage
-      accentColor="#8ab4ff"
-      secondaryColor="#8ee6c8"
-      onAccentColorChange={vi.fn()}
-      onSecondaryColorChange={vi.fn()}
-    />,
-  );
+function renderSettings(onChange = vi.fn()) {
+  function Harness() {
+    const [settings, setSettings] = useState<AppearanceSettings>(defaultAppearanceSettings);
+    return (
+      <SettingsPage
+        appearanceSettings={settings}
+        onAppearanceSettingsChange={(nextSettings) => {
+          setSettings(nextSettings);
+          onChange(nextSettings);
+        }}
+      />
+    );
+  }
+
+  return {
+    onChange,
+    ...render(<Harness />),
+  };
 }
 
 describe("SettingsPage", () => {
-  it("renders only unrelated appearance preferences", () => {
-    renderSettings();
-
-    expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    expect(screen.getByText("Configure local workspace appearance preferences.")).toBeInTheDocument();
-    expect(screen.getByText("Appearance")).toBeInTheDocument();
-    expect(screen.getByLabelText("Custom accent color")).toBeInTheDocument();
-    expect(screen.getByLabelText("Custom secondary color")).toBeInTheDocument();
-  });
-
-  it("does not render relocated NIBI connection controls or session actions", () => {
-    renderSettings();
-
-    expect(screen.queryByRole("heading", { name: "Connection Mode" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("radio", { name: /Mock mode/ })).not.toBeInTheDocument();
-    expect(screen.queryByText("Mode-specific setup")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("NIBI username")).not.toBeInTheDocument();
-    expect(screen.queryByText("SSH key")).not.toBeInTheDocument();
-    expect(screen.queryByText("Remote FluorCast paths")).not.toBeInTheDocument();
-    expect(screen.queryByText("FluorCast does not store your NIBI password. SSH keys remain on your computer."))
-      .not.toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "NIBI Session" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Clean stale WSL session" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Start NIBI session" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Test authenticated session" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Run remote environment checks" })).not.toBeInTheDocument();
-  });
-
-  it("keeps appearance settings collapsible with the same controls", () => {
+  it("renders appearance as the main settings content without a collapsed section", () => {
     const { container } = renderSettings();
 
-    const appearancePanel = container.querySelector(".appearance-panel") as HTMLDetailsElement;
-    expect(appearancePanel.open).toBe(false);
+    expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Appearance" })).toBeInTheDocument();
+    expect(container.querySelector("details")).not.toBeInTheDocument();
+    expect(screen.queryByText("Local")).not.toBeInTheDocument();
+  });
 
-    fireEvent.click(screen.getByText("Appearance"));
+  it("updates theme mode selection", () => {
+    const { onChange } = renderSettings();
 
-    expect(appearancePanel.open).toBe(true);
-    expect(within(appearancePanel).getByRole("button", { name: "Rose accent" })).toBeInTheDocument();
-    expect(within(appearancePanel).getByRole("button", { name: "Amber secondary" })).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Dark"));
+
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ themeMode: "dark" }));
+  });
+
+  it("keeps light and dark palettes independent", () => {
+    const { onChange } = renderSettings();
+
+    fireEvent.change(document.getElementById("light-primary-hex") as HTMLInputElement, { target: { value: "#123456" } });
+
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+      lightPalette: expect.objectContaining({ primary: "#123456" }),
+      darkPalette: defaultAppearanceSettings.darkPalette,
+    }));
+  });
+
+  it("rejects invalid hex input without emitting a corrupted setting", () => {
+    const { onChange } = renderSettings();
+
+    fireEvent.change(document.getElementById("light-primary-hex") as HTMLInputElement, { target: { value: "bad" } });
+
+    expect(screen.getByText("Use a 6-digit hex color, like #8ab4ff.")).toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("updates the real color controls from hex input", () => {
+    renderSettings();
+
+    fireEvent.change(document.getElementById("light-primary-hex") as HTMLInputElement, { target: { value: "#123456" } });
+
+    expect(screen.getByLabelText("Primary color picker")).toHaveValue("#123456");
+    expect(document.getElementById("light-primary-hex")).toHaveValue("#123456");
+  });
+
+  it("requires confirmation before restoring all appearance defaults", () => {
+    const { onChange } = renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "Restore all appearance defaults" }));
+    expect(screen.getByRole("dialog", { name: "Restore all appearance defaults?" })).toBeInTheDocument();
+
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Restore defaults" }));
+
+    expect(onChange).toHaveBeenCalledWith(defaultAppearanceSettings);
+  });
+
+  it("restores only the palette currently being edited", () => {
+    const customSettings = {
+      ...defaultAppearanceSettings,
+      lightPalette: {
+        ...defaultAppearanceSettings.lightPalette,
+        primary: "#123456",
+      },
+    };
+    const onChange = vi.fn();
+    render(
+      <SettingsPage appearanceSettings={customSettings} onAppearanceSettingsChange={onChange} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Restore current palette defaults" }));
+
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+      lightPalette: defaultAppearanceSettings.lightPalette,
+      darkPalette: defaultAppearanceSettings.darkPalette,
+    }));
   });
 });
+

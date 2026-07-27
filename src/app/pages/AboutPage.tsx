@@ -1,3 +1,5 @@
+import { FluorCastLogo } from "../components/FluorCastLogo";
+
 export function AboutPage() {
   return (
     <div className="page narrow-page">
@@ -7,7 +9,7 @@ export function AboutPage() {
       </header>
 
       <section className="about-card">
-        <span className="large-mark">F</span>
+        <span className="large-mark"><FluorCastLogo /></span>
         <div>
           <h2>Two focused parts, one workflow</h2>
           <p>

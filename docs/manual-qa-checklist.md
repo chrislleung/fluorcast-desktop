@@ -2,6 +2,21 @@
 
 Use `npm.cmd run tauri dev` for desktop checks. The Vite browser preview does not exercise Tauri shell, WSL, SSH, or SQLite integration.
 
+## Appearance
+
+- Confirm System mode follows the Windows light/dark preference and updates while FluorCast is running.
+- Confirm Light and Dark modes switch immediately.
+- Restart FluorCast and confirm the selected mode and both palettes persist.
+- Edit every semantic color token and confirm the application updates.
+- Confirm Light palette and Dark palette edits remain independent.
+- Confirm Restore current palette defaults affects only the palette being edited.
+- Confirm Restore all appearance defaults shows confirmation and restores mode plus both palettes.
+- Confirm Settings has no collapsed Appearance panel.
+- Confirm dialogs, dropdowns, tooltips, tables, diagnostics, result views, job cards, empty states, navigation, and focus indicators remain readable.
+- Confirm the app starts without an obvious light/dark flash.
+- Confirm the monochrome FluorCast logo is crisp and visible on light and dark backgrounds.
+- Regenerate Tauri icons with `.\scripts\generate-icons.ps1` when `app-icon.svg` changes, then confirm Windows/Tauri icons render at small and large sizes.
+
 ## Final NIBI Acceptance
 
 - Start FluorCast.
