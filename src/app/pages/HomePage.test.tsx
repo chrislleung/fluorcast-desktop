@@ -140,6 +140,99 @@ describe("HomePage", () => {
     expect(securityNotice.compareDocumentPosition(nibiSession) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  it("renders the Required Nibi setup warning with detailed content collapsed", () => {
+    renderHome({ connection_mode: "interactive_mfa" });
+
+    expect(screen.getByRole("heading", { name: "Required Nibi setup" })).toBeInTheDocument();
+    expect(screen.queryByText(/does not currently install or train FluorCast automatically/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Trained model artifacts are not bundled/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("~/scratch/FluorCast")).not.toBeInTheDocument();
+    expect(screen.queryByText("~/scratch/chemfluor_env")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("required-nibi-setup-instructions")).not.toBeInTheDocument();
+  });
+
+  it("toggles Required Nibi setup details and aria-expanded state", () => {
+    renderHome({ connection_mode: "interactive_mfa" });
+
+    const toggle = screen.getByRole("button", { name: /Required Nibi setup/i });
+
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveAttribute("aria-controls", "required-nibi-setup-content");
+    expect(screen.queryByText("Detailed terminal instructions")).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(/does not currently install or train FluorCast automatically/i)).toBeInTheDocument();
+    expect(screen.getByText(/Trained model artifacts are not bundled/i)).toBeInTheDocument();
+    expect(screen.getByText("Detailed terminal instructions")).toBeInTheDocument();
+    expect(screen.getByTestId("required-nibi-setup-content")).toHaveAttribute("id", "required-nibi-setup-content");
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Detailed terminal instructions")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("required-nibi-setup-content")).not.toBeInTheDocument();
+  });
+
+  it("expands Required Nibi setup instructions with safe official repository link", () => {
+    renderHome({ connection_mode: "interactive_mfa" });
+
+    fireEvent.click(screen.getByRole("button", { name: /Required Nibi setup/i }));
+    const setupPanel = screen.getByTestId("required-nibi-setup-instructions");
+
+    expect(within(setupPanel).getByText(/git clone https:\/\/github.com\/chrislleung\/fluorcast.git FluorCast/))
+      .toBeInTheDocument();
+
+    const repositoryLink = screen.getByRole("link", {
+      name: "https://github.com/chrislleung/fluorcast",
+    });
+    expect(repositoryLink).toHaveAttribute("href", "https://github.com/chrislleung/fluorcast");
+    expect(repositoryLink).toHaveAttribute("target", "_blank");
+    expect(repositoryLink).toHaveAttribute("rel", "noopener noreferrer");
+
+    fireEvent.click(repositoryLink);
+    expect(openerMock.openUrl).toHaveBeenCalledWith("https://github.com/chrislleung/fluorcast");
+  });
+
+  it("renders exact setup command content without personal usernames", () => {
+    renderHome({ connection_mode: "interactive_mfa" });
+
+    fireEvent.click(screen.getByRole("button", { name: /Required Nibi setup/i }));
+    const setupPanel = screen.getByTestId("required-nibi-setup-instructions");
+    const setupText = setupPanel.textContent ?? "";
+
+    expect(setupText).toContain("ssh YOUR_USERNAME@nibi.alliancecan.ca");
+    expect(setupText).not.toContain("chrisl@");
+    expect(setupText).not.toContain("/home/chris");
+    expect(setupText).toContain("~/scratch/FluorCast");
+    expect(setupText).toContain('export FLUORCAST_TARGET_NAME="absorption_nm"');
+    expect(setupText).toContain('export FLUORCAST_TARGET_NAME="emission_nm"');
+    expect(setupText).toContain('export FLUORCAST_TARGET_NAME="quantum_yield"');
+    expect(setupText).toContain("sbatch slurm/base_models/run_model_experiments_fluodb.sbatch");
+    expect(setupText).toContain("sbatch slurm/base_models/run_neural_experiments.sbatch");
+  });
+
+  it("renders all Required Nibi setup readiness checklist items", () => {
+    renderHome({ connection_mode: "interactive_mfa" });
+
+    fireEvent.click(screen.getByRole("button", { name: /Required Nibi setup/i }));
+    const checklist = screen.getByRole("list", { name: "Nibi setup readiness checklist" });
+    [
+      "Repository cloned",
+      "Environment installed",
+      "Tree models trained",
+      "Neural models trained",
+      "Absorption hybrid trained",
+      "Emission hybrid trained",
+      "Quantum-yield hybrid trained",
+      "Manual MFA session connected",
+      "Remote environment checks pass",
+    ].forEach((item) => {
+      expect(within(checklist).getByText(item)).toBeInTheDocument();
+    });
+  });
+
   it("renders only the available connection-mode options in the same order", () => {
     renderHome();
 

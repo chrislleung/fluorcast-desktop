@@ -65,7 +65,7 @@ describe("App", () => {
   it("introduces the FluorCast prediction workflow", async () => {
     render(<App />);
     expect(await screen.findByRole("heading", { name: /from structure to signal/i })).toBeInTheDocument();
-    expect(screen.getByText(/never need to work from the command line/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Required Nibi setup/i })).toBeInTheDocument();
   });
 
   it("navigates between application pages", async () => {

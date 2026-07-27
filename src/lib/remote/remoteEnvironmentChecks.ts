@@ -19,6 +19,11 @@ export type RemoteEnvironmentCheckId =
   | "squeue"
   | "sacct"
   | "prediction_entry_point"
+  | "tree_model_artifacts"
+  | "neural_model_artifacts"
+  | "absorption_hybrid_artifacts"
+  | "emission_hybrid_artifacts"
+  | "quantum_yield_hybrid_artifacts"
   | "upload_read_delete_smoke";
 
 export type RemoteEnvironmentCheckDefinition = {
@@ -80,6 +85,30 @@ function smokeFailureMessage(result: RemoteCommandResult): string {
   }
 
   return "The authenticated remote smoke-test command failed.";
+}
+
+function modelDirectoryCheck(
+  id: Extract<RemoteEnvironmentCheckId, "tree_model_artifacts" | "neural_model_artifacts" | "absorption_hybrid_artifacts" | "emission_hybrid_artifacts" | "quantum_yield_hybrid_artifacts">,
+  name: string,
+  settings: NibiSettings,
+  remoteProjectPath: string,
+  relativePath: string,
+  successMessage: string,
+): RemoteEnvironmentCheckDefinition {
+  const path = `${remoteProjectPath}/${relativePath}`;
+  return {
+    id,
+    name,
+    optional: false,
+    commandSpec: withSettings({
+      label: name,
+      executable: "test",
+      args: ["-d", path],
+      redacted_preview: `test -d ${shellQuote(path)}`,
+    }, settings),
+    successMessage,
+    failureMessage: `Missing model artifacts: ${relativePath}. Complete the training instructions in Required Nibi setup.`,
+  };
 }
 
 export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): RemoteEnvironmentCheckDefinition[] {
@@ -235,6 +264,46 @@ export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): 
       successMessage: "Prediction entry point exists.",
       failureMessage: "Prediction entry point was not found.",
     },
+    modelDirectoryCheck(
+      "tree_model_artifacts",
+      "Tree model artifacts exist",
+      trimmed,
+      trimmed.remote_project_path,
+      "models/experiments_fluodb",
+      "Tree model artifacts exist.",
+    ),
+    modelDirectoryCheck(
+      "neural_model_artifacts",
+      "Neural model artifacts exist",
+      trimmed,
+      trimmed.remote_project_path,
+      "models/neural_experiments_fluodb",
+      "Neural model artifacts exist.",
+    ),
+    modelDirectoryCheck(
+      "absorption_hybrid_artifacts",
+      "Absorption hybrid artifacts exist",
+      trimmed,
+      trimmed.remote_project_path,
+      "models/production_hybrid/absorption_nm",
+      "Absorption hybrid artifacts exist.",
+    ),
+    modelDirectoryCheck(
+      "emission_hybrid_artifacts",
+      "Emission hybrid artifacts exist",
+      trimmed,
+      trimmed.remote_project_path,
+      "models/production_hybrid/emission_nm",
+      "Emission hybrid artifacts exist.",
+    ),
+    modelDirectoryCheck(
+      "quantum_yield_hybrid_artifacts",
+      "Quantum-yield hybrid artifacts exist",
+      trimmed,
+      trimmed.remote_project_path,
+      "models/production_hybrid/quantum_yield",
+      "Quantum-yield hybrid artifacts exist.",
+    ),
     {
       id: "upload_read_delete_smoke",
       name: "Upload/read/delete smoke test",

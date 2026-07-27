@@ -340,7 +340,70 @@ describe("Slurm submission", () => {
     );
 
     expect(result.status).toBe("slurm_submission_failed");
-    expect(result.message).toContain("Verify FluorCast repository directory failed");
+    expect(result.message).toContain("Missing remote repository at /home/alice/scratch/Wrong");
+    expect(result.message).toContain("Required Nibi setup");
+    expect(vi.mocked(selectedExecutor.runCommand).mock.calls.some(([command]) => command.executable === "sbatch")).toBe(false);
+  });
+
+  it("fails before submission when model artifacts are missing", async () => {
+    const selectedExecutor = executor("interactive_mfa", true, "123456");
+    vi.mocked(selectedExecutor.runCommand).mockImplementation(async (commandSpec) => ({
+      exit_code: commandSpec.redacted_preview === "test -d <remote_project>/models/production_hybrid/emission_nm" ? 1 : commandSpec.executable === "cat" ? 1 : 0,
+      stdout: "",
+      stderr: commandSpec.redacted_preview === "test -d <remote_project>/models/production_hybrid/emission_nm"
+        ? "No such file or directory"
+        : "",
+      duration_ms: 1,
+      command_label: commandSpec.label,
+      redacted_command_preview: commandSpec.redacted_preview ?? commandSpec.executable,
+    }));
+
+    const result = await submitPredictionSlurmJob(
+      job,
+      {
+        ...defaultNibiSettings,
+        backend_mode: "nibi",
+        connection_mode: "interactive_mfa",
+        remote_project_path: "/home/alice/scratch/FluorCast",
+        remote_jobs_path: "/home/alice/scratch/fluorcast-jobs",
+      },
+      selectedExecutor,
+      persistence(),
+    );
+
+    expect(result.status).toBe("slurm_submission_failed");
+    expect(result.message).toContain("Missing model artifacts: models/production_hybrid/emission_nm");
+    expect(result.message).toContain("Required Nibi setup");
+    expect(vi.mocked(selectedExecutor.runCommand).mock.calls.some(([command]) => command.executable === "sbatch")).toBe(false);
+  });
+
+  it("distinguishes SSH permission failures from missing setup", async () => {
+    const selectedExecutor = executor("interactive_mfa", true, "123456");
+    vi.mocked(selectedExecutor.runCommand).mockImplementation(async (commandSpec) => ({
+      exit_code: commandSpec.redacted_preview === "test -d <remote_project>" ? 255 : commandSpec.executable === "cat" ? 1 : 0,
+      stdout: "",
+      stderr: commandSpec.redacted_preview === "test -d <remote_project>" ? "Permission denied (publickey)" : "",
+      duration_ms: 1,
+      command_label: commandSpec.label,
+      redacted_command_preview: commandSpec.redacted_preview ?? commandSpec.executable,
+    }));
+
+    const result = await submitPredictionSlurmJob(
+      job,
+      {
+        ...defaultNibiSettings,
+        backend_mode: "nibi",
+        connection_mode: "interactive_mfa",
+        remote_project_path: "/home/alice/scratch/FluorCast",
+        remote_jobs_path: "/home/alice/scratch/fluorcast-jobs",
+      },
+      selectedExecutor,
+      persistence(),
+    );
+
+    expect(result.status).toBe("slurm_submission_failed");
+    expect(result.message).toBe("Could not connect to NIBI over SSH. Check your network, host, username, and SSH key settings.");
+    expect(result.message).not.toContain("Missing remote repository");
     expect(vi.mocked(selectedExecutor.runCommand).mock.calls.some(([command]) => command.executable === "sbatch")).toBe(false);
   });
 
