@@ -8,3 +8,4 @@ src-tauri/target
 .idea
 .vscode/*
 !.vscode/extensions.json
+release
