@@ -3,8 +3,11 @@ import { defaultNibiSettings } from "../../features/settings";
 import {
   buildRemoteEnvironmentCheckDefinitions,
   getRemoteEnvironmentReadiness,
+  operationDetail,
+  reportToRemoteEnvironmentRows,
   resultToRemoteEnvironmentRow,
   validateRemoteEnvironmentLocalInputs,
+  type EnvironmentCheckReport,
 } from "./remoteEnvironmentChecks";
 import type { RemoteCommandResult } from "./types";
 
@@ -29,6 +32,28 @@ function result(exitCode: number, label = "check"): RemoteCommandResult {
 }
 
 describe("remote environment checks", () => {
+  it("defines the exact 17 check IDs in contract order", () => {
+    expect(buildRemoteEnvironmentCheckDefinitions(settings).map((check) => check.id)).toEqual([
+      "authenticated_session",
+      "remote_project_path",
+      "remote_project_readable",
+      "remote_jobs_path",
+      "remote_jobs_writable",
+      "python_environment_exists",
+      "python_environment_runs",
+      "sbatch",
+      "squeue",
+      "sacct",
+      "prediction_entry_point",
+      "tree_model_artifacts",
+      "neural_model_artifacts",
+      "absorption_hybrid_artifacts",
+      "emission_hybrid_artifacts",
+      "quantum_yield_hybrid_artifacts",
+      "upload_read_delete_smoke",
+    ]);
+  });
+
   it("generates project path check command", () => {
     const check = buildRemoteEnvironmentCheckDefinitions(settings).find((item) => item.id === "remote_project_path");
 
@@ -236,4 +261,106 @@ describe("remote environment checks", () => {
       ],
     });
   });
+
+  it("maps backend report results by ID when the report order is shuffled", () => {
+    const definitions = buildRemoteEnvironmentCheckDefinitions(settings);
+    const checks = definitions
+      .map((definition) => ({
+        id: definition.id,
+        status: definition.id === "sacct" ? "failed" as const : "passed" as const,
+        summary: `${definition.id} summary`,
+        detail: definition.id === "sacct" ? "sacct missing" : "",
+        exit_code: definition.id === "sacct" ? 1 : 0,
+        stdout: definition.id,
+        stderr: definition.id === "sacct" ? "sacct missing" : "",
+      }))
+      .reverse();
+
+    const rows = reportToRemoteEnvironmentRows(definitions, report({ status: "failed", checks }));
+
+    expect(rows.map((row) => row.id)).toEqual(definitions.map((definition) => definition.id));
+    expect(rows.find((row) => row.id === "sacct")).toMatchObject({
+      status: "failed",
+      message: "sacct summary",
+      result: expect.objectContaining({
+        exit_code: 1,
+        stderr: "sacct missing",
+      }),
+    });
+    expect(rows.find((row) => row.id === "remote_project_path")).toMatchObject({
+      status: "passed",
+      message: "remote_project_path summary",
+    });
+  });
+
+  it("does not convert missing backend results into genuine environment failures", () => {
+    const definitions = buildRemoteEnvironmentCheckDefinitions(settings);
+    const rows = reportToRemoteEnvironmentRows(definitions, report({
+      status: "runner_error",
+      checks: [{
+        id: "authenticated_session",
+        status: "passed",
+        summary: "Authenticated session reuse returned FLUORCAST_AUTH_OK.",
+        exit_code: 0,
+        stdout: "FLUORCAST_AUTH_OK",
+        stderr: "",
+      }],
+      diagnostics: {
+        parser_error: "Missing check IDs: remote_project_path.",
+        missing_ids: ["remote_project_path"],
+      },
+    }));
+
+    expect(rows.find((row) => row.id === "authenticated_session")).toMatchObject({
+      status: "passed",
+    });
+    expect(rows.find((row) => row.id === "remote_project_path")).toMatchObject({
+      status: "runner_error",
+      message: "Not run because the batched environment-check report was incomplete.",
+    });
+    expect(rows.find((row) => row.id === "remote_project_path")?.result).toBeUndefined();
+    expect(operationDetail(report({
+      status: "runner_error",
+      checks: [],
+      diagnostics: {
+        parser_error: "Missing check IDs.",
+        missing_ids: ["remote_project_path"],
+      },
+    }))).toContain("PARSER_ERROR=Missing check IDs.");
+  });
 });
+
+function report(overrides: Partial<EnvironmentCheckReport>): EnvironmentCheckReport {
+  return {
+    status: "passed",
+    checks: [],
+    diagnostics: {
+      operation_status: overrides.status ?? "passed",
+      wsl_launch_count: 1,
+      ssh_launch_count: 1,
+      expected_check_count: 17,
+      parsed_check_count: overrides.checks?.length ?? 17,
+      duplicate_ids: [],
+      unknown_ids: [],
+      missing_ids: [],
+      malformed_rows: [],
+      parser_error: null,
+      ssh_exit_code: 0,
+      timed_out: false,
+      sanitized_stderr: "",
+      total_duration_ms: 12,
+      ...overrides.diagnostics,
+    },
+    started_at: "2026-07-27T00:00:00.000Z",
+    completed_at: "2026-07-27T00:00:00.012Z",
+    duration_ms: 12,
+    operation_name: "run_nibi_environment_checks",
+    timed_out: false,
+    process_exit_code: 0,
+    process_visibility: "hidden",
+    backend_process_launches: 1,
+    wsl_process_launches: 1,
+    ssh_remote_sessions: 1,
+    ...overrides,
+  };
+}

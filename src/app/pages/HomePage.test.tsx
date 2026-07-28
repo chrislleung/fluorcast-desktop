@@ -625,10 +625,10 @@ describe("HomePage", () => {
               "remote_jobs_writable",
               "python_environment_exists",
               "python_environment_runs",
-              "prediction_entry_point",
-              "slurm_prediction_script",
               "sbatch",
               "squeue",
+              "sacct",
+              "prediction_entry_point",
               "tree_model_artifacts",
               "neural_model_artifacts",
               "absorption_hybrid_artifacts",
@@ -682,6 +682,7 @@ describe("HomePage", () => {
   });
 
   it("runs remote environment checks as one single-flight backend invocation", async () => {
+    vi.useFakeTimers();
     let resolveReport: (value: unknown) => void = () => undefined;
     coreMock.invoke.mockImplementation((command) => {
       if (command === "run_nibi_environment_checks") {
@@ -711,6 +712,10 @@ describe("HomePage", () => {
     expect(coreMock.invoke.mock.calls.filter(([command]) => command === "run_nibi_environment_checks")).toHaveLength(1);
     await Promise.resolve();
     expect(coreMock.invoke.mock.calls.filter(([command]) => command === "run_nibi_environment_checks")).toHaveLength(1);
+    expect(screen.getAllByText("running")).toHaveLength(17);
+    vi.advanceTimersByTime(120_000);
+    expect(coreMock.invoke.mock.calls.filter(([command]) => command === "run_nibi_environment_checks")).toHaveLength(1);
+    vi.useRealTimers();
 
     resolveReport({
       status: "passed",
@@ -731,6 +736,7 @@ describe("HomePage", () => {
       ssh_remote_sessions: 1,
     });
     await waitFor(() => expect(button).toBeEnabled());
+    vi.useRealTimers();
   });
 
   it("renders only one copy of each connection-related control", () => {

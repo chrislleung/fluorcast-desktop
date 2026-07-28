@@ -2,7 +2,7 @@ use crate::process::{
     hidden_std_command_with_stdin, run_hidden_command, run_hidden_command_with_stdin,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -443,6 +443,7 @@ pub fn open_powershell_login(settings: NibiSettings) -> Result<(), String> {
 pub struct EnvironmentCheckReport {
     status: String,
     checks: Vec<EnvironmentCheckResult>,
+    diagnostics: EnvironmentCheckDiagnostics,
     started_at: String,
     completed_at: String,
     duration_ms: u64,
@@ -461,6 +462,34 @@ pub struct EnvironmentCheckResult {
     status: String,
     summary: String,
     detail: Option<String>,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct EnvironmentCheckDiagnostics {
+    operation_status: String,
+    wsl_launch_count: u32,
+    ssh_launch_count: u32,
+    expected_check_count: usize,
+    parsed_check_count: usize,
+    duplicate_ids: Vec<String>,
+    unknown_ids: Vec<String>,
+    missing_ids: Vec<String>,
+    malformed_rows: Vec<String>,
+    parser_error: Option<String>,
+    ssh_exit_code: Option<i32>,
+    timed_out: bool,
+    sanitized_stderr: String,
+    total_duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct EnvironmentCheckConfig<'a> {
+    remote_project_path: &'a str,
+    remote_jobs_path: &'a str,
+    python_environment_path: &'a str,
 }
 
 #[tauri::command]
@@ -2495,12 +2524,15 @@ async fn run_manual_mfa_environment_checks(
     validate_remote_path(&settings.remote_jobs_path, "Remote jobs path")?;
     validate_remote_path(&settings.python_environment_path, "Python executable path")?;
     let commands = build_manual_mfa_session_commands(settings)?;
-    let args = vec![
-        commands.host.clone(),
-        settings.remote_project_path.trim().to_string(),
-        settings.remote_jobs_path.trim().to_string(),
-        settings.python_environment_path.trim().to_string(),
-    ];
+    let config = EnvironmentCheckConfig {
+        remote_project_path: settings.remote_project_path.trim(),
+        remote_jobs_path: settings.remote_jobs_path.trim(),
+        python_environment_path: settings.python_environment_path.trim(),
+    };
+    let config_json = serde_json::to_string(&config)
+        .map_err(|error| format!("Could not serialize environment-check configuration: {error}"))?;
+    let encoded_config = base64_encode(config_json.as_bytes());
+    let args = vec![commands.host.clone(), encoded_config];
     let output = run_wsl_bash_script(
         &commands.wsl_distro,
         &manual_mfa_environment_checks_script(),
@@ -2508,17 +2540,52 @@ async fn run_manual_mfa_environment_checks(
         Duration::from_secs(90),
     )
     .await?;
-    let checks = parse_environment_check_markers(&output.stdout);
+    let sanitized_stderr = sanitize_session_stderr(&output.stderr, &commands);
+    let mut parsed = parse_environment_check_markers(&output.stdout);
+    if output.status != 0 && parsed.parser_error.is_none() {
+        parsed.parser_error = Some(format!(
+            "Environment-check runner exited with status {}.",
+            output.status
+        ));
+    }
     let status = if output.timed_out {
         "timeout"
-    } else if !checks.is_empty() && checks.iter().all(|check| check.status == "passed") {
+    } else if parsed.parser_error.is_some() || output.status != 0 {
+        "runner_error"
+    } else if parsed.checks.iter().all(|check| check.status == "passed") {
         "passed"
     } else {
         "failed"
     };
+    let ssh_launch_count = if parsed
+        .checks
+        .iter()
+        .any(|check| check.id == "authenticated_session" && check.status == "passed")
+    {
+        1
+    } else {
+        0
+    };
+    let diagnostics = EnvironmentCheckDiagnostics {
+        operation_status: status.to_string(),
+        wsl_launch_count: 1,
+        ssh_launch_count,
+        expected_check_count: EXPECTED_ENVIRONMENT_CHECK_IDS.len(),
+        parsed_check_count: parsed.checks.len(),
+        duplicate_ids: parsed.duplicate_ids,
+        unknown_ids: parsed.unknown_ids,
+        missing_ids: parsed.missing_ids,
+        malformed_rows: parsed.malformed_rows,
+        parser_error: parsed.parser_error,
+        ssh_exit_code: Some(output.status),
+        timed_out: output.timed_out,
+        sanitized_stderr,
+        total_duration_ms: started.elapsed().as_millis() as u64,
+    };
     Ok(EnvironmentCheckReport {
         status: status.to_string(),
-        checks,
+        checks: parsed.checks,
+        diagnostics,
         started_at: started_at.to_string(),
         completed_at: timestamp_now(),
         duration_ms: started.elapsed().as_millis() as u64,
@@ -2528,84 +2595,309 @@ async fn run_manual_mfa_environment_checks(
         process_visibility: "hidden".to_string(),
         backend_process_launches: 1,
         wsl_process_launches: 1,
-        ssh_remote_sessions: 1,
+        ssh_remote_sessions: ssh_launch_count,
     })
 }
 
-fn parse_environment_check_markers(stdout: &str) -> Vec<EnvironmentCheckResult> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.strip_prefix("FC_CHECK\t")?.splitn(4, '\t');
-            let id = parts.next()?.to_string();
-            let status = parts.next()?.to_string();
-            let summary = parts.next()?.to_string();
-            let detail = parts
-                .next()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            Some(EnvironmentCheckResult {
-                id,
-                status,
-                summary,
-                detail,
-            })
-        })
-        .collect()
+const ENVIRONMENT_CHECK_MARKER: &str = "FLUORCAST_CHECK_V1|";
+const ENVIRONMENT_CHECK_SUMMARY_MARKER: &str = "FLUORCAST_CHECK_SUMMARY_V1|";
+const EXPECTED_ENVIRONMENT_CHECK_IDS: [&str; 17] = [
+    "authenticated_session",
+    "remote_project_path",
+    "remote_project_readable",
+    "remote_jobs_path",
+    "remote_jobs_writable",
+    "python_environment_exists",
+    "python_environment_runs",
+    "sbatch",
+    "squeue",
+    "sacct",
+    "prediction_entry_point",
+    "tree_model_artifacts",
+    "neural_model_artifacts",
+    "absorption_hybrid_artifacts",
+    "emission_hybrid_artifacts",
+    "quantum_yield_hybrid_artifacts",
+    "upload_read_delete_smoke",
+];
+
+#[derive(Debug)]
+struct ParsedEnvironmentCheckReport {
+    checks: Vec<EnvironmentCheckResult>,
+    duplicate_ids: Vec<String>,
+    unknown_ids: Vec<String>,
+    missing_ids: Vec<String>,
+    malformed_rows: Vec<String>,
+    parser_error: Option<String>,
+}
+
+fn parse_environment_check_markers(stdout: &str) -> ParsedEnvironmentCheckReport {
+    let expected_ids = EXPECTED_ENVIRONMENT_CHECK_IDS
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut checks = Vec::new();
+    let mut seen = HashSet::new();
+    let mut duplicate_ids = Vec::new();
+    let mut unknown_ids = Vec::new();
+    let mut malformed_rows = Vec::new();
+    let mut summary_count = None;
+
+    for line in stdout.lines() {
+        if let Some(raw_count) = line.strip_prefix(ENVIRONMENT_CHECK_SUMMARY_MARKER) {
+            match raw_count.trim().parse::<usize>() {
+                Ok(count) => summary_count = Some(count),
+                Err(_) => malformed_rows.push(line.to_string()),
+            }
+            continue;
+        }
+
+        if !line.starts_with(ENVIRONMENT_CHECK_MARKER) {
+            continue;
+        }
+
+        let parts = line.splitn(6, '|').collect::<Vec<_>>();
+        if parts.len() != 6 {
+            malformed_rows.push(line.to_string());
+            continue;
+        }
+
+        let id = parts[1];
+        let status = parts[2];
+        let exit_code = parts[3].parse::<i32>().ok();
+        if !expected_ids.contains(id) {
+            unknown_ids.push(id.to_string());
+            continue;
+        }
+        if status != "passed" && status != "failed" {
+            malformed_rows.push(line.to_string());
+            continue;
+        }
+        let Some(exit_code) = exit_code else {
+            malformed_rows.push(line.to_string());
+            continue;
+        };
+        let stdout_text = match decode_marker_field(parts[4]) {
+            Ok(value) => value,
+            Err(error) => {
+                malformed_rows.push(format!("{id}: stdout {error}"));
+                continue;
+            }
+        };
+        let stderr_text = match decode_marker_field(parts[5]) {
+            Ok(value) => value,
+            Err(error) => {
+                malformed_rows.push(format!("{id}: stderr {error}"));
+                continue;
+            }
+        };
+        if !seen.insert(id.to_string()) {
+            duplicate_ids.push(id.to_string());
+            continue;
+        }
+        let detail = [stdout_text.as_str(), stderr_text.as_str()]
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        checks.push(EnvironmentCheckResult {
+            id: id.to_string(),
+            status: status.to_string(),
+            summary: environment_check_summary(id, status),
+            detail: if detail.trim().is_empty() {
+                None
+            } else {
+                Some(detail)
+            },
+            exit_code: Some(exit_code),
+            stdout: stdout_text,
+            stderr: stderr_text,
+        });
+    }
+
+    let missing_ids = EXPECTED_ENVIRONMENT_CHECK_IDS
+        .iter()
+        .filter(|id| !seen.contains(**id))
+        .map(|id| (*id).to_string())
+        .collect::<Vec<_>>();
+    let mut parser_errors = Vec::new();
+    if !duplicate_ids.is_empty() {
+        parser_errors.push(format!(
+            "Duplicate check IDs: {}.",
+            duplicate_ids.join(", ")
+        ));
+    }
+    if !unknown_ids.is_empty() {
+        parser_errors.push(format!("Unknown check IDs: {}.", unknown_ids.join(", ")));
+    }
+    if !missing_ids.is_empty() {
+        parser_errors.push(format!("Missing check IDs: {}.", missing_ids.join(", ")));
+    }
+    if !malformed_rows.is_empty() {
+        parser_errors.push(format!("Malformed result rows: {}.", malformed_rows.len()));
+    }
+    match summary_count {
+        Some(count) if count == EXPECTED_ENVIRONMENT_CHECK_IDS.len() => {}
+        Some(count) => parser_errors.push(format!(
+            "Summary reported {count} checks; expected {}.",
+            EXPECTED_ENVIRONMENT_CHECK_IDS.len()
+        )),
+        None => parser_errors.push("Missing environment-check summary marker.".to_string()),
+    }
+
+    ParsedEnvironmentCheckReport {
+        checks,
+        duplicate_ids,
+        unknown_ids,
+        missing_ids,
+        malformed_rows,
+        parser_error: if parser_errors.is_empty() {
+            None
+        } else {
+            Some(parser_errors.join(" "))
+        },
+    }
+}
+
+fn decode_marker_field(value: &str) -> Result<String, String> {
+    let bytes = base64_decode(value)?;
+    String::from_utf8(bytes).map_err(|_| "is not valid UTF-8".to_string())
+}
+
+fn environment_check_summary(id: &str, status: &str) -> String {
+    let passed = status == "passed";
+    match (id, passed) {
+        ("authenticated_session", true) => "Authenticated session reuse returned FLUORCAST_AUTH_OK.",
+        ("authenticated_session", false) => "Authenticated session reuse failed.",
+        ("remote_project_path", true) => "Remote project path exists.",
+        ("remote_project_path", false) => "Remote project path was not found.",
+        ("remote_project_readable", true) => "Remote project path is readable.",
+        ("remote_project_readable", false) => "Remote project path is not readable.",
+        ("remote_jobs_path", true) => "Remote jobs path exists or was created.",
+        ("remote_jobs_path", false) => "Remote jobs path could not be created or verified.",
+        ("remote_jobs_writable", true) => "Remote jobs path is writable.",
+        ("remote_jobs_writable", false) => "Remote jobs path is not writable.",
+        ("python_environment_exists", true) => "Python executable exists.",
+        ("python_environment_exists", false) => {
+            "Python executable was not found or is not executable."
+        }
+        ("python_environment_runs", true) => "Python executable reports its version.",
+        ("python_environment_runs", false) => "Python executable was not found or did not run.",
+        ("sbatch", true) => "sbatch is available.",
+        ("sbatch", false) => "sbatch is unavailable.",
+        ("squeue", true) => "squeue is available.",
+        ("squeue", false) => "squeue is unavailable.",
+        ("sacct", true) => "sacct is available.",
+        ("sacct", false) => "sacct is unavailable.",
+        ("prediction_entry_point", true) => "Prediction entry point exists.",
+        ("prediction_entry_point", false) => "Prediction entry point was not found.",
+        ("tree_model_artifacts", true) => "Tree model artifacts exist.",
+        ("tree_model_artifacts", false) => "Missing model artifacts: models/experiments_fluodb. Complete the training instructions in Required Nibi setup.",
+        ("neural_model_artifacts", true) => "Neural model artifacts exist.",
+        ("neural_model_artifacts", false) => "Missing model artifacts: models/neural_experiments_fluodb. Complete the training instructions in Required Nibi setup.",
+        ("absorption_hybrid_artifacts", true) => "Absorption hybrid artifacts exist.",
+        ("absorption_hybrid_artifacts", false) => "Missing model artifacts: models/production_hybrid/absorption_nm. Complete the training instructions in Required Nibi setup.",
+        ("emission_hybrid_artifacts", true) => "Emission hybrid artifacts exist.",
+        ("emission_hybrid_artifacts", false) => "Missing model artifacts: models/production_hybrid/emission_nm. Complete the training instructions in Required Nibi setup.",
+        ("quantum_yield_hybrid_artifacts", true) => "Quantum-yield hybrid artifacts exist.",
+        ("quantum_yield_hybrid_artifacts", false) => "Missing model artifacts: models/production_hybrid/quantum_yield. Complete the training instructions in Required Nibi setup.",
+        ("upload_read_delete_smoke", true) => {
+            "Remote jobs path passed the create/read/delete smoke test."
+        }
+        ("upload_read_delete_smoke", false) => {
+            "Remote jobs path failed the create/read/delete smoke test."
+        }
+        _ => "Remote environment check returned an unknown result.",
+    }
+    .to_string()
 }
 
 fn manual_mfa_environment_checks_script() -> String {
-    let remote_script = [
-        "set -u",
-        "PROJECT=\"$1\"",
-        "JOBS=\"$2\"",
-        "PYTHON_BIN=\"$3\"",
-        "PREDICTION=\"$PROJECT/scripts/run_prediction_job.py\"",
-        "SLURM_SCRIPT=\"$PROJECT/slurm/run_prediction_job.sbatch\"",
-        "emit() { printf 'FC_CHECK\\t%s\\t%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$3\" \"${4:-}\"; }",
-        "run_check() { id=\"$1\"; summary=\"$2\"; shift 2; detail=\"$($@ 2>&1)\"; code=$?; if [ \"$code\" -eq 0 ]; then emit \"$id\" passed \"$summary\" \"$detail\"; else emit \"$id\" failed \"$summary\" \"$detail\"; fi; }",
-        "run_check remote_project_path 'Remote project path exists.' test -d \"$PROJECT\"",
-        "run_check remote_project_readable 'Remote project path is readable.' test -r \"$PROJECT\"",
-        "mkdir -p \"$JOBS\" >/dev/null 2>&1",
-        "run_check remote_jobs_path 'Remote jobs path exists or was created.' test -d \"$JOBS\"",
-        "run_check remote_jobs_writable 'Remote jobs path is writable.' test -w \"$JOBS\"",
-        "run_check python_environment_exists 'Python executable exists.' test -x \"$PYTHON_BIN\"",
-        "run_check python_environment_runs 'Python executable reports its version.' \"$PYTHON_BIN\" --version",
-        "run_check prediction_entry_point 'Prediction entry point exists.' test -f \"$PREDICTION\"",
-        "run_check slurm_prediction_script 'Slurm prediction script exists.' test -f \"$SLURM_SCRIPT\"",
-        "run_check sbatch 'sbatch is available.' command -v sbatch",
-        "run_check squeue 'squeue is available.' command -v squeue",
-        "run_check sacct 'sacct is available.' command -v sacct",
-        "run_check tree_model_artifacts 'Tree model artifacts exist.' test -d \"$PROJECT/models/experiments_fluodb\"",
-        "run_check neural_model_artifacts 'Neural model artifacts exist.' test -d \"$PROJECT/models/neural_experiments_fluodb\"",
-        "run_check absorption_hybrid_artifacts 'Absorption hybrid artifacts exist.' test -d \"$PROJECT/models/production_hybrid/absorption_nm\"",
-        "run_check emission_hybrid_artifacts 'Emission hybrid artifacts exist.' test -d \"$PROJECT/models/production_hybrid/emission_nm\"",
-        "run_check quantum_yield_hybrid_artifacts 'Quantum-yield hybrid artifacts exist.' test -d \"$PROJECT/models/production_hybrid/quantum_yield\"",
-        "smoke=\"$JOBS/.fluorcast-smoke-$$.txt\"",
-        "if printf 'fluorcast-smoke' > \"$smoke\" && test \"$(cat \"$smoke\")\" = 'fluorcast-smoke' && rm -f \"$smoke\"; then emit upload_read_delete_smoke passed 'Remote jobs path passed the create/read/delete smoke test.' ''; else rm -f \"$smoke\" >/dev/null 2>&1; emit upload_read_delete_smoke failed 'Remote jobs path failed the create/read/delete smoke test.' ''; fi",
-    ]
-    .join("\n");
+    let remote_script = manual_mfa_environment_checks_remote_script();
 
     vec![
         "#!/usr/bin/env bash",
-        "set -u",
+        "set +e",
         "HOST=\"$1\"",
-        "PROJECT=\"$2\"",
-        "JOBS=\"$3\"",
-        "PYTHON_BIN=\"$4\"",
+        "CONFIG_B64=\"$2\"",
         "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
-        "emit() { printf 'FC_CHECK\\t%s\\t%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$3\" \"${4:-}\"; }",
+        "b64_text() { printf '%s' \"${1:-}\" | base64 | tr -d '\\r\\n'; }",
+        "emit_text() { out_b64=$(b64_text \"${4:-}\"); err_b64=$(b64_text \"${5:-}\"); printf 'FLUORCAST_CHECK_V1|%s|%s|%s|%s|%s\\n' \"$1\" \"$2\" \"$3\" \"$out_b64\" \"$err_b64\"; }",
         "if ssh -n -S \"$CTL\" -O check \"$HOST\" >/dev/null 2>&1; then",
-        "  emit authenticated_session passed 'Authenticated session reuse returned FLUORCAST_AUTH_OK.' ''",
+        "  emit_text authenticated_session passed 0 'FLUORCAST_AUTH_OK' ''",
         "else",
-        "  emit authenticated_session failed 'Authenticated session reuse failed.' 'ControlMaster socket was not ready.'",
-        "  for id in remote_project_path remote_project_readable remote_jobs_path remote_jobs_writable python_environment_exists python_environment_runs prediction_entry_point slurm_prediction_script sbatch squeue sacct tree_model_artifacts neural_model_artifacts absorption_hybrid_artifacts emission_hybrid_artifacts quantum_yield_hybrid_artifacts upload_read_delete_smoke; do emit \"$id\" failed 'Not run because authenticated session reuse failed.' ''; done",
+        "  emit_text authenticated_session failed 20 '' 'ControlMaster socket was not ready.'",
         "  exit 20",
         "fi",
-        "ssh -n -S \"$CTL\" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \"$HOST\" bash -s -- \"$PROJECT\" \"$JOBS\" \"$PYTHON_BIN\" <<'FLUORCAST_REMOTE_ENV_CHECKS'",
+        "ssh -S \"$CTL\" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \"$HOST\" bash -s -- \"$CONFIG_B64\" <<'FLUORCAST_REMOTE_ENV_CHECKS'",
         remote_script.as_str(),
         "FLUORCAST_REMOTE_ENV_CHECKS",
+        "SSH_CODE=$?",
+        "if [ \"$SSH_CODE\" -eq 0 ]; then printf 'FLUORCAST_CHECK_SUMMARY_V1|17\\n'; fi",
+        "exit \"$SSH_CODE\"",
+    ]
+    .join("\n")
+}
+
+fn manual_mfa_environment_checks_remote_script() -> String {
+    [
+        "set +e",
+        "CONFIG_B64=\"${1:-}\"",
+        "if [ -z \"$CONFIG_B64\" ]; then printf 'FLUORCAST_RUNNER_ERROR|missing_config\\n' >&2; exit 64; fi",
+        "CONFIG_JSON=$(printf '%s' \"$CONFIG_B64\" | base64 -d 2>/dev/null)",
+        "if [ \"$?\" -ne 0 ] || [ -z \"$CONFIG_JSON\" ]; then printf 'FLUORCAST_RUNNER_ERROR|config_decode_failed\\n' >&2; exit 65; fi",
+        "CONFIG_LINES=$(CONFIG_JSON=\"$CONFIG_JSON\" python3 - <<'PY'",
+        "import base64, json, os, sys",
+        "try:",
+        "    cfg = json.loads(os.environ['CONFIG_JSON'])",
+        "    vals = [cfg['remote_project_path'], cfg['remote_jobs_path'], cfg['python_environment_path']]",
+        "    if any(not isinstance(v, str) or not v for v in vals):",
+        "        raise ValueError('missing config value')",
+        "    for value in vals:",
+        "        print(base64.b64encode(value.encode('utf-8')).decode('ascii'))",
+        "except Exception as exc:",
+        "    print(f'FLUORCAST_CONFIG_ERROR={exc}', file=sys.stderr)",
+        "    sys.exit(66)",
+        "PY",
+        ")",
+        "CONFIG_CODE=$?",
+        "if [ \"$CONFIG_CODE\" -ne 0 ]; then printf 'FLUORCAST_RUNNER_ERROR|config_parse_failed\\n' >&2; exit \"$CONFIG_CODE\"; fi",
+        "decode_config_value() { printf '%s' \"$1\" | base64 -d; }",
+        "PROJECT_B64=$(printf '%s\\n' \"$CONFIG_LINES\" | sed -n '1p')",
+        "JOBS_B64=$(printf '%s\\n' \"$CONFIG_LINES\" | sed -n '2p')",
+        "PYTHON_B64=$(printf '%s\\n' \"$CONFIG_LINES\" | sed -n '3p')",
+        "PROJECT=$(decode_config_value \"$PROJECT_B64\")",
+        "JOBS=$(decode_config_value \"$JOBS_B64\")",
+        "PYTHON_BIN=$(decode_config_value \"$PYTHON_B64\")",
+        "if [ -z \"$PROJECT\" ] || [ -z \"$JOBS\" ] || [ -z \"$PYTHON_BIN\" ]; then printf 'FLUORCAST_RUNNER_ERROR|missing_config_value\\n' >&2; exit 67; fi",
+        "source_profile_once() { file=\"$1\"; [ -r \"$file\" ] || return 0; case \":$SOURCED_PROFILES:\" in *:\"$file\":*) return 0;; esac; SOURCED_PROFILES=\"$SOURCED_PROFILES:$file\"; . \"$file\" >/dev/null 2>&1; return 0; }",
+        "SOURCED_PROFILES=\"\"",
+        "ORIGINAL_PATH=\"$PATH\"",
+        "source_profile_once /etc/profile",
+        "source_profile_once \"$HOME/.bash_profile\"",
+        "source_profile_once \"$HOME/.bash_login\"",
+        "source_profile_once \"$HOME/.profile\"",
+        "PATH=\"$PATH:$ORIGINAL_PATH\"",
+        "b64_field() { if [ -s \"$1\" ]; then base64 < \"$1\" | tr -d '\\r\\n'; fi; }",
+        "emit() { out_b64=$(b64_field \"$4\"); err_b64=$(b64_field \"$5\"); printf 'FLUORCAST_CHECK_V1|%s|%s|%s|%s|%s\\n' \"$1\" \"$2\" \"$3\" \"$out_b64\" \"$err_b64\"; }",
+        "run_check() { id=\"$1\"; shift; out=$(mktemp); err=$(mktemp); \"$@\" >\"$out\" 2>\"$err\"; code=$?; if [ \"$code\" -eq 0 ]; then status=passed; else status=failed; fi; emit \"$id\" \"$status\" \"$code\" \"$out\" \"$err\"; rm -f \"$out\" \"$err\"; return 0; }",
+        "run_check remote_project_path test -d \"$PROJECT\"",
+        "run_check remote_project_readable test -r \"$PROJECT\"",
+        "run_check remote_jobs_path bash -c 'mkdir -p \"$1\" && test -d \"$1\"' _ \"$JOBS\"",
+        "run_check remote_jobs_writable test -w \"$JOBS\"",
+        "run_check python_environment_exists test -x \"$PYTHON_BIN\"",
+        "run_check python_environment_runs \"$PYTHON_BIN\" --version",
+        "run_check sbatch bash -c 'command -v sbatch'",
+        "run_check squeue bash -c 'command -v squeue'",
+        "run_check sacct bash -c 'command -v sacct'",
+        "run_check prediction_entry_point test -f \"$PROJECT/scripts/run_prediction_job.py\"",
+        "run_check tree_model_artifacts test -d \"$PROJECT/models/experiments_fluodb\"",
+        "run_check neural_model_artifacts test -d \"$PROJECT/models/neural_experiments_fluodb\"",
+        "run_check absorption_hybrid_artifacts test -d \"$PROJECT/models/production_hybrid/absorption_nm\"",
+        "run_check emission_hybrid_artifacts test -d \"$PROJECT/models/production_hybrid/emission_nm\"",
+        "run_check quantum_yield_hybrid_artifacts test -d \"$PROJECT/models/production_hybrid/quantum_yield\"",
+        "smoke_check() { smoke=\"$JOBS/.fluorcast-smoke-$$-$(date +%s%N).txt\"; trap 'rm -f \"$smoke\" >/dev/null 2>&1' EXIT; printf 'fluorcast-smoke' > \"$smoke\" || return 30; content=$(cat \"$smoke\" 2>/dev/null) || return 31; [ \"$content\" = 'fluorcast-smoke' ] || return 31; rm -f \"$smoke\" || return 32; trap - EXIT; return 0; }",
+        "run_check upload_read_delete_smoke smoke_check",
     ]
     .join("\n")
 }
@@ -4621,6 +4913,7 @@ fn is_interactive_login_required_output(output: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command as Proc;
 
     fn settings() -> NibiSettings {
         NibiSettings {
@@ -4732,6 +5025,433 @@ mod tests {
         let decoded = base64_decode(&encoded).unwrap();
 
         assert_eq!(String::from_utf8(decoded).unwrap(), text);
+    }
+
+    fn check_marker(id: &str, status: &str, code: i32, stdout: &str, stderr: &str) -> String {
+        format!(
+            "FLUORCAST_CHECK_V1|{id}|{status}|{code}|{}|{}",
+            base64_encode(stdout.as_bytes()),
+            base64_encode(stderr.as_bytes())
+        )
+    }
+
+    fn successful_environment_report() -> String {
+        let mut lines = EXPECTED_ENVIRONMENT_CHECK_IDS
+            .iter()
+            .map(|id| check_marker(id, "passed", 0, "ok", ""))
+            .collect::<Vec<_>>();
+        lines.push("FLUORCAST_CHECK_SUMMARY_V1|17".to_string());
+        lines.join("\n")
+    }
+
+    #[test]
+    fn expected_environment_check_ids_match_frontend_contract() {
+        assert_eq!(
+            EXPECTED_ENVIRONMENT_CHECK_IDS,
+            [
+                "authenticated_session",
+                "remote_project_path",
+                "remote_project_readable",
+                "remote_jobs_path",
+                "remote_jobs_writable",
+                "python_environment_exists",
+                "python_environment_runs",
+                "sbatch",
+                "squeue",
+                "sacct",
+                "prediction_entry_point",
+                "tree_model_artifacts",
+                "neural_model_artifacts",
+                "absorption_hybrid_artifacts",
+                "emission_hybrid_artifacts",
+                "quantum_yield_hybrid_artifacts",
+                "upload_read_delete_smoke",
+            ]
+        );
+        let unique = EXPECTED_ENVIRONMENT_CHECK_IDS
+            .iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(unique.len(), 17);
+    }
+
+    #[test]
+    fn parses_all_valid_environment_markers_and_ignores_banner_text() {
+        let report = parse_environment_check_markers(&format!(
+            "Welcome to NIBI\n{}\nprofile text\n",
+            successful_environment_report()
+        ));
+
+        assert_eq!(report.parser_error, None);
+        assert_eq!(report.checks.len(), 17);
+        assert_eq!(report.missing_ids, Vec::<String>::new());
+        assert!(report.checks.iter().all(|check| check.status == "passed"));
+    }
+
+    #[test]
+    fn marker_order_does_not_affect_environment_id_mapping() {
+        let mut ids = EXPECTED_ENVIRONMENT_CHECK_IDS.to_vec();
+        ids.reverse();
+        let mut lines = ids
+            .iter()
+            .map(|id| check_marker(id, "passed", 0, id, ""))
+            .collect::<Vec<_>>();
+        lines.push("FLUORCAST_CHECK_SUMMARY_V1|17".to_string());
+
+        let report = parse_environment_check_markers(&lines.join("\n"));
+
+        assert_eq!(report.parser_error, None);
+        assert_eq!(report.checks[0].id, "upload_read_delete_smoke");
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|check| check.id == "authenticated_session")
+                .unwrap()
+                .stdout,
+            "authenticated_session"
+        );
+    }
+
+    #[test]
+    fn marker_fields_allow_empty_and_multiline_output() {
+        let report = parse_environment_check_markers(&format!(
+            "{}\n{}\nFLUORCAST_CHECK_SUMMARY_V1|17",
+            check_marker("authenticated_session", "passed", 0, "", ""),
+            EXPECTED_ENVIRONMENT_CHECK_IDS[1..]
+                .iter()
+                .map(|id| check_marker(id, "passed", 0, "line one\nline two", "err one\nerr two"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+
+        assert_eq!(report.parser_error, None);
+        let session = report
+            .checks
+            .iter()
+            .find(|check| check.id == "authenticated_session")
+            .unwrap();
+        assert_eq!(session.stdout, "");
+        assert_eq!(session.stderr, "");
+        let path = report
+            .checks
+            .iter()
+            .find(|check| check.id == "remote_project_path")
+            .unwrap();
+        assert_eq!(path.stdout, "line one\nline two");
+        assert_eq!(path.stderr, "err one\nerr two");
+    }
+
+    #[test]
+    fn parser_rejects_missing_duplicate_unknown_and_malformed_rows() {
+        let missing = parse_environment_check_markers("FLUORCAST_CHECK_SUMMARY_V1|17");
+        assert!(missing.parser_error.unwrap().contains("Missing check IDs"));
+
+        let duplicate = parse_environment_check_markers(&format!(
+            "{}\n{}\nFLUORCAST_CHECK_SUMMARY_V1|17",
+            successful_environment_report(),
+            check_marker("remote_project_path", "passed", 0, "", "")
+        ));
+        assert_eq!(duplicate.duplicate_ids, vec!["remote_project_path"]);
+        assert!(duplicate
+            .parser_error
+            .unwrap()
+            .contains("Duplicate check IDs"));
+
+        let unknown = parse_environment_check_markers(&format!(
+            "{}\n{}\nFLUORCAST_CHECK_SUMMARY_V1|17",
+            successful_environment_report(),
+            check_marker("unexpected_check", "passed", 0, "", "")
+        ));
+        assert_eq!(unknown.unknown_ids, vec!["unexpected_check"]);
+        assert!(unknown.parser_error.unwrap().contains("Unknown check IDs"));
+
+        let malformed = parse_environment_check_markers(&format!(
+            "{}\nFLUORCAST_CHECK_V1|remote_project_path|passed|0|only-five\nFLUORCAST_CHECK_V1\\tremote_project_path\\tpassed\\t0\\tbad\\tbad\nFLUORCAST_CHECK_SUMMARY_V1|17",
+            successful_environment_report()
+        ));
+        assert!(!malformed.malformed_rows.is_empty());
+        assert!(malformed
+            .parser_error
+            .unwrap()
+            .contains("Malformed result rows"));
+    }
+
+    #[test]
+    fn malformed_base64_marker_does_not_create_check_result() {
+        let mut lines = EXPECTED_ENVIRONMENT_CHECK_IDS
+            .iter()
+            .map(|id| check_marker(id, "passed", 0, "ok", ""))
+            .collect::<Vec<_>>();
+        lines[1] = "FLUORCAST_CHECK_V1|remote_project_path|passed|0|not-valid!|".to_string();
+        lines.push("FLUORCAST_CHECK_SUMMARY_V1|17".to_string());
+
+        let report = parse_environment_check_markers(&lines.join("\n"));
+
+        assert!(report
+            .parser_error
+            .as_deref()
+            .unwrap()
+            .contains("Malformed result rows"));
+        assert!(report
+            .checks
+            .iter()
+            .all(|check| check.id != "remote_project_path"));
+        assert_eq!(report.missing_ids, vec!["remote_project_path"]);
+    }
+
+    #[test]
+    fn a_genuine_failed_check_does_not_hide_later_results() {
+        let mut lines = EXPECTED_ENVIRONMENT_CHECK_IDS
+            .iter()
+            .map(|id| {
+                if *id == "remote_project_path" {
+                    check_marker(id, "failed", 1, "", "missing")
+                } else {
+                    check_marker(id, "passed", 0, "ok", "")
+                }
+            })
+            .collect::<Vec<_>>();
+        lines.push("FLUORCAST_CHECK_SUMMARY_V1|17".to_string());
+
+        let report = parse_environment_check_markers(&lines.join("\n"));
+
+        assert_eq!(report.parser_error, None);
+        assert_eq!(report.checks.len(), 17);
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|check| check.id == "upload_read_delete_smoke")
+                .unwrap()
+                .status,
+            "passed"
+        );
+    }
+
+    #[test]
+    fn environment_script_uses_versioned_markers_json_config_and_stdin_for_remote_ssh() {
+        let script = manual_mfa_environment_checks_script();
+        let remote_ssh_line = script
+            .lines()
+            .find(|line| line.contains("bash -s -- \"$CONFIG_B64\""))
+            .unwrap();
+
+        assert!(script.contains("FLUORCAST_CHECK_V1|%s|%s|%s|%s|%s"));
+        assert!(script.contains("FLUORCAST_CHECK_SUMMARY_V1|17"));
+        assert!(script.contains("CONFIG_B64=\"$2\""));
+        assert!(script.contains("json.loads"));
+        assert!(script.contains("set +e"));
+        assert!(!script.contains("set -e"));
+        assert!(!remote_ssh_line.contains("ssh -n"));
+        assert!(remote_ssh_line.contains("ssh -S \"$CTL\""));
+        assert!(script.contains("-o BatchMode=yes"));
+    }
+
+    #[test]
+    fn environment_remote_script_runner_error_does_not_fabricate_environment_failures() {
+        let report = run_environment_remote_script_fixture(None).unwrap();
+
+        assert_ne!(report.status.code(), Some(0));
+        let parsed = parse_environment_check_markers(&String::from_utf8_lossy(&report.stdout));
+
+        assert_eq!(parsed.checks.len(), 0);
+        assert!(parsed
+            .parser_error
+            .as_deref()
+            .unwrap()
+            .contains("Missing check IDs"));
+        assert!(String::from_utf8_lossy(&report.stderr).contains("missing_config"));
+    }
+
+    #[test]
+    fn environment_remote_script_fixture_returns_all_checks_and_keeps_running_after_failure() {
+        let fixture = create_environment_script_fixture();
+        let config = EnvironmentCheckConfig {
+            remote_project_path: &fixture.project,
+            remote_jobs_path: &fixture.jobs,
+            python_environment_path: &fixture.python,
+        };
+        let config_json = serde_json::to_string(&config).unwrap();
+        let passed_output = run_environment_remote_script_fixture(Some((
+            &base64_encode(config_json.as_bytes()),
+            &fixture.bin,
+            &fixture.home,
+        )))
+        .unwrap();
+        assert_eq!(passed_output.status.code(), Some(0));
+        let mut passed_lines = environment_script_full_report_stdout(&passed_output.stdout);
+        passed_lines.push_str("\nFLUORCAST_CHECK_SUMMARY_V1|17");
+        let passed = parse_environment_check_markers(&passed_lines);
+
+        assert_eq!(passed.parser_error, None);
+        assert_eq!(passed.checks.len(), 17);
+        assert!(
+            passed.checks.iter().all(|check| check.status == "passed"),
+            "failed checks: {:?}",
+            passed
+                .checks
+                .iter()
+                .filter(|check| check.status != "passed")
+                .map(|check| (&check.id, &check.stderr))
+                .collect::<Vec<_>>()
+        );
+
+        let remove_status = Proc::new("bash")
+            .arg("-lc")
+            .arg(format!(
+                "rm -rf '{}'",
+                fixture.emission_model.replace('\'', "'\\''")
+            ))
+            .status()
+            .unwrap();
+        assert!(remove_status.success());
+        let failed_output = run_environment_remote_script_fixture(Some((
+            &base64_encode(config_json.as_bytes()),
+            &fixture.bin,
+            &fixture.home,
+        )))
+        .unwrap();
+        assert_eq!(failed_output.status.code(), Some(0));
+        let mut failed_lines = environment_script_full_report_stdout(&failed_output.stdout);
+        failed_lines.push_str("\nFLUORCAST_CHECK_SUMMARY_V1|17");
+        let failed = parse_environment_check_markers(&failed_lines);
+
+        assert_eq!(failed.parser_error, None);
+        assert_eq!(failed.checks.len(), 17);
+        assert_eq!(
+            failed
+                .checks
+                .iter()
+                .find(|check| check.id == "emission_hybrid_artifacts")
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            failed
+                .checks
+                .iter()
+                .find(|check| check.id == "quantum_yield_hybrid_artifacts")
+                .unwrap()
+                .status,
+            "passed"
+        );
+        assert_eq!(
+            failed
+                .checks
+                .iter()
+                .find(|check| check.id == "upload_read_delete_smoke")
+                .unwrap()
+                .status,
+            "passed"
+        );
+    }
+
+    struct EnvironmentScriptFixture {
+        project: String,
+        jobs: String,
+        python: String,
+        bin: String,
+        home: String,
+        emission_model: String,
+    }
+
+    fn create_environment_script_fixture() -> EnvironmentScriptFixture {
+        let setup = r#"
+set -eu
+root="$(mktemp -d "${TMPDIR:-/tmp}/fluorcast-env.XXXXXX")"
+project="$root/project"
+jobs="$root/jobs"
+bin="$root/bin"
+home="$root/home"
+python="$root/python"
+mkdir -p "$project/scripts" "$jobs" "$bin" "$home"
+mkdir -p "$project/models/experiments_fluodb"
+mkdir -p "$project/models/neural_experiments_fluodb"
+mkdir -p "$project/models/production_hybrid/absorption_nm"
+mkdir -p "$project/models/production_hybrid/emission_nm"
+mkdir -p "$project/models/production_hybrid/quantum_yield"
+printf '#!/usr/bin/env bash\nprintf "Python 3.11.0\\n"\n' > "$python"
+chmod +x "$python"
+printf '# prediction\n' > "$project/scripts/run_prediction_job.py"
+for tool in sbatch squeue sacct; do
+  printf '#!/usr/bin/env bash\nprintf "%s\\n" "$0"\n' > "$bin/$tool"
+  chmod +x "$bin/$tool"
+done
+printf 'export PATH="%s:$PATH"\n' "$bin" > "$home/.profile"
+printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$project" "$jobs" "$python" "$bin" "$home" "$project/models/production_hybrid/emission_nm"
+"#;
+        let output = Proc::new("bash")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().unwrap().write_all(setup.as_bytes())?;
+                child.wait_with_output()
+            })
+            .expect("bash is required for the environment-check script fixture");
+        assert!(
+            output.status.success(),
+            "fixture setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lines = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 6);
+        EnvironmentScriptFixture {
+            project: lines[0].clone(),
+            jobs: lines[1].clone(),
+            python: lines[2].clone(),
+            bin: lines[3].clone(),
+            home: lines[4].clone(),
+            emission_model: lines[5].clone(),
+        }
+    }
+
+    fn run_environment_remote_script_fixture(
+        config_and_path: Option<(&str, &str, &str)>,
+    ) -> std::io::Result<std::process::Output> {
+        let mut command = Proc::new("bash");
+        command
+            .arg("-s")
+            .arg("--")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let script = if let Some((config_b64, bin, home)) = config_and_path {
+            command.arg(config_b64).env("HOME", home);
+            format!(
+                "PATH='{}':$PATH\n{}",
+                bin.replace('\'', "'\\''"),
+                manual_mfa_environment_checks_remote_script()
+            )
+        } else {
+            manual_mfa_environment_checks_remote_script()
+        };
+        if let Some((_, _, home)) = config_and_path {
+            command.env("HOME", home);
+        }
+        let mut child = command.spawn()?;
+        child.stdin.take().unwrap().write_all(script.as_bytes())?;
+        child.wait_with_output()
+    }
+
+    fn environment_script_full_report_stdout(remote_stdout: &[u8]) -> String {
+        format!(
+            "{}\n{}",
+            check_marker(
+                "authenticated_session",
+                "passed",
+                0,
+                "FLUORCAST_AUTH_OK",
+                ""
+            ),
+            String::from_utf8_lossy(remote_stdout)
+        )
     }
 
     #[test]

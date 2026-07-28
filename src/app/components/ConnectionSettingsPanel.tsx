@@ -414,13 +414,19 @@ export function ConnectionSettingsPanel({
         };
         onManualMfaSessionChange(nextSession);
       }
-      setRemoteEnvironmentStatus(getRemoteEnvironmentReadiness(completedRows).summary);
+      if (report.status === "runner_error" || report.diagnostics?.parser_error) {
+        setRemoteEnvironmentStatus(
+          `Remote environment checks could not complete. ${report.diagnostics?.parser_error ?? "See technical details."}`,
+        );
+      } else {
+        setRemoteEnvironmentStatus(getRemoteEnvironmentReadiness(completedRows).summary);
+      }
     } catch (error) {
       setRemoteEnvironmentStatus(error instanceof Error ? error.message : "Remote environment checks could not run.");
       setRemoteEnvironmentRows((current) => current.map((row) => ({
         ...row,
-        status: "failed",
-        message: "Remote environment checks could not run.",
+        status: "not_run",
+        message: "Not run because the environment-check operation did not complete.",
       })));
     } finally {
       remoteEnvironmentCheckInFlightRef.current = false;

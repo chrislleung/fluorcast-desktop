@@ -5,7 +5,7 @@ import {
 } from "../../features/settings";
 import type { RemoteCommandResult, RemoteCommandSpec } from "./types";
 
-export type RemoteEnvironmentCheckStatus = "not_run" | "running" | "passed" | "failed";
+export type RemoteEnvironmentCheckStatus = "not_run" | "running" | "passed" | "failed" | "runner_error";
 
 export type RemoteEnvironmentCheckId =
   | "authenticated_session"
@@ -19,7 +19,6 @@ export type RemoteEnvironmentCheckId =
   | "squeue"
   | "sacct"
   | "prediction_entry_point"
-  | "slurm_prediction_script"
   | "tree_model_artifacts"
   | "neural_model_artifacts"
   | "absorption_hybrid_artifacts"
@@ -44,14 +43,35 @@ export type RemoteEnvironmentCheckRow = RemoteEnvironmentCheckDefinition & {
 
 export type EnvironmentCheckResult = {
   id: RemoteEnvironmentCheckId;
-  status: "passed" | "failed" | "running" | "not_run";
+  status: "passed" | "failed" | "running" | "not_run" | "runner_error";
   summary: string;
   detail?: string | null;
+  exit_code?: number | null;
+  stdout?: string;
+  stderr?: string;
+};
+
+export type EnvironmentCheckDiagnostics = {
+  operation_status: string;
+  wsl_launch_count: number;
+  ssh_launch_count: number;
+  expected_check_count: number;
+  parsed_check_count: number;
+  duplicate_ids: string[];
+  unknown_ids: string[];
+  missing_ids: string[];
+  malformed_rows: string[];
+  parser_error?: string | null;
+  ssh_exit_code?: number | null;
+  timed_out: boolean;
+  sanitized_stderr: string;
+  total_duration_ms: number;
 };
 
 export type EnvironmentCheckReport = {
   status: string;
   checks: EnvironmentCheckResult[];
+  diagnostics?: EnvironmentCheckDiagnostics;
   started_at: string;
   completed_at: string;
   duration_ms: number;
@@ -137,7 +157,6 @@ function modelDirectoryCheck(
 export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): RemoteEnvironmentCheckDefinition[] {
   const trimmed = trimNibiSettings(settings);
   const predictionScriptPath = `${trimmed.remote_project_path}/scripts/run_prediction_job.py`;
-  const slurmScriptPath = `${trimmed.remote_project_path}/slurm/run_prediction_job.sbatch`;
   const jobsCommand = `mkdir -p ${shellQuote(trimmed.remote_jobs_path)} && test -d ${shellQuote(trimmed.remote_jobs_path)}`;
   const checks: RemoteEnvironmentCheckDefinition[] = [];
 
@@ -288,19 +307,6 @@ export function buildRemoteEnvironmentCheckDefinitions(settings: NibiSettings): 
       successMessage: "Prediction entry point exists.",
       failureMessage: "Prediction entry point was not found.",
     },
-    {
-      id: "slurm_prediction_script",
-      name: "Slurm prediction script exists",
-      optional: false,
-      commandSpec: withSettings({
-        label: "Slurm prediction script exists",
-        executable: "test",
-        args: ["-f", slurmScriptPath],
-        redacted_preview: `test -f ${shellQuote(slurmScriptPath)}`,
-      }, trimmed),
-      successMessage: "Slurm prediction script exists.",
-      failureMessage: "Slurm prediction script was not found.",
-    },
     modelDirectoryCheck(
       "tree_model_artifacts",
       "Tree model artifacts exist",
@@ -395,16 +401,29 @@ export function reportToRemoteEnvironmentRows(
     if (!check) {
       return {
         ...definition,
-        status: "failed",
-        message: "Remote environment check was not returned by the backend.",
-        result: createReportCommandResult(definition, report, 1, ""),
+        status: report.status === "runner_error" || report.diagnostics?.parser_error ? "runner_error" : "not_run",
+        message: "Not run because the batched environment-check report was incomplete.",
       };
     }
+    const status = check.status === "passed"
+      ? "passed"
+      : check.status === "failed"
+      ? "failed"
+      : check.status === "runner_error"
+      ? "runner_error"
+      : "not_run";
     return {
       ...definition,
-      status: check.status === "passed" ? "passed" : "failed",
+      status,
       message: check.summary,
-      result: createReportCommandResult(definition, report, check.status === "passed" ? 0 : 1, check.detail ?? ""),
+      result: createReportCommandResult(
+        definition,
+        report,
+        check.exit_code ?? (check.status === "passed" ? 0 : check.status === "failed" ? 1 : null),
+        check.detail ?? operationDetail(report),
+        check.stdout,
+        check.stderr,
+      ),
     };
   });
 }
@@ -412,18 +431,47 @@ export function reportToRemoteEnvironmentRows(
 function createReportCommandResult(
   definition: RemoteEnvironmentCheckDefinition,
   report: EnvironmentCheckReport,
-  exitCode: number,
+  exitCode: number | null,
   detail: string,
+  stdout?: string,
+  stderr?: string,
 ): RemoteCommandResult {
   return {
-    exit_code: exitCode,
-    stdout: detail,
-    stderr: exitCode === 0 ? "" : detail,
+    exit_code: exitCode ?? 0,
+    stdout: stdout ?? detail,
+    stderr: stderr ?? (exitCode === 0 ? "" : detail),
     duration_ms: report.duration_ms,
     command_label: definition.name,
     redacted_command_preview: "run_nibi_environment_checks",
     timed_out: report.timed_out,
   };
+}
+
+export function operationDetail(report: EnvironmentCheckReport): string {
+  const diagnostics = report.diagnostics;
+  if (!diagnostics) {
+    return "";
+  }
+  const duplicateIds = diagnostics.duplicate_ids ?? [];
+  const unknownIds = diagnostics.unknown_ids ?? [];
+  const missingIds = diagnostics.missing_ids ?? [];
+  const malformedRows = diagnostics.malformed_rows ?? [];
+  return [
+    `OPERATION_STATUS=${diagnostics.operation_status}`,
+    `WSL_LAUNCH_COUNT=${diagnostics.wsl_launch_count}`,
+    `SSH_LAUNCH_COUNT=${diagnostics.ssh_launch_count}`,
+    `EXPECTED_CHECK_COUNT=${diagnostics.expected_check_count}`,
+    `PARSED_CHECK_COUNT=${diagnostics.parsed_check_count}`,
+    `DUPLICATE_IDS=${duplicateIds.join(",")}`,
+    `UNKNOWN_IDS=${unknownIds.join(",")}`,
+    `MISSING_IDS=${missingIds.join(",")}`,
+    `MALFORMED_ROWS=${malformedRows.length}`,
+    `SSH_EXIT_CODE=${diagnostics.ssh_exit_code ?? "none"}`,
+    `TIMED_OUT=${diagnostics.timed_out}`,
+    `SANITIZED_STDERR=${diagnostics.sanitized_stderr}`,
+    `PARSER_ERROR=${diagnostics.parser_error ?? ""}`,
+    `TOTAL_DURATION_MS=${diagnostics.total_duration_ms}`,
+  ].join("\n");
 }
 
 export function getRemoteEnvironmentReadiness(rows: RemoteEnvironmentCheckRow[]): RemoteEnvironmentReadiness {
