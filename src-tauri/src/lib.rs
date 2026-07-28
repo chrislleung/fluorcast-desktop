@@ -1,4 +1,5 @@
 mod nibi;
+mod process;
 
 use sqlx::sqlite::SqlitePoolOptions;
 use tauri::{AppHandle, Manager};
@@ -86,6 +87,7 @@ pub fn run() {
             nibi::test_nibi_connection,
             nibi::test_robot_automation,
             nibi::run_nibi_remote_command,
+            nibi::run_nibi_environment_checks,
             nibi::download_nibi_file,
             nibi::upload_nibi_file,
             nibi::prediction_output_temp_file_path,

@@ -5,7 +5,7 @@ import {
 } from "../../features/settings";
 import type { RemoteCommandResult, RemoteCommandSpec } from "./types";
 
-export type RemoteEnvironmentCheckStatus = "not_run" | "running" | "passed" | "failed";
+export type RemoteEnvironmentCheckStatus = "not_run" | "running" | "passed" | "failed" | "runner_error";
 
 export type RemoteEnvironmentCheckId =
   | "authenticated_session"
@@ -39,6 +39,49 @@ export type RemoteEnvironmentCheckRow = RemoteEnvironmentCheckDefinition & {
   status: RemoteEnvironmentCheckStatus;
   message: string;
   result?: RemoteCommandResult;
+};
+
+export type EnvironmentCheckResult = {
+  id: RemoteEnvironmentCheckId;
+  status: "passed" | "failed" | "running" | "not_run" | "runner_error";
+  summary: string;
+  detail?: string | null;
+  exit_code?: number | null;
+  stdout?: string;
+  stderr?: string;
+};
+
+export type EnvironmentCheckDiagnostics = {
+  operation_status: string;
+  wsl_launch_count: number;
+  ssh_launch_count: number;
+  expected_check_count: number;
+  parsed_check_count: number;
+  duplicate_ids: string[];
+  unknown_ids: string[];
+  missing_ids: string[];
+  malformed_rows: string[];
+  parser_error?: string | null;
+  ssh_exit_code?: number | null;
+  timed_out: boolean;
+  sanitized_stderr: string;
+  total_duration_ms: number;
+};
+
+export type EnvironmentCheckReport = {
+  status: string;
+  checks: EnvironmentCheckResult[];
+  diagnostics?: EnvironmentCheckDiagnostics;
+  started_at: string;
+  completed_at: string;
+  duration_ms: number;
+  operation_name: string;
+  timed_out: boolean;
+  process_exit_code?: number | null;
+  process_visibility: "hidden" | "visible";
+  backend_process_launches: number;
+  wsl_process_launches: number;
+  ssh_remote_sessions: number;
 };
 
 export type RemoteEnvironmentReadiness = {
@@ -346,6 +389,89 @@ export function resultToRemoteEnvironmentRow(
     message,
     result,
   };
+}
+
+export function reportToRemoteEnvironmentRows(
+  definitions: RemoteEnvironmentCheckDefinition[],
+  report: EnvironmentCheckReport,
+): RemoteEnvironmentCheckRow[] {
+  const resultById = new Map(report.checks.map((check) => [check.id, check]));
+  return definitions.map((definition) => {
+    const check = resultById.get(definition.id);
+    if (!check) {
+      return {
+        ...definition,
+        status: report.status === "runner_error" || report.diagnostics?.parser_error ? "runner_error" : "not_run",
+        message: "Not run because the batched environment-check report was incomplete.",
+      };
+    }
+    const status = check.status === "passed"
+      ? "passed"
+      : check.status === "failed"
+      ? "failed"
+      : check.status === "runner_error"
+      ? "runner_error"
+      : "not_run";
+    return {
+      ...definition,
+      status,
+      message: check.summary,
+      result: createReportCommandResult(
+        definition,
+        report,
+        check.exit_code ?? (check.status === "passed" ? 0 : check.status === "failed" ? 1 : null),
+        check.detail ?? operationDetail(report),
+        check.stdout,
+        check.stderr,
+      ),
+    };
+  });
+}
+
+function createReportCommandResult(
+  definition: RemoteEnvironmentCheckDefinition,
+  report: EnvironmentCheckReport,
+  exitCode: number | null,
+  detail: string,
+  stdout?: string,
+  stderr?: string,
+): RemoteCommandResult {
+  return {
+    exit_code: exitCode ?? 0,
+    stdout: stdout ?? detail,
+    stderr: stderr ?? (exitCode === 0 ? "" : detail),
+    duration_ms: report.duration_ms,
+    command_label: definition.name,
+    redacted_command_preview: "run_nibi_environment_checks",
+    timed_out: report.timed_out,
+  };
+}
+
+export function operationDetail(report: EnvironmentCheckReport): string {
+  const diagnostics = report.diagnostics;
+  if (!diagnostics) {
+    return "";
+  }
+  const duplicateIds = diagnostics.duplicate_ids ?? [];
+  const unknownIds = diagnostics.unknown_ids ?? [];
+  const missingIds = diagnostics.missing_ids ?? [];
+  const malformedRows = diagnostics.malformed_rows ?? [];
+  return [
+    `OPERATION_STATUS=${diagnostics.operation_status}`,
+    `WSL_LAUNCH_COUNT=${diagnostics.wsl_launch_count}`,
+    `SSH_LAUNCH_COUNT=${diagnostics.ssh_launch_count}`,
+    `EXPECTED_CHECK_COUNT=${diagnostics.expected_check_count}`,
+    `PARSED_CHECK_COUNT=${diagnostics.parsed_check_count}`,
+    `DUPLICATE_IDS=${duplicateIds.join(",")}`,
+    `UNKNOWN_IDS=${unknownIds.join(",")}`,
+    `MISSING_IDS=${missingIds.join(",")}`,
+    `MALFORMED_ROWS=${malformedRows.length}`,
+    `SSH_EXIT_CODE=${diagnostics.ssh_exit_code ?? "none"}`,
+    `TIMED_OUT=${diagnostics.timed_out}`,
+    `SANITIZED_STDERR=${diagnostics.sanitized_stderr}`,
+    `PARSER_ERROR=${diagnostics.parser_error ?? ""}`,
+    `TOTAL_DURATION_MS=${diagnostics.total_duration_ms}`,
+  ].join("\n");
 }
 
 export function getRemoteEnvironmentReadiness(rows: RemoteEnvironmentCheckRow[]): RemoteEnvironmentReadiness {

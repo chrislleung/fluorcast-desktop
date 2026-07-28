@@ -19,14 +19,13 @@ import {
   buildManualMfaSessionCommands,
   buildRemoteEnvironmentCheckDefinitions,
   createInitialRemoteEnvironmentRows,
-  createRemoteExecutor,
   defaultManualMfaSessionState,
+  reportToRemoteEnvironmentRows,
   getRemoteEnvironmentReadiness,
-  InteractiveMfaRemoteExecutor,
-  resultToRemoteEnvironmentRow,
   validateRemoteEnvironmentLocalInputs,
   applyManualMfaSessionResult,
   applyManualMfaTerminalLaunchResult,
+  type EnvironmentCheckReport,
   type RemoteEnvironmentCheckRow,
 } from "../../lib/remote";
 import type {
@@ -35,7 +34,6 @@ import type {
   ManualMfaTerminalLaunchResult,
   ManualMfaSessionUiState,
   LocalSshCapabilitiesResult,
-  RemoteCommandResult,
 } from "../../lib/remote";
 import { ConnectionModeSetting } from "./ConnectionModeSetting";
 
@@ -269,6 +267,7 @@ export function ConnectionSettingsPanel({
   );
   const [remoteEnvironmentStatus, setRemoteEnvironmentStatus] = useState("");
   const [isRunningRemoteEnvironmentChecks, setIsRunningRemoteEnvironmentChecks] = useState(false);
+  const remoteEnvironmentCheckInFlightRef = useRef(false);
   const [isRemoteEnvironmentOpen, setIsRemoteEnvironmentOpen] = useState(false);
   const normalizedRobotSettingsRef = useRef("");
 
@@ -371,30 +370,10 @@ export function ConnectionSettingsPanel({
     setRemoteEnvironmentRows(createInitialRemoteEnvironmentRows(defaultNibiSettings));
   }
 
-  function createFailedRemoteEnvironmentResult(label: string, message: string): RemoteCommandResult {
-    return {
-      exit_code: 1,
-      stdout: "",
-      stderr: message,
-      duration_ms: 0,
-      command_label: label,
-      redacted_command_preview: label,
-    };
-  }
-
-  function createSessionReadinessRemoteEnvironmentResult(result: ManualMfaSessionResult): RemoteCommandResult {
-    return {
-      exit_code: result.can_run_background_commands ? 0 : result.last_session_test_exit_code ?? 1,
-      stdout: result.last_session_test_stdout,
-      stderr: result.can_run_background_commands ? "" : result.message || result.last_session_test_stderr,
-      duration_ms: 0,
-      command_label: "Authenticated session reuse",
-      redacted_command_preview: result.redacted_command_preview,
-      timed_out: result.status === "timeout",
-    };
-  }
-
   async function runRemoteEnvironmentChecks() {
+    if (remoteEnvironmentCheckInFlightRef.current) {
+      return;
+    }
     const trimmed = trimNibiSettings(values);
     const isConnectionReady = isManualMfaMode
       ? manualMfaSession.status === "authenticated" || manualMfaSession.can_run_background_commands
@@ -410,62 +389,48 @@ export function ConnectionSettingsPanel({
     const definitions = buildRemoteEnvironmentCheckDefinitions(trimmed);
     setRemoteEnvironmentRows(definitions.map((definition) => ({
       ...definition,
-      status: "not_run",
-      message: "Not run.",
+      status: "running",
+      message: "Running...",
     })));
+    remoteEnvironmentCheckInFlightRef.current = true;
     setIsRunningRemoteEnvironmentChecks(true);
 
-    const completedRows: RemoteEnvironmentCheckRow[] = [];
-    const executor = createRemoteExecutor(trimmed.connection_mode);
-    if (executor instanceof InteractiveMfaRemoteExecutor) {
-      executor.setAuthenticated(isConnectionReady);
-    }
-    let stoppedAfterReadinessFailure = false;
     try {
-      for (const definition of definitions) {
-        setRemoteEnvironmentRows((current) => current.map((row) => (
-          row.id === definition.id
-            ? { ...row, status: "running", message: "Running..." }
-            : row
-        )));
-
-        let result: RemoteCommandResult;
-        if (definition.id === "authenticated_session") {
-          const readiness = await invoke<ManualMfaSessionResult>("test_manual_mfa_session", {
-            settings: trimmed,
-          });
-          updateManualMfaFromResult(readiness, true);
-          result = createSessionReadinessRemoteEnvironmentResult(readiness);
-        } else {
-          try {
-          result = await executor.runCommand(definition.commandSpec);
-          } catch (error) {
-            result = createFailedRemoteEnvironmentResult(
-              definition.name,
-              error instanceof Error ? error.message : "Remote environment check could not run.",
-            );
-          }
-        }
-
-        const completedRow = resultToRemoteEnvironmentRow(definition, result);
-        completedRows.push(completedRow);
-        setRemoteEnvironmentRows((current) => current.map((row) => (
-          row.id === definition.id ? completedRow : row
-        )));
-
-        if (definition.id === "authenticated_session" && completedRow.status !== "passed") {
-          setRemoteEnvironmentStatus("Authenticated session reuse failed. Remote environment checks were not run.");
-          stoppedAfterReadinessFailure = true;
-          break;
-        }
+      const report = await invoke<EnvironmentCheckReport>("run_nibi_environment_checks", {
+        mode: trimmed.connection_mode,
+        settings: trimmed,
+      });
+      const completedRows = reportToRemoteEnvironmentRows(definitions, report);
+      setRemoteEnvironmentRows(completedRows);
+      const sessionRow = completedRows.find((row) => row.id === "authenticated_session");
+      if (sessionRow?.status === "passed" && isManualMfaMode) {
+        const now = new Date().toISOString();
+        const nextSession = {
+          ...manualMfaSession,
+          status: "authenticated" as const,
+          can_run_background_commands: true,
+          last_successful_command_at: now,
+          last_session_test_result: sessionRow.message,
+        };
+        onManualMfaSessionChange(nextSession);
       }
-
-      if (!stoppedAfterReadinessFailure) {
+      if (report.status === "runner_error" || report.diagnostics?.parser_error) {
+        setRemoteEnvironmentStatus(
+          `Remote environment checks could not complete. ${report.diagnostics?.parser_error ?? "See technical details."}`,
+        );
+      } else {
         setRemoteEnvironmentStatus(getRemoteEnvironmentReadiness(completedRows).summary);
       }
+    } catch (error) {
+      setRemoteEnvironmentStatus(error instanceof Error ? error.message : "Remote environment checks could not run.");
+      setRemoteEnvironmentRows((current) => current.map((row) => ({
+        ...row,
+        status: "not_run",
+        message: "Not run because the environment-check operation did not complete.",
+      })));
     } finally {
+      remoteEnvironmentCheckInFlightRef.current = false;
       setIsRunningRemoteEnvironmentChecks(false);
-      void executor.dispose();
     }
   }
 

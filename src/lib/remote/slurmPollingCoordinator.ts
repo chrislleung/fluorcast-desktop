@@ -15,7 +15,7 @@ type TimerHandle = ReturnType<typeof setTimeout>;
 
 export const SLURM_POLL_INTERVALS_MS = {
   running: 15_000,
-  queued: 25_000,
+  queued: 15_000,
   resultRetry: 30_000,
   failureBackoffBase: 30_000,
   failureBackoffMax: 120_000,

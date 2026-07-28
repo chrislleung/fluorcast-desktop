@@ -1,5 +1,8 @@
+use crate::process::{
+    hidden_std_command_with_stdin, run_hidden_command, run_hidden_command_with_stdin,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -18,9 +21,11 @@ const PERSISTENT_SHELL_TIMEOUT: Duration = Duration::from_secs(60);
 const PERSISTENT_SHELL_LOG_LIMIT: usize = 128_000;
 
 static PERSISTENT_SHELL: OnceLock<Mutex<Option<PersistentShell>>> = OnceLock::new();
-static MANUAL_MFA_TERMINAL_LAUNCH: OnceLock<Mutex<()>> = OnceLock::new();
+static MANUAL_MFA_TERMINAL_LAUNCH: OnceLock<Mutex<bool>> = OnceLock::new();
+static ENVIRONMENT_CHECK_RUN: OnceLock<Mutex<bool>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct NibiSettings {
     #[serde(default = "default_manual_mfa_provider")]
     manual_mfa_provider: String,
@@ -221,6 +226,7 @@ pub struct ManualMfaTerminalLaunchResult {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum TerminalLaunchMethod {
     WindowsTerminal,
     Powershell,
@@ -287,6 +293,7 @@ impl Default for ManualMfaSessionDiagnostics {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum ManualMfaSessionStatus {
     Authenticated,
     AuthenticationRequired,
@@ -355,7 +362,7 @@ enum RemoteCommand {
 const INTERACTIVE_LOGIN_REQUIRED_MESSAGE: &str = "NIBI is asking for interactive password/Duo authentication. This confirms the app reached NIBI, but a hidden background command cannot complete the login. First test the manual PowerShell SSH command. For automatic job submission, FluorCast will need an automation-compatible SSH setup.";
 
 #[tauri::command]
-pub fn test_nibi_connection(settings: NibiSettings) -> Vec<NibiConnectionCheck> {
+pub async fn test_nibi_connection(settings: NibiSettings) -> Vec<NibiConnectionCheck> {
     let mut results = Vec::new();
     let local_checks = build_local_checks(&settings);
     let local_checks_passed = local_checks
@@ -378,7 +385,7 @@ pub fn test_nibi_connection(settings: NibiSettings) -> Vec<NibiConnectionCheck> 
 
     for check in remote_checks() {
         let invocation = build_ssh_invocation(&settings, check.command);
-        match run_ssh_invocation(&invocation) {
+        match run_ssh_invocation(&invocation).await {
             Ok(output) => {
                 let status = classify_command_output(&output, check.expected_stdout);
                 let should_stop =
@@ -429,12 +436,60 @@ pub fn test_nibi_connection(settings: NibiSettings) -> Vec<NibiConnectionCheck> 
 #[tauri::command]
 pub fn open_powershell_login(settings: NibiSettings) -> Result<(), String> {
     validate_manual_login_settings(&settings)?;
-    let command = build_manual_ssh_command(&settings);
-    Command::new("powershell.exe")
-        .args(["-NoExit", "-Command", &command])
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("Could not open PowerShell: {error}"))
+    Err("PowerShell Manual MFA login is retired. Use Start NIBI session to open the single supported Windows Terminal login tab.".to_string())
+}
+
+#[derive(Debug, Serialize)]
+pub struct EnvironmentCheckReport {
+    status: String,
+    checks: Vec<EnvironmentCheckResult>,
+    diagnostics: EnvironmentCheckDiagnostics,
+    started_at: String,
+    completed_at: String,
+    duration_ms: u64,
+    operation_name: String,
+    timed_out: bool,
+    process_exit_code: Option<i32>,
+    process_visibility: String,
+    backend_process_launches: u32,
+    wsl_process_launches: u32,
+    ssh_remote_sessions: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EnvironmentCheckResult {
+    id: String,
+    status: String,
+    summary: String,
+    detail: Option<String>,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct EnvironmentCheckDiagnostics {
+    operation_status: String,
+    wsl_launch_count: u32,
+    ssh_launch_count: u32,
+    expected_check_count: usize,
+    parsed_check_count: usize,
+    duplicate_ids: Vec<String>,
+    unknown_ids: Vec<String>,
+    missing_ids: Vec<String>,
+    malformed_rows: Vec<String>,
+    parser_error: Option<String>,
+    ssh_exit_code: Option<i32>,
+    timed_out: bool,
+    sanitized_stderr: String,
+    total_duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct EnvironmentCheckConfig<'a> {
+    remote_project_path: &'a str,
+    remote_jobs_path: &'a str,
+    python_environment_path: &'a str,
 }
 
 #[tauri::command]
@@ -452,11 +507,13 @@ pub fn get_restricted_robot_public_key(
 }
 
 #[tauri::command]
-pub fn test_robot_automation(settings: NibiSettings) -> Result<RobotAutomationTestResult, String> {
+pub async fn test_robot_automation(
+    settings: NibiSettings,
+) -> Result<RobotAutomationTestResult, String> {
     validate_robot_settings(&settings)?;
     let invocation = build_robot_ssh_invocation(&settings);
     let redacted_command_preview = redacted_robot_command_preview(&settings);
-    match run_ssh_invocation(&invocation) {
+    match run_ssh_invocation(&invocation).await {
         Ok(output) => Ok(classify_robot_automation_output(
             output,
             redacted_command_preview,
@@ -529,13 +586,13 @@ pub fn prediction_output_file_modified_at(local_path: String) -> Result<String, 
 }
 
 #[tauri::command]
-pub fn run_nibi_remote_command(
+pub async fn run_nibi_remote_command(
     mode: String,
     settings: NibiSettings,
     command_spec: RemoteCommandSpecInput,
 ) -> Result<RemoteCommandResult, String> {
     if mode == "interactive_mfa" && command_spec.executable == "fluorcast-upload-smoke-test" {
-        return run_manual_mfa_upload_smoke_test_result(&settings, &command_spec);
+        return run_manual_mfa_upload_smoke_test_result(&settings, &command_spec).await;
     }
 
     validate_remote_command_spec(&command_spec)?;
@@ -543,7 +600,7 @@ pub fn run_nibi_remote_command(
         && !settings.uses_persistent_shell()
         && command_spec.executable == "fluorcast-record-slurm-submission"
     {
-        return run_manual_mfa_slurm_marker_result(&settings, &command_spec);
+        return run_manual_mfa_slurm_marker_result(&settings, &command_spec).await;
     }
     let remote_command = structured_remote_command_to_shell(&command_spec)?;
     if mode == "interactive_mfa" {
@@ -552,7 +609,8 @@ pub fn run_nibi_remote_command(
             &remote_command,
             command_spec.label,
             command_spec.redacted_preview,
-        );
+        )
+        .await;
     }
     let invocation = if mode == "robot_automation" {
         build_robot_remote_invocation(&settings, &remote_command)?
@@ -564,10 +622,47 @@ pub fn run_nibi_remote_command(
         command_spec.label,
         command_spec.redacted_preview,
     )
+    .await
 }
 
 #[tauri::command]
-pub fn upload_nibi_file(
+pub async fn run_nibi_environment_checks(
+    mode: String,
+    settings: NibiSettings,
+) -> Result<EnvironmentCheckReport, String> {
+    let started = Instant::now();
+    let started_at = timestamp_now();
+    {
+        let mut running = ENVIRONMENT_CHECK_RUN
+            .get_or_init(|| Mutex::new(false))
+            .try_lock()
+            .map_err(|_| "Remote environment checks are already running.".to_string())?;
+        if *running {
+            return Err("Remote environment checks are already running.".to_string());
+        }
+        *running = true;
+    }
+
+    let result = if mode == "interactive_mfa" {
+        run_manual_mfa_environment_checks(&settings, &started_at, started).await
+    } else {
+        Err(
+            "Batched environment checks currently require Manual MFA ControlMaster mode."
+                .to_string(),
+        )
+    };
+
+    if let Ok(mut running) = ENVIRONMENT_CHECK_RUN
+        .get_or_init(|| Mutex::new(false))
+        .lock()
+    {
+        *running = false;
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn upload_nibi_file(
     mode: String,
     settings: NibiSettings,
     local_path: String,
@@ -587,27 +682,25 @@ pub fn upload_nibi_file(
         return Ok(());
     }
     if mode == "interactive_mfa" {
-        return upload_file_via_wsl_scp(&settings, &local_path, &remote_path);
+        return upload_file_via_wsl_scp(&settings, &local_path, &remote_path).await;
     }
     let target = if mode == "robot_automation" {
         build_robot_scp_target(&settings, &local_path, &remote_path)?
     } else {
         return Err("Unsupported NIBI connection mode.".to_string());
     };
-    let mut command = Command::new(target.program);
-    command.args(target.args);
-    let output = command
-        .output()
+    let output = run_hidden_command(&target.program, &target.args, WSL_SCRIPT_TIMEOUT)
+        .await
         .map_err(|error| format!("Could not start remote upload: {error}"))?;
-    if output.status.success() {
+    if output.status == 0 {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(output.stderr)
     }
 }
 
 #[tauri::command]
-pub fn download_nibi_file(
+pub async fn download_nibi_file(
     mode: String,
     settings: NibiSettings,
     remote_path: String,
@@ -623,22 +716,20 @@ pub fn download_nibi_file(
         return Ok(());
     }
     if mode == "interactive_mfa" {
-        return download_file_via_wsl_scp(&settings, &remote_path, &local_path);
+        return download_file_via_wsl_scp(&settings, &remote_path, &local_path).await;
     }
     let source = if mode == "robot_automation" {
         build_robot_download_target(&settings, &remote_path, &local_path)?
     } else {
         return Err("Unsupported NIBI connection mode.".to_string());
     };
-    let mut command = Command::new(source.program);
-    command.args(source.args);
-    let output = command
-        .output()
+    let output = run_hidden_command(&source.program, &source.args, WSL_SCRIPT_TIMEOUT)
+        .await
         .map_err(|error| format!("Could not start remote download: {error}"))?;
-    if output.status.success() {
+    if output.status == 0 {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(output.stderr)
     }
 }
 
@@ -651,20 +742,33 @@ pub fn get_manual_mfa_session_commands(
 }
 
 #[tauri::command]
-pub fn open_manual_mfa_login(
+pub async fn open_manual_mfa_login(
     settings: NibiSettings,
 ) -> Result<ManualMfaTerminalLaunchResult, String> {
     validate_manual_login_start_settings(&settings)?;
-    let _guard = MANUAL_MFA_TERMINAL_LAUNCH
-        .get_or_init(|| Mutex::new(()))
-        .try_lock()
-        .map_err(|_| "A NIBI session launch is already in progress.".to_string())?;
+    {
+        let mut running = MANUAL_MFA_TERMINAL_LAUNCH
+            .get_or_init(|| Mutex::new(false))
+            .try_lock()
+            .map_err(|_| "A NIBI session launch is already in progress.".to_string())?;
+        if *running {
+            return Err("A NIBI session launch is already in progress.".to_string());
+        }
+        *running = true;
+    }
     let commands = build_manual_mfa_session_commands(&settings)?;
-    Ok(launch_manual_mfa_terminal(commands))
+    let result = launch_manual_mfa_terminal(commands).await;
+    if let Ok(mut running) = MANUAL_MFA_TERMINAL_LAUNCH
+        .get_or_init(|| Mutex::new(false))
+        .lock()
+    {
+        *running = false;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
-pub fn clean_stale_manual_mfa_session(
+pub async fn clean_stale_manual_mfa_session(
     settings: NibiSettings,
 ) -> Result<ManualMfaSessionResult, String> {
     validate_manual_login_settings(&settings)?;
@@ -675,7 +779,9 @@ pub fn clean_stale_manual_mfa_session(
         &commands.clean_script_content,
         &args,
         WSL_SCRIPT_TIMEOUT,
-    ) {
+    )
+    .await
+    {
         Ok(output) => {
             let status = if output.status == 0 {
                 ManualMfaSessionStatus::Disconnected
@@ -719,8 +825,8 @@ pub fn clean_stale_manual_mfa_session(
                 last_session_test_exit_code: Some(output.status),
                 parsed_session_status: status,
                 selected_backend: "wsl",
-                wsl_available: wsl_available_for_distro(&commands.wsl_distro),
-                wsl_ssh_available: wsl_ssh_available_for_distro(&commands.wsl_distro),
+                wsl_available: wsl_available_for_distro(&commands.wsl_distro).await,
+                wsl_ssh_available: wsl_ssh_available_for_distro(&commands.wsl_distro).await,
             })
         }
         Err(message) => Ok(manual_mfa_transport_error_result(&commands, message)),
@@ -728,10 +834,12 @@ pub fn clean_stale_manual_mfa_session(
 }
 
 #[tauri::command]
-pub fn test_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSessionResult, String> {
+pub async fn test_manual_mfa_session(
+    settings: NibiSettings,
+) -> Result<ManualMfaSessionResult, String> {
     validate_manual_login_settings(&settings)?;
     let commands = build_manual_mfa_session_commands(&settings)?;
-    Ok(run_manual_mfa_session_readiness(&commands))
+    Ok(run_manual_mfa_session_readiness(&commands).await)
 }
 
 #[tauri::command]
@@ -761,7 +869,8 @@ pub fn persistent_shell_start(
         settings.nibi_username.trim(),
         settings.manual_login_host()
     );
-    let mut child = Command::new("ssh")
+    let mut command = hidden_std_command_with_stdin("ssh");
+    let mut child = command
         .args([
             "-tt",
             "-i",
@@ -908,17 +1017,13 @@ pub fn persistent_shell_test_readiness(
 }
 
 #[tauri::command]
-pub fn check_local_ssh_capabilities() -> LocalSshCapabilitiesResult {
-    let version_output = Command::new("ssh")
-        .arg("-V")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+pub async fn check_local_ssh_capabilities() -> LocalSshCapabilitiesResult {
+    let version_output =
+        run_hidden_command("ssh", &["-V".to_string()], Duration::from_secs(5)).await;
     let ssh_version = match version_output {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = output.stdout.trim().to_string();
+            let stderr = output.stderr.trim().to_string();
             if stdout.is_empty() {
                 stderr
             } else {
@@ -928,25 +1033,17 @@ pub fn check_local_ssh_capabilities() -> LocalSshCapabilitiesResult {
         Err(error) => format!("Could not run ssh -V: {error}"),
     };
 
-    let syntax_output = Command::new("ssh")
-        .args([
-            "-G",
-            "-o",
-            "ControlMaster=auto",
-            "-o",
-            "ControlPath=fluorcast-test-%r@%h:%p",
-            "example.invalid",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+    let syntax_args = vec![
+        "-G".to_string(),
+        "-o".to_string(),
+        "ControlMaster=auto".to_string(),
+        "-o".to_string(),
+        "ControlPath=fluorcast-test-%r@%h:%p".to_string(),
+        "example.invalid".to_string(),
+    ];
+    let syntax_output = run_hidden_command("ssh", &syntax_args, Duration::from_secs(5)).await;
     let (syntax_stdout, syntax_stderr, syntax_exit_code) = match syntax_output {
-        Ok(output) => (
-            String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            output.status.code(),
-        ),
+        Ok(output) => (output.stdout, output.stderr, Some(output.status)),
         Err(error) => (
             String::new(),
             format!("Could not run ssh -G: {error}"),
@@ -983,16 +1080,18 @@ pub fn check_local_ssh_capabilities() -> LocalSshCapabilitiesResult {
 }
 
 #[tauri::command]
-pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSessionResult, String> {
+pub async fn end_manual_mfa_session(
+    settings: NibiSettings,
+) -> Result<ManualMfaSessionResult, String> {
     validate_manual_login_settings(&settings)?;
     let commands = build_manual_mfa_session_commands(&settings)?;
-    if let Err(message) = write_manual_mfa_scripts(&commands) {
+    if let Err(message) = write_manual_mfa_scripts(&commands).await {
         return Ok(ManualMfaSessionResult {
             status: ManualMfaSessionStatus::Failed,
             message,
             diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
-            control_path_exists: wsl_path_exists(&commands.control_path),
+            control_path_exists: wsl_path_exists(&commands.control_path).await,
             redacted_command_preview: commands.redacted_end_command_preview.clone(),
             can_run_background_commands: false,
             last_master_check_result: String::new(),
@@ -1002,14 +1101,14 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
             last_session_test_exit_code: None,
             parsed_session_status: ManualMfaSessionStatus::Failed,
             selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
+            wsl_available: wsl_available().await,
+            wsl_ssh_available: wsl_ssh_available().await,
         });
     }
-    match run_wsl_script(&commands.end_command) {
+    match run_wsl_script(&commands.end_command).await {
         Ok(output) => {
             let combined = output.combined();
-            let control_path_exists = wsl_path_exists(&commands.control_path);
+            let control_path_exists = wsl_path_exists(&commands.control_path).await;
             if output.status == 0 || combined.to_ascii_lowercase().contains("no such file") {
                 Ok(ManualMfaSessionResult {
                     status: ManualMfaSessionStatus::Disconnected,
@@ -1026,8 +1125,8 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
                     last_session_test_exit_code: Some(output.status),
                     parsed_session_status: ManualMfaSessionStatus::Disconnected,
                     selected_backend: "wsl",
-                    wsl_available: wsl_available(),
-                    wsl_ssh_available: wsl_ssh_available(),
+                    wsl_available: wsl_available().await,
+                    wsl_ssh_available: wsl_ssh_available().await,
                 })
             } else if is_interactive_login_required_output(&combined) {
                 Ok(ManualMfaSessionResult {
@@ -1045,8 +1144,8 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
                     last_session_test_exit_code: Some(output.status),
                     parsed_session_status: ManualMfaSessionStatus::SessionNotReused,
                     selected_backend: "wsl",
-                    wsl_available: wsl_available(),
-                    wsl_ssh_available: wsl_ssh_available(),
+                    wsl_available: wsl_available().await,
+                    wsl_ssh_available: wsl_ssh_available().await,
                 })
             } else {
                 Ok(ManualMfaSessionResult {
@@ -1064,8 +1163,8 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
                     last_session_test_exit_code: Some(output.status),
                     parsed_session_status: ManualMfaSessionStatus::Failed,
                     selected_backend: "wsl",
-                    wsl_available: wsl_available(),
-                    wsl_ssh_available: wsl_ssh_available(),
+                    wsl_available: wsl_available().await,
+                    wsl_ssh_available: wsl_ssh_available().await,
                 })
             }
         }
@@ -1074,7 +1173,7 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
             message: map_manual_mfa_error(&message),
             diagnostics: ManualMfaSessionDiagnostics::default(),
             control_path: commands.control_path.clone(),
-            control_path_exists: wsl_path_exists(&commands.control_path),
+            control_path_exists: wsl_path_exists(&commands.control_path).await,
             redacted_command_preview: commands.redacted_end_command_preview,
             can_run_background_commands: false,
             last_master_check_result: message,
@@ -1084,8 +1183,8 @@ pub fn end_manual_mfa_session(settings: NibiSettings) -> Result<ManualMfaSession
             last_session_test_exit_code: None,
             parsed_session_status: ManualMfaSessionStatus::Disconnected,
             selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
+            wsl_available: wsl_available().await,
+            wsl_ssh_available: wsl_ssh_available().await,
         }),
     }
 }
@@ -1260,6 +1359,7 @@ fn build_robot_ssh_invocation(settings: &NibiSettings) -> SshInvocation {
     }
 }
 
+#[allow(dead_code)]
 fn build_manual_ssh_command(settings: &NibiSettings) -> String {
     format!(
         "ssh -i {} {}@{}",
@@ -1422,7 +1522,7 @@ fn build_manual_mfa_session_commands(
 
     Ok(ManualMfaSessionCommands {
         backend: "wsl",
-        control_path_exists: wsl_path_exists(&control_path),
+        control_path_exists: false,
         control_socket_filename: socket_name,
         script_dir,
         start_script_path: start_script_path.clone(),
@@ -1486,50 +1586,24 @@ impl RemoteCommand {
     }
 }
 
-fn run_ssh_invocation(invocation: &SshInvocation) -> Result<CommandOutput, String> {
-    let mut child = Command::new(&invocation.program)
-        .args(&invocation.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Could not start ssh: {error}"))?;
-
-    let started = Instant::now();
-    loop {
-        if let Some(_status) = child
-            .try_wait()
-            .map_err(|error| format!("Could not read ssh status: {error}"))?
-        {
-            let output = child
-                .wait_with_output()
-                .map_err(|error| format!("Could not read ssh output: {error}"))?;
-            return Ok(CommandOutput {
-                status: output.status.code().unwrap_or(1),
-                stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-                timed_out: false,
-            });
-        }
-
-        if started.elapsed() > SSH_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("SSH command timed out after 20 seconds.".to_string());
-        }
-
-        thread::sleep(Duration::from_millis(100));
-    }
+async fn run_ssh_invocation(invocation: &SshInvocation) -> Result<CommandOutput, String> {
+    let output = run_hidden_command(&invocation.program, &invocation.args, SSH_TIMEOUT).await?;
+    Ok(CommandOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        timed_out: output.timed_out,
+    })
 }
 
-fn run_remote_invocation_result(
+async fn run_remote_invocation_result(
     invocation: SshInvocation,
     label: String,
     redacted_preview: Option<String>,
 ) -> Result<RemoteCommandResult, String> {
     let started = Instant::now();
     let preview = redacted_preview.unwrap_or_else(|| invocation.program.clone());
-    match run_ssh_invocation(&invocation) {
+    match run_ssh_invocation(&invocation).await {
         Ok(output) => Ok(RemoteCommandResult {
             exit_code: output.status,
             stdout: output.stdout,
@@ -1551,7 +1625,7 @@ fn run_remote_invocation_result(
     }
 }
 
-fn upload_file_via_wsl_scp(
+async fn upload_file_via_wsl_scp(
     settings: &NibiSettings,
     local_path: &str,
     remote_path: &str,
@@ -1573,6 +1647,7 @@ fn upload_file_via_wsl_scp(
         &invocation.stdin,
         WSL_SCRIPT_TIMEOUT,
     )
+    .await
     .map_err(|error| format!("Could not run WSL bash script: {error}"))?;
     if output.status == 0 {
         Ok(())
@@ -1640,7 +1715,7 @@ fn build_manual_mfa_scp_upload_invocation(
     )
 }
 
-fn download_file_via_wsl_scp(
+async fn download_file_via_wsl_scp(
     settings: &NibiSettings,
     remote_path: &str,
     local_path: &str,
@@ -1656,6 +1731,7 @@ fn download_file_via_wsl_scp(
         &invocation.stdin,
         WSL_SCRIPT_TIMEOUT,
     )
+    .await
     .map_err(|error| format!("Could not run WSL bash script: {error}"))?;
     if output.status == 0 {
         Ok(())
@@ -1876,10 +1952,9 @@ impl PersistentShell {
             PersistentShellStatus::Active
                 | PersistentShellStatus::WaitingForLoginMfa
                 | PersistentShellStatus::Connecting
-        ) {
-            if self.child.try_wait().ok().flatten().is_some() {
-                self.status = PersistentShellStatus::Disconnected;
-            }
+        ) && self.child.try_wait().ok().flatten().is_some()
+        {
+            self.status = PersistentShellStatus::Disconnected;
         }
     }
 
@@ -2384,7 +2459,7 @@ fn build_wsl_bash_script_invocation(
     }
 }
 
-fn run_manual_mfa_remote_command_result(
+async fn run_manual_mfa_remote_command_result(
     settings: &NibiSettings,
     remote_command: &str,
     label: String,
@@ -2394,7 +2469,7 @@ fn run_manual_mfa_remote_command_result(
     let commands = build_manual_mfa_session_commands(settings)?;
     let preview = redacted_preview.unwrap_or_else(|| label.clone());
     let started = Instant::now();
-    let readiness = run_manual_mfa_session_readiness(&commands);
+    let readiness = run_manual_mfa_session_readiness(&commands).await;
     if !readiness.can_run_background_commands {
         return Ok(RemoteCommandResult {
             exit_code: readiness.last_session_test_exit_code.unwrap_or(1),
@@ -2413,7 +2488,8 @@ fn run_manual_mfa_remote_command_result(
         &invocation.args,
         &invocation.stdin,
         command_timeout(settings, remote_command),
-    )?;
+    )
+    .await?;
 
     Ok(RemoteCommandResult {
         exit_code: output.status,
@@ -2438,7 +2514,395 @@ fn build_manual_mfa_remote_command_invocation(
     )
 }
 
-fn run_manual_mfa_upload_smoke_test_result(
+async fn run_manual_mfa_environment_checks(
+    settings: &NibiSettings,
+    started_at: &str,
+    started: Instant,
+) -> Result<EnvironmentCheckReport, String> {
+    validate_manual_login_settings(settings)?;
+    validate_remote_path(&settings.remote_project_path, "Remote project path")?;
+    validate_remote_path(&settings.remote_jobs_path, "Remote jobs path")?;
+    validate_remote_path(&settings.python_environment_path, "Python executable path")?;
+    let commands = build_manual_mfa_session_commands(settings)?;
+    let config = EnvironmentCheckConfig {
+        remote_project_path: settings.remote_project_path.trim(),
+        remote_jobs_path: settings.remote_jobs_path.trim(),
+        python_environment_path: settings.python_environment_path.trim(),
+    };
+    let config_json = serde_json::to_string(&config)
+        .map_err(|error| format!("Could not serialize environment-check configuration: {error}"))?;
+    let encoded_config = base64_encode(config_json.as_bytes());
+    let args = vec![commands.host.clone(), encoded_config];
+    let output = run_wsl_bash_script(
+        &commands.wsl_distro,
+        &manual_mfa_environment_checks_script(),
+        &args,
+        Duration::from_secs(90),
+    )
+    .await?;
+    let sanitized_stderr = sanitize_session_stderr(&output.stderr, &commands);
+    let mut parsed = parse_environment_check_markers(&output.stdout);
+    if output.status != 0 && parsed.parser_error.is_none() {
+        parsed.parser_error = Some(format!(
+            "Environment-check runner exited with status {}.",
+            output.status
+        ));
+    }
+    let status = if output.timed_out {
+        "timeout"
+    } else if parsed.parser_error.is_some() || output.status != 0 {
+        "runner_error"
+    } else if parsed.checks.iter().all(|check| check.status == "passed") {
+        "passed"
+    } else {
+        "failed"
+    };
+    let ssh_launch_count = if parsed
+        .checks
+        .iter()
+        .any(|check| check.id == "authenticated_session" && check.status == "passed")
+    {
+        1
+    } else {
+        0
+    };
+    let diagnostics = EnvironmentCheckDiagnostics {
+        operation_status: status.to_string(),
+        wsl_launch_count: 1,
+        ssh_launch_count,
+        expected_check_count: EXPECTED_ENVIRONMENT_CHECK_IDS.len(),
+        parsed_check_count: parsed.checks.len(),
+        duplicate_ids: parsed.duplicate_ids,
+        unknown_ids: parsed.unknown_ids,
+        missing_ids: parsed.missing_ids,
+        malformed_rows: parsed.malformed_rows,
+        parser_error: parsed.parser_error,
+        ssh_exit_code: Some(output.status),
+        timed_out: output.timed_out,
+        sanitized_stderr,
+        total_duration_ms: started.elapsed().as_millis() as u64,
+    };
+    Ok(EnvironmentCheckReport {
+        status: status.to_string(),
+        checks: parsed.checks,
+        diagnostics,
+        started_at: started_at.to_string(),
+        completed_at: timestamp_now(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        operation_name: "run_nibi_environment_checks".to_string(),
+        timed_out: output.timed_out,
+        process_exit_code: Some(output.status),
+        process_visibility: "hidden".to_string(),
+        backend_process_launches: 1,
+        wsl_process_launches: 1,
+        ssh_remote_sessions: ssh_launch_count,
+    })
+}
+
+const ENVIRONMENT_CHECK_MARKER: &str = "FLUORCAST_CHECK_V1|";
+const ENVIRONMENT_CHECK_SUMMARY_MARKER: &str = "FLUORCAST_CHECK_SUMMARY_V1|";
+const EXPECTED_ENVIRONMENT_CHECK_IDS: [&str; 17] = [
+    "authenticated_session",
+    "remote_project_path",
+    "remote_project_readable",
+    "remote_jobs_path",
+    "remote_jobs_writable",
+    "python_environment_exists",
+    "python_environment_runs",
+    "sbatch",
+    "squeue",
+    "sacct",
+    "prediction_entry_point",
+    "tree_model_artifacts",
+    "neural_model_artifacts",
+    "absorption_hybrid_artifacts",
+    "emission_hybrid_artifacts",
+    "quantum_yield_hybrid_artifacts",
+    "upload_read_delete_smoke",
+];
+
+#[derive(Debug)]
+struct ParsedEnvironmentCheckReport {
+    checks: Vec<EnvironmentCheckResult>,
+    duplicate_ids: Vec<String>,
+    unknown_ids: Vec<String>,
+    missing_ids: Vec<String>,
+    malformed_rows: Vec<String>,
+    parser_error: Option<String>,
+}
+
+fn parse_environment_check_markers(stdout: &str) -> ParsedEnvironmentCheckReport {
+    let expected_ids = EXPECTED_ENVIRONMENT_CHECK_IDS
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut checks = Vec::new();
+    let mut seen = HashSet::new();
+    let mut duplicate_ids = Vec::new();
+    let mut unknown_ids = Vec::new();
+    let mut malformed_rows = Vec::new();
+    let mut summary_count = None;
+
+    for line in stdout.lines() {
+        if let Some(raw_count) = line.strip_prefix(ENVIRONMENT_CHECK_SUMMARY_MARKER) {
+            match raw_count.trim().parse::<usize>() {
+                Ok(count) => summary_count = Some(count),
+                Err(_) => malformed_rows.push(line.to_string()),
+            }
+            continue;
+        }
+
+        if !line.starts_with(ENVIRONMENT_CHECK_MARKER) {
+            continue;
+        }
+
+        let parts = line.splitn(6, '|').collect::<Vec<_>>();
+        if parts.len() != 6 {
+            malformed_rows.push(line.to_string());
+            continue;
+        }
+
+        let id = parts[1];
+        let status = parts[2];
+        let exit_code = parts[3].parse::<i32>().ok();
+        if !expected_ids.contains(id) {
+            unknown_ids.push(id.to_string());
+            continue;
+        }
+        if status != "passed" && status != "failed" {
+            malformed_rows.push(line.to_string());
+            continue;
+        }
+        let Some(exit_code) = exit_code else {
+            malformed_rows.push(line.to_string());
+            continue;
+        };
+        let stdout_text = match decode_marker_field(parts[4]) {
+            Ok(value) => value,
+            Err(error) => {
+                malformed_rows.push(format!("{id}: stdout {error}"));
+                continue;
+            }
+        };
+        let stderr_text = match decode_marker_field(parts[5]) {
+            Ok(value) => value,
+            Err(error) => {
+                malformed_rows.push(format!("{id}: stderr {error}"));
+                continue;
+            }
+        };
+        if !seen.insert(id.to_string()) {
+            duplicate_ids.push(id.to_string());
+            continue;
+        }
+        let detail = [stdout_text.as_str(), stderr_text.as_str()]
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        checks.push(EnvironmentCheckResult {
+            id: id.to_string(),
+            status: status.to_string(),
+            summary: environment_check_summary(id, status),
+            detail: if detail.trim().is_empty() {
+                None
+            } else {
+                Some(detail)
+            },
+            exit_code: Some(exit_code),
+            stdout: stdout_text,
+            stderr: stderr_text,
+        });
+    }
+
+    let missing_ids = EXPECTED_ENVIRONMENT_CHECK_IDS
+        .iter()
+        .filter(|id| !seen.contains(**id))
+        .map(|id| (*id).to_string())
+        .collect::<Vec<_>>();
+    let mut parser_errors = Vec::new();
+    if !duplicate_ids.is_empty() {
+        parser_errors.push(format!(
+            "Duplicate check IDs: {}.",
+            duplicate_ids.join(", ")
+        ));
+    }
+    if !unknown_ids.is_empty() {
+        parser_errors.push(format!("Unknown check IDs: {}.", unknown_ids.join(", ")));
+    }
+    if !missing_ids.is_empty() {
+        parser_errors.push(format!("Missing check IDs: {}.", missing_ids.join(", ")));
+    }
+    if !malformed_rows.is_empty() {
+        parser_errors.push(format!("Malformed result rows: {}.", malformed_rows.len()));
+    }
+    match summary_count {
+        Some(count) if count == EXPECTED_ENVIRONMENT_CHECK_IDS.len() => {}
+        Some(count) => parser_errors.push(format!(
+            "Summary reported {count} checks; expected {}.",
+            EXPECTED_ENVIRONMENT_CHECK_IDS.len()
+        )),
+        None => parser_errors.push("Missing environment-check summary marker.".to_string()),
+    }
+
+    ParsedEnvironmentCheckReport {
+        checks,
+        duplicate_ids,
+        unknown_ids,
+        missing_ids,
+        malformed_rows,
+        parser_error: if parser_errors.is_empty() {
+            None
+        } else {
+            Some(parser_errors.join(" "))
+        },
+    }
+}
+
+fn decode_marker_field(value: &str) -> Result<String, String> {
+    let bytes = base64_decode(value)?;
+    String::from_utf8(bytes).map_err(|_| "is not valid UTF-8".to_string())
+}
+
+fn environment_check_summary(id: &str, status: &str) -> String {
+    let passed = status == "passed";
+    match (id, passed) {
+        ("authenticated_session", true) => "Authenticated session reuse returned FLUORCAST_AUTH_OK.",
+        ("authenticated_session", false) => "Authenticated session reuse failed.",
+        ("remote_project_path", true) => "Remote project path exists.",
+        ("remote_project_path", false) => "Remote project path was not found.",
+        ("remote_project_readable", true) => "Remote project path is readable.",
+        ("remote_project_readable", false) => "Remote project path is not readable.",
+        ("remote_jobs_path", true) => "Remote jobs path exists or was created.",
+        ("remote_jobs_path", false) => "Remote jobs path could not be created or verified.",
+        ("remote_jobs_writable", true) => "Remote jobs path is writable.",
+        ("remote_jobs_writable", false) => "Remote jobs path is not writable.",
+        ("python_environment_exists", true) => "Python executable exists.",
+        ("python_environment_exists", false) => {
+            "Python executable was not found or is not executable."
+        }
+        ("python_environment_runs", true) => "Python executable reports its version.",
+        ("python_environment_runs", false) => "Python executable was not found or did not run.",
+        ("sbatch", true) => "sbatch is available.",
+        ("sbatch", false) => "sbatch is unavailable.",
+        ("squeue", true) => "squeue is available.",
+        ("squeue", false) => "squeue is unavailable.",
+        ("sacct", true) => "sacct is available.",
+        ("sacct", false) => "sacct is unavailable.",
+        ("prediction_entry_point", true) => "Prediction entry point exists.",
+        ("prediction_entry_point", false) => "Prediction entry point was not found.",
+        ("tree_model_artifacts", true) => "Tree model artifacts exist.",
+        ("tree_model_artifacts", false) => "Missing model artifacts: models/experiments_fluodb. Complete the training instructions in Required Nibi setup.",
+        ("neural_model_artifacts", true) => "Neural model artifacts exist.",
+        ("neural_model_artifacts", false) => "Missing model artifacts: models/neural_experiments_fluodb. Complete the training instructions in Required Nibi setup.",
+        ("absorption_hybrid_artifacts", true) => "Absorption hybrid artifacts exist.",
+        ("absorption_hybrid_artifacts", false) => "Missing model artifacts: models/production_hybrid/absorption_nm. Complete the training instructions in Required Nibi setup.",
+        ("emission_hybrid_artifacts", true) => "Emission hybrid artifacts exist.",
+        ("emission_hybrid_artifacts", false) => "Missing model artifacts: models/production_hybrid/emission_nm. Complete the training instructions in Required Nibi setup.",
+        ("quantum_yield_hybrid_artifacts", true) => "Quantum-yield hybrid artifacts exist.",
+        ("quantum_yield_hybrid_artifacts", false) => "Missing model artifacts: models/production_hybrid/quantum_yield. Complete the training instructions in Required Nibi setup.",
+        ("upload_read_delete_smoke", true) => {
+            "Remote jobs path passed the create/read/delete smoke test."
+        }
+        ("upload_read_delete_smoke", false) => {
+            "Remote jobs path failed the create/read/delete smoke test."
+        }
+        _ => "Remote environment check returned an unknown result.",
+    }
+    .to_string()
+}
+
+fn manual_mfa_environment_checks_script() -> String {
+    let remote_script = manual_mfa_environment_checks_remote_script();
+
+    vec![
+        "#!/usr/bin/env bash",
+        "set +e",
+        "HOST=\"$1\"",
+        "CONFIG_B64=\"$2\"",
+        "CTL=\"$HOME/.fluorcast/ssh/cm-nibi.sock\"",
+        "b64_text() { printf '%s' \"${1:-}\" | base64 | tr -d '\\r\\n'; }",
+        "emit_text() { out_b64=$(b64_text \"${4:-}\"); err_b64=$(b64_text \"${5:-}\"); printf 'FLUORCAST_CHECK_V1|%s|%s|%s|%s|%s\\n' \"$1\" \"$2\" \"$3\" \"$out_b64\" \"$err_b64\"; }",
+        "if ssh -n -S \"$CTL\" -O check \"$HOST\" >/dev/null 2>&1; then",
+        "  emit_text authenticated_session passed 0 'FLUORCAST_AUTH_OK' ''",
+        "else",
+        "  emit_text authenticated_session failed 20 '' 'ControlMaster socket was not ready.'",
+        "  exit 20",
+        "fi",
+        "ssh -S \"$CTL\" -o ControlMaster=no -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \"$HOST\" bash -s -- \"$CONFIG_B64\" <<'FLUORCAST_REMOTE_ENV_CHECKS'",
+        remote_script.as_str(),
+        "FLUORCAST_REMOTE_ENV_CHECKS",
+        "SSH_CODE=$?",
+        "if [ \"$SSH_CODE\" -eq 0 ]; then printf 'FLUORCAST_CHECK_SUMMARY_V1|17\\n'; fi",
+        "exit \"$SSH_CODE\"",
+    ]
+    .join("\n")
+}
+
+fn manual_mfa_environment_checks_remote_script() -> String {
+    [
+        "set +e",
+        "CONFIG_B64=\"${1:-}\"",
+        "if [ -z \"$CONFIG_B64\" ]; then printf 'FLUORCAST_RUNNER_ERROR|missing_config\\n' >&2; exit 64; fi",
+        "CONFIG_JSON=$(printf '%s' \"$CONFIG_B64\" | base64 -d 2>/dev/null)",
+        "if [ \"$?\" -ne 0 ] || [ -z \"$CONFIG_JSON\" ]; then printf 'FLUORCAST_RUNNER_ERROR|config_decode_failed\\n' >&2; exit 65; fi",
+        "CONFIG_LINES=$(CONFIG_JSON=\"$CONFIG_JSON\" python3 - <<'PY'",
+        "import base64, json, os, sys",
+        "try:",
+        "    cfg = json.loads(os.environ['CONFIG_JSON'])",
+        "    vals = [cfg['remote_project_path'], cfg['remote_jobs_path'], cfg['python_environment_path']]",
+        "    if any(not isinstance(v, str) or not v for v in vals):",
+        "        raise ValueError('missing config value')",
+        "    for value in vals:",
+        "        print(base64.b64encode(value.encode('utf-8')).decode('ascii'))",
+        "except Exception as exc:",
+        "    print(f'FLUORCAST_CONFIG_ERROR={exc}', file=sys.stderr)",
+        "    sys.exit(66)",
+        "PY",
+        ")",
+        "CONFIG_CODE=$?",
+        "if [ \"$CONFIG_CODE\" -ne 0 ]; then printf 'FLUORCAST_RUNNER_ERROR|config_parse_failed\\n' >&2; exit \"$CONFIG_CODE\"; fi",
+        "decode_config_value() { printf '%s' \"$1\" | base64 -d; }",
+        "PROJECT_B64=$(printf '%s\\n' \"$CONFIG_LINES\" | sed -n '1p')",
+        "JOBS_B64=$(printf '%s\\n' \"$CONFIG_LINES\" | sed -n '2p')",
+        "PYTHON_B64=$(printf '%s\\n' \"$CONFIG_LINES\" | sed -n '3p')",
+        "PROJECT=$(decode_config_value \"$PROJECT_B64\")",
+        "JOBS=$(decode_config_value \"$JOBS_B64\")",
+        "PYTHON_BIN=$(decode_config_value \"$PYTHON_B64\")",
+        "if [ -z \"$PROJECT\" ] || [ -z \"$JOBS\" ] || [ -z \"$PYTHON_BIN\" ]; then printf 'FLUORCAST_RUNNER_ERROR|missing_config_value\\n' >&2; exit 67; fi",
+        "source_profile_once() { file=\"$1\"; [ -r \"$file\" ] || return 0; case \":$SOURCED_PROFILES:\" in *:\"$file\":*) return 0;; esac; SOURCED_PROFILES=\"$SOURCED_PROFILES:$file\"; . \"$file\" >/dev/null 2>&1; return 0; }",
+        "SOURCED_PROFILES=\"\"",
+        "ORIGINAL_PATH=\"$PATH\"",
+        "source_profile_once /etc/profile",
+        "source_profile_once \"$HOME/.bash_profile\"",
+        "source_profile_once \"$HOME/.bash_login\"",
+        "source_profile_once \"$HOME/.profile\"",
+        "PATH=\"$PATH:$ORIGINAL_PATH\"",
+        "b64_field() { if [ -s \"$1\" ]; then base64 < \"$1\" | tr -d '\\r\\n'; fi; }",
+        "emit() { out_b64=$(b64_field \"$4\"); err_b64=$(b64_field \"$5\"); printf 'FLUORCAST_CHECK_V1|%s|%s|%s|%s|%s\\n' \"$1\" \"$2\" \"$3\" \"$out_b64\" \"$err_b64\"; }",
+        "run_check() { id=\"$1\"; shift; out=$(mktemp); err=$(mktemp); \"$@\" >\"$out\" 2>\"$err\"; code=$?; if [ \"$code\" -eq 0 ]; then status=passed; else status=failed; fi; emit \"$id\" \"$status\" \"$code\" \"$out\" \"$err\"; rm -f \"$out\" \"$err\"; return 0; }",
+        "run_check remote_project_path test -d \"$PROJECT\"",
+        "run_check remote_project_readable test -r \"$PROJECT\"",
+        "run_check remote_jobs_path bash -c 'mkdir -p \"$1\" && test -d \"$1\"' _ \"$JOBS\"",
+        "run_check remote_jobs_writable test -w \"$JOBS\"",
+        "run_check python_environment_exists test -x \"$PYTHON_BIN\"",
+        "run_check python_environment_runs \"$PYTHON_BIN\" --version",
+        "run_check sbatch bash -c 'command -v sbatch'",
+        "run_check squeue bash -c 'command -v squeue'",
+        "run_check sacct bash -c 'command -v sacct'",
+        "run_check prediction_entry_point test -f \"$PROJECT/scripts/run_prediction_job.py\"",
+        "run_check tree_model_artifacts test -d \"$PROJECT/models/experiments_fluodb\"",
+        "run_check neural_model_artifacts test -d \"$PROJECT/models/neural_experiments_fluodb\"",
+        "run_check absorption_hybrid_artifacts test -d \"$PROJECT/models/production_hybrid/absorption_nm\"",
+        "run_check emission_hybrid_artifacts test -d \"$PROJECT/models/production_hybrid/emission_nm\"",
+        "run_check quantum_yield_hybrid_artifacts test -d \"$PROJECT/models/production_hybrid/quantum_yield\"",
+        "smoke_check() { smoke=\"$JOBS/.fluorcast-smoke-$$-$(date +%s%N).txt\"; trap 'rm -f \"$smoke\" >/dev/null 2>&1' EXIT; printf 'fluorcast-smoke' > \"$smoke\" || return 30; content=$(cat \"$smoke\" 2>/dev/null) || return 31; [ \"$content\" = 'fluorcast-smoke' ] || return 31; rm -f \"$smoke\" || return 32; trap - EXIT; return 0; }",
+        "run_check upload_read_delete_smoke smoke_check",
+    ]
+    .join("\n")
+}
+
+async fn run_manual_mfa_upload_smoke_test_result(
     settings: &NibiSettings,
     command_spec: &RemoteCommandSpecInput,
 ) -> Result<RemoteCommandResult, String> {
@@ -2465,7 +2929,7 @@ fn run_manual_mfa_upload_smoke_test_result(
     validate_remote_smoke_path_argument(remote_jobs_path, "Remote jobs path")?;
     validate_manual_login_settings(settings)?;
     let commands = build_manual_mfa_session_commands(settings)?;
-    let readiness = run_manual_mfa_session_readiness(&commands);
+    let readiness = run_manual_mfa_session_readiness(&commands).await;
     if !readiness.can_run_background_commands {
         return Ok(RemoteCommandResult {
             exit_code: readiness.last_session_test_exit_code.unwrap_or(1),
@@ -2484,7 +2948,8 @@ fn run_manual_mfa_upload_smoke_test_result(
         &invocation.args,
         &invocation.stdin,
         WSL_SCRIPT_TIMEOUT,
-    )?;
+    )
+    .await?;
 
     Ok(RemoteCommandResult {
         exit_code: output.status,
@@ -2497,7 +2962,7 @@ fn run_manual_mfa_upload_smoke_test_result(
     })
 }
 
-fn run_manual_mfa_slurm_marker_result(
+async fn run_manual_mfa_slurm_marker_result(
     settings: &NibiSettings,
     command_spec: &RemoteCommandSpecInput,
 ) -> Result<RemoteCommandResult, String> {
@@ -2509,7 +2974,7 @@ fn run_manual_mfa_slurm_marker_result(
         .clone()
         .unwrap_or_else(|| command_spec.label.clone());
     let commands = build_manual_mfa_session_commands(settings)?;
-    let readiness = run_manual_mfa_session_readiness(&commands);
+    let readiness = run_manual_mfa_session_readiness(&commands).await;
     if !readiness.can_run_background_commands {
         return Ok(RemoteCommandResult {
             exit_code: readiness.last_session_test_exit_code.unwrap_or(1),
@@ -2532,7 +2997,8 @@ fn run_manual_mfa_slurm_marker_result(
         &invocation.args,
         &invocation.stdin,
         WSL_SCRIPT_TIMEOUT,
-    )?;
+    )
+    .await?;
 
     Ok(RemoteCommandResult {
         exit_code: output.status,
@@ -2890,14 +3356,18 @@ fn manual_mfa_session_test_script() -> String {
     .join("\n")
 }
 
-fn run_manual_mfa_session_readiness(commands: &ManualMfaSessionCommands) -> ManualMfaSessionResult {
+async fn run_manual_mfa_session_readiness(
+    commands: &ManualMfaSessionCommands,
+) -> ManualMfaSessionResult {
     let args = vec![commands.host.clone()];
     match run_wsl_bash_script(
         &commands.wsl_distro,
         &commands.check_script_content,
         &args,
         WSL_SCRIPT_TIMEOUT,
-    ) {
+    )
+    .await
+    {
         Ok(output) => classify_manual_mfa_session_probe_output(commands, &output),
         Err(message) => manual_mfa_transport_error_result(commands, message),
     }
@@ -3021,8 +3491,8 @@ fn classify_manual_mfa_session_probe_output(
         last_session_test_exit_code: Some(output.status),
         parsed_session_status: status,
         selected_backend: "wsl",
-        wsl_available: wsl_available_for_distro(&commands.wsl_distro),
-        wsl_ssh_available: wsl_ssh_available_for_distro(&commands.wsl_distro),
+        wsl_available: false,
+        wsl_ssh_available: false,
     }
 }
 
@@ -3057,7 +3527,7 @@ fn manual_mfa_transport_error_result(
         last_session_test_exit_code: None,
         parsed_session_status: status,
         selected_backend: "wsl",
-        wsl_available: wsl_available_for_distro(&commands.wsl_distro),
+        wsl_available: false,
         wsl_ssh_available: false,
     }
 }
@@ -3126,7 +3596,7 @@ fn normalize_bash_source(script: &str) -> String {
     script.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn run_wsl_bash_script(
+async fn run_wsl_bash_script(
     distro: &str,
     script: &str,
     positional_args: &[String],
@@ -3139,95 +3609,28 @@ fn run_wsl_bash_script(
         &invocation.stdin,
         timeout,
     )
+    .await
     .map_err(|error| format!("Could not run WSL bash script: {error}"))
 }
 
-fn run_program_with_stdin_timeout(
+async fn run_program_with_stdin_timeout(
     program: &str,
     args: &[String],
     stdin_text: &str,
     timeout: Duration,
 ) -> Result<CommandOutput, String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Could not start {program}: {error}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("Could not capture {program} stdout."))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| format!("Could not capture {program} stderr."))?;
-    let stdout_handle = thread::spawn(move || {
-        let mut reader = stdout;
-        let mut output = String::new();
-        reader.read_to_string(&mut output).map(|_| output)
-    });
-    let stderr_handle = thread::spawn(move || {
-        let mut reader = stderr;
-        let mut output = String::new();
-        reader.read_to_string(&mut output).map(|_| output)
-    });
-
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(error) = stdin
-            .write_all(stdin_text.as_bytes())
-            .and_then(|_| stdin.flush())
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("Could not write script stdin: {error}"));
-        }
-    }
-
-    let started = Instant::now();
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("Could not read {program} status: {error}"))?
-        {
-            break status;
-        }
-        if started.elapsed() > timeout {
-            timed_out = true;
-            let _ = child.kill();
-            break child
-                .wait()
-                .map_err(|error| format!("Could not wait for timed out {program}: {error}"))?;
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-
-    let stdout = stdout_handle
-        .join()
-        .map_err(|_| format!("Could not join {program} stdout reader."))?
-        .map_err(|error| format!("Could not read {program} stdout: {error}"))?;
-    let stderr = stderr_handle
-        .join()
-        .map_err(|_| format!("Could not join {program} stderr reader."))?
-        .map_err(|error| format!("Could not read {program} stderr: {error}"))?;
-
+    let output = run_hidden_command_with_stdin(program, args, stdin_text, timeout).await?;
     Ok(CommandOutput {
-        status: if timed_out {
-            124
-        } else {
-            status.code().unwrap_or(1)
-        },
-        stdout: stdout.trim().to_string(),
-        stderr: stderr.trim().to_string(),
-        timed_out,
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        timed_out: output.timed_out,
     })
 }
 
-fn run_wsl_script(script: &str) -> Result<CommandOutput, String> {
-    let output = run_wsl_bash_script(&default_wsl_distro(), script, &[], WSL_SCRIPT_TIMEOUT)?;
+async fn run_wsl_script(script: &str) -> Result<CommandOutput, String> {
+    let output =
+        run_wsl_bash_script(&default_wsl_distro(), script, &[], WSL_SCRIPT_TIMEOUT).await?;
     if output.status == 0 {
         Ok(output)
     } else {
@@ -3235,19 +3638,19 @@ fn run_wsl_script(script: &str) -> Result<CommandOutput, String> {
     }
 }
 
-fn write_manual_mfa_scripts(commands: &ManualMfaSessionCommands) -> Result<(), String> {
+async fn write_manual_mfa_scripts(commands: &ManualMfaSessionCommands) -> Result<(), String> {
     for (path, content) in [
         (&commands.start_script_path, &commands.login_command),
         (&commands.check_script_path, &commands.check_script_content),
         (&commands.end_script_path, &commands.end_script_content),
         (&commands.clean_script_path, &commands.clean_script_content),
     ] {
-        write_wsl_script(path, content, &commands.wsl_distro)?;
+        write_wsl_script(path, content, &commands.wsl_distro).await?;
     }
     Ok(())
 }
 
-fn write_wsl_script(path: &str, content: &str, distro: &str) -> Result<(), String> {
+async fn write_wsl_script(path: &str, content: &str, distro: &str) -> Result<(), String> {
     let script_name = path
         .rsplit('/')
         .next()
@@ -3274,15 +3677,15 @@ fn write_wsl_script(path: &str, content: &str, distro: &str) -> Result<(), Strin
     ]
     .join("\n");
     let args = vec![script_name, base64_encode(content.as_bytes())];
-    let output = run_wsl_bash_script(distro, &writer_script, &args, WSL_SCRIPT_TIMEOUT).map_err(
-        |error| {
+    let output = run_wsl_bash_script(distro, &writer_script, &args, WSL_SCRIPT_TIMEOUT)
+        .await
+        .map_err(|error| {
             format!(
                 "{} {}",
                 terminal_command_not_found_message(&error),
                 "Could not write WSL Manual MFA scripts."
             )
-        },
-    )?;
+        })?;
     if output.status == 0 {
         Ok(())
     } else {
@@ -3293,13 +3696,14 @@ fn write_wsl_script(path: &str, content: &str, distro: &str) -> Result<(), Strin
     }
 }
 
-fn resolve_wsl_home(distro: &str) -> Result<String, String> {
+async fn resolve_wsl_home(distro: &str) -> Result<String, String> {
     let output = run_wsl_bash_script(
         distro,
         "printf '%s\\n' \"$HOME\"",
         &[],
         Duration::from_secs(5),
     )
+    .await
     .map_err(|error| format!("Could not resolve WSL HOME: {error}"))?;
     if output.status == 0 {
         let home = output.stdout.trim();
@@ -3320,7 +3724,7 @@ fn start_script_path_for_wsl_home(wsl_home: &str) -> String {
     )
 }
 
-fn verify_wsl_login_script(distro: &str, script_path: &str) -> Result<(), String> {
+async fn verify_wsl_login_script(distro: &str, script_path: &str) -> Result<(), String> {
     let output = run_wsl_bash_script(
         distro,
         [
@@ -3348,6 +3752,7 @@ fn verify_wsl_login_script(distro: &str, script_path: &str) -> Result<(), String
         &[script_path.to_string()],
         Duration::from_secs(5),
     )
+    .await
     .map_err(|error| format!("Could not verify WSL login script: {error}"))?;
     if output.status == 0 {
         Ok(())
@@ -3381,13 +3786,13 @@ fn build_windows_terminal_login_args(
     ]
 }
 
-fn launch_manual_mfa_terminal(
+async fn launch_manual_mfa_terminal(
     mut commands: ManualMfaSessionCommands,
 ) -> ManualMfaTerminalLaunchResult {
-    let wsl_ok = command_available("wsl.exe");
-    let wt_ok = command_available("wt.exe");
-    let powershell_ok = command_available("powershell.exe");
-    let distro_ok = wsl_distro_available(&commands.wsl_distro);
+    let wsl_ok = command_available("wsl.exe").await;
+    let wt_ok = command_available("wt.exe").await;
+    let powershell_ok = command_available("powershell.exe").await;
+    let distro_ok = wsl_distro_available(&commands.wsl_distro).await;
     let timestamp = timestamp_now();
     let manual_message = format!(
         "Could not open the login terminal automatically. Open WSL and run:\n{}",
@@ -3436,7 +3841,7 @@ fn launch_manual_mfa_terminal(
         };
     }
 
-    if let Err(error_message) = write_manual_mfa_scripts(&commands) {
+    if let Err(error_message) = write_manual_mfa_scripts(&commands).await {
         return ManualMfaTerminalLaunchResult {
             launched: false,
             method: TerminalLaunchMethod::Manual,
@@ -3445,7 +3850,7 @@ fn launch_manual_mfa_terminal(
             timestamp,
             command_preview: commands.manual_wsl_login_command.clone(),
             generated_script_path: commands.start_script_path.clone(),
-            script_file_exists: wsl_path_exists(&commands.start_script_path),
+            script_file_exists: wsl_path_exists(&commands.start_script_path).await,
             launch_method_attempted: "script_generation".to_string(),
             launch_error_code: String::new(),
             manual_wsl_command: commands.manual_wsl_login_command.clone(),
@@ -3457,7 +3862,7 @@ fn launch_manual_mfa_terminal(
         };
     }
 
-    let resolved_home = match resolve_wsl_home(&commands.wsl_distro) {
+    let resolved_home = match resolve_wsl_home(&commands.wsl_distro).await {
         Ok(home) => home,
         Err(error_message) => {
             return ManualMfaTerminalLaunchResult {
@@ -3496,7 +3901,7 @@ fn launch_manual_mfa_terminal(
     );
 
     if let Err(error_message) =
-        verify_wsl_login_script(&commands.wsl_distro, &resolved_start_script_path)
+        verify_wsl_login_script(&commands.wsl_distro, &resolved_start_script_path).await
     {
         return ManualMfaTerminalLaunchResult {
             launched: false,
@@ -3525,6 +3930,8 @@ fn launch_manual_mfa_terminal(
             &commands.host,
             &commands.wsl_key_path,
         );
+        // This is the single documented visible process exception: Manual MFA must open
+        // Windows Terminal so the user can type the Alliance password and approve Duo.
         match Command::new("wt.exe").args(&args).spawn() {
             Ok(_) => {
                 return ManualMfaTerminalLaunchResult {
@@ -3535,7 +3942,7 @@ fn launch_manual_mfa_terminal(
                     timestamp,
                     command_preview: commands.windows_terminal_command.clone(),
                     generated_script_path: commands.start_script_path.clone(),
-                    script_file_exists: wsl_path_exists(&commands.start_script_path),
+                    script_file_exists: wsl_path_exists(&commands.start_script_path).await,
                     launch_method_attempted: "windows_terminal".to_string(),
                     launch_error_code: String::new(),
                     manual_wsl_command: commands.manual_wsl_login_command.clone(),
@@ -3589,47 +3996,45 @@ fn launch_manual_mfa_terminal(
     }
 }
 
-fn command_available(program: &str) -> bool {
-    Command::new("where.exe")
-        .arg(program)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn wsl_distro_available(distro: &str) -> bool {
-    wsl_available_for_distro(distro)
-}
-
-fn wsl_available() -> bool {
-    wsl_available_for_distro(&default_wsl_distro())
-}
-
-fn wsl_available_for_distro(distro: &str) -> bool {
-    run_wsl_bash_script(distro, "printf 'ok\\n'", &[], Duration::from_secs(5))
+async fn command_available(program: &str) -> bool {
+    run_hidden_command("where.exe", &[program.to_string()], Duration::from_secs(5))
+        .await
         .map(|output| output.status == 0)
         .unwrap_or(false)
 }
 
-fn wsl_ssh_available() -> bool {
-    wsl_ssh_available_for_distro(&default_wsl_distro())
+async fn wsl_distro_available(distro: &str) -> bool {
+    wsl_available_for_distro(distro).await
 }
 
-fn wsl_ssh_available_for_distro(distro: &str) -> bool {
+async fn wsl_available() -> bool {
+    wsl_available_for_distro(&default_wsl_distro()).await
+}
+
+async fn wsl_available_for_distro(distro: &str) -> bool {
+    run_wsl_bash_script(distro, "printf 'ok\\n'", &[], Duration::from_secs(5))
+        .await
+        .map(|output| output.status == 0)
+        .unwrap_or(false)
+}
+
+async fn wsl_ssh_available() -> bool {
+    wsl_ssh_available_for_distro(&default_wsl_distro()).await
+}
+
+async fn wsl_ssh_available_for_distro(distro: &str) -> bool {
     run_wsl_bash_script(
         distro,
         "command -v ssh >/dev/null 2>&1",
         &[],
         Duration::from_secs(5),
     )
+    .await
     .map(|output| output.status == 0)
     .unwrap_or(false)
 }
 
-fn wsl_path_exists(path: &str) -> bool {
+async fn wsl_path_exists(path: &str) -> bool {
     let args = vec![path.to_string()];
     run_wsl_bash_script(
         &default_wsl_distro(),
@@ -3637,6 +4042,7 @@ fn wsl_path_exists(path: &str) -> bool {
         &args,
         Duration::from_secs(5),
     )
+    .await
     .map(|output| output.status == 0)
     .unwrap_or(false)
 }
@@ -3761,13 +4167,14 @@ fn classify_command_output(output: &CommandOutput, expected_stdout: Option<&str>
     }
 }
 
+#[allow(dead_code)]
 fn classify_manual_mfa_session_output(
     commands: &ManualMfaSessionCommands,
     check_output: &CommandOutput,
     auth_output: &CommandOutput,
 ) -> ManualMfaSessionResult {
     let combined = auth_output.combined();
-    let control_path_exists = wsl_path_exists(&commands.control_path);
+    let control_path_exists = false;
     let parsed = classify_manual_mfa_status(&combined, control_path_exists);
     if check_output.status == 0
         && auth_output.status == 0
@@ -3790,8 +4197,8 @@ fn classify_manual_mfa_session_output(
             last_session_test_exit_code: Some(auth_output.status),
             parsed_session_status: ManualMfaSessionStatus::Authenticated,
             selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
+            wsl_available: false,
+            wsl_ssh_available: false,
         }
     } else if matches!(parsed, ManualMfaSessionStatus::SessionNotReused) {
         ManualMfaSessionResult {
@@ -3809,8 +4216,8 @@ fn classify_manual_mfa_session_output(
             last_session_test_exit_code: Some(auth_output.status),
             parsed_session_status: ManualMfaSessionStatus::SessionNotReused,
             selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
+            wsl_available: false,
+            wsl_ssh_available: false,
         }
     } else if matches!(parsed, ManualMfaSessionStatus::ControlmasterUnsupported) {
         ManualMfaSessionResult {
@@ -3828,8 +4235,8 @@ fn classify_manual_mfa_session_output(
             last_session_test_exit_code: Some(auth_output.status),
             parsed_session_status: ManualMfaSessionStatus::ControlmasterUnsupported,
             selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
+            wsl_available: false,
+            wsl_ssh_available: false,
         }
     } else if matches!(parsed, ManualMfaSessionStatus::PermissionDenied) {
         ManualMfaSessionResult {
@@ -3847,8 +4254,8 @@ fn classify_manual_mfa_session_output(
             last_session_test_exit_code: Some(auth_output.status),
             parsed_session_status: ManualMfaSessionStatus::PermissionDenied,
             selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
+            wsl_available: false,
+            wsl_ssh_available: false,
         }
     } else if matches!(parsed, ManualMfaSessionStatus::SessionNotFound) {
         ManualMfaSessionResult {
@@ -3866,8 +4273,8 @@ fn classify_manual_mfa_session_output(
             last_session_test_exit_code: Some(auth_output.status),
             parsed_session_status: ManualMfaSessionStatus::SessionNotFound,
             selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
+            wsl_available: false,
+            wsl_ssh_available: false,
         }
     } else {
         ManualMfaSessionResult {
@@ -3885,12 +4292,13 @@ fn classify_manual_mfa_session_output(
             last_session_test_exit_code: Some(auth_output.status),
             parsed_session_status: ManualMfaSessionStatus::Failed,
             selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
+            wsl_available: false,
+            wsl_ssh_available: false,
         }
     }
 }
 
+#[allow(dead_code)]
 fn classify_manual_mfa_session_error(
     commands: &ManualMfaSessionCommands,
     check_message: &str,
@@ -3901,7 +4309,7 @@ fn classify_manual_mfa_session_error(
     } else {
         auth_message
     };
-    let control_path_exists = wsl_path_exists(&commands.control_path);
+    let control_path_exists = false;
     let parsed = classify_manual_mfa_status(message, control_path_exists);
     if matches!(parsed, ManualMfaSessionStatus::SessionNotReused) {
         ManualMfaSessionResult {
@@ -3919,8 +4327,8 @@ fn classify_manual_mfa_session_error(
             last_session_test_exit_code: None,
             parsed_session_status: ManualMfaSessionStatus::SessionNotReused,
             selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
+            wsl_available: false,
+            wsl_ssh_available: false,
         }
     } else {
         let status = parsed;
@@ -3945,12 +4353,13 @@ fn classify_manual_mfa_session_error(
             last_session_test_exit_code: None,
             parsed_session_status: status,
             selected_backend: "wsl",
-            wsl_available: wsl_available(),
-            wsl_ssh_available: wsl_ssh_available(),
+            wsl_available: false,
+            wsl_ssh_available: false,
         }
     }
 }
 
+#[allow(dead_code)]
 fn classify_manual_mfa_status(message: &str, control_path_exists: bool) -> ManualMfaSessionStatus {
     if is_controlmaster_unsupported_output(message) {
         ManualMfaSessionStatus::ControlmasterUnsupported
@@ -3974,6 +4383,7 @@ fn is_controlmaster_unsupported_output(message: &str) -> bool {
         || lower.contains("mux")
 }
 
+#[allow(dead_code)]
 fn is_control_path_missing_output(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("no such file or directory")
@@ -4334,7 +4744,7 @@ fn base64_decode(value: &str) -> Result<Vec<u8>, String> {
     }
 
     let clean = value.trim().as_bytes();
-    if clean.len() % 4 != 0 {
+    if !clean.len().is_multiple_of(4) {
         return Err("Downloaded base64 content has invalid length.".to_string());
     }
     let mut out = Vec::new();
@@ -4503,6 +4913,7 @@ fn is_interactive_login_required_output(output: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command as Proc;
 
     fn settings() -> NibiSettings {
         NibiSettings {
@@ -4614,6 +5025,433 @@ mod tests {
         let decoded = base64_decode(&encoded).unwrap();
 
         assert_eq!(String::from_utf8(decoded).unwrap(), text);
+    }
+
+    fn check_marker(id: &str, status: &str, code: i32, stdout: &str, stderr: &str) -> String {
+        format!(
+            "FLUORCAST_CHECK_V1|{id}|{status}|{code}|{}|{}",
+            base64_encode(stdout.as_bytes()),
+            base64_encode(stderr.as_bytes())
+        )
+    }
+
+    fn successful_environment_report() -> String {
+        let mut lines = EXPECTED_ENVIRONMENT_CHECK_IDS
+            .iter()
+            .map(|id| check_marker(id, "passed", 0, "ok", ""))
+            .collect::<Vec<_>>();
+        lines.push("FLUORCAST_CHECK_SUMMARY_V1|17".to_string());
+        lines.join("\n")
+    }
+
+    #[test]
+    fn expected_environment_check_ids_match_frontend_contract() {
+        assert_eq!(
+            EXPECTED_ENVIRONMENT_CHECK_IDS,
+            [
+                "authenticated_session",
+                "remote_project_path",
+                "remote_project_readable",
+                "remote_jobs_path",
+                "remote_jobs_writable",
+                "python_environment_exists",
+                "python_environment_runs",
+                "sbatch",
+                "squeue",
+                "sacct",
+                "prediction_entry_point",
+                "tree_model_artifacts",
+                "neural_model_artifacts",
+                "absorption_hybrid_artifacts",
+                "emission_hybrid_artifacts",
+                "quantum_yield_hybrid_artifacts",
+                "upload_read_delete_smoke",
+            ]
+        );
+        let unique = EXPECTED_ENVIRONMENT_CHECK_IDS
+            .iter()
+            .collect::<HashSet<_>>();
+        assert_eq!(unique.len(), 17);
+    }
+
+    #[test]
+    fn parses_all_valid_environment_markers_and_ignores_banner_text() {
+        let report = parse_environment_check_markers(&format!(
+            "Welcome to NIBI\n{}\nprofile text\n",
+            successful_environment_report()
+        ));
+
+        assert_eq!(report.parser_error, None);
+        assert_eq!(report.checks.len(), 17);
+        assert_eq!(report.missing_ids, Vec::<String>::new());
+        assert!(report.checks.iter().all(|check| check.status == "passed"));
+    }
+
+    #[test]
+    fn marker_order_does_not_affect_environment_id_mapping() {
+        let mut ids = EXPECTED_ENVIRONMENT_CHECK_IDS.to_vec();
+        ids.reverse();
+        let mut lines = ids
+            .iter()
+            .map(|id| check_marker(id, "passed", 0, id, ""))
+            .collect::<Vec<_>>();
+        lines.push("FLUORCAST_CHECK_SUMMARY_V1|17".to_string());
+
+        let report = parse_environment_check_markers(&lines.join("\n"));
+
+        assert_eq!(report.parser_error, None);
+        assert_eq!(report.checks[0].id, "upload_read_delete_smoke");
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|check| check.id == "authenticated_session")
+                .unwrap()
+                .stdout,
+            "authenticated_session"
+        );
+    }
+
+    #[test]
+    fn marker_fields_allow_empty_and_multiline_output() {
+        let report = parse_environment_check_markers(&format!(
+            "{}\n{}\nFLUORCAST_CHECK_SUMMARY_V1|17",
+            check_marker("authenticated_session", "passed", 0, "", ""),
+            EXPECTED_ENVIRONMENT_CHECK_IDS[1..]
+                .iter()
+                .map(|id| check_marker(id, "passed", 0, "line one\nline two", "err one\nerr two"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+
+        assert_eq!(report.parser_error, None);
+        let session = report
+            .checks
+            .iter()
+            .find(|check| check.id == "authenticated_session")
+            .unwrap();
+        assert_eq!(session.stdout, "");
+        assert_eq!(session.stderr, "");
+        let path = report
+            .checks
+            .iter()
+            .find(|check| check.id == "remote_project_path")
+            .unwrap();
+        assert_eq!(path.stdout, "line one\nline two");
+        assert_eq!(path.stderr, "err one\nerr two");
+    }
+
+    #[test]
+    fn parser_rejects_missing_duplicate_unknown_and_malformed_rows() {
+        let missing = parse_environment_check_markers("FLUORCAST_CHECK_SUMMARY_V1|17");
+        assert!(missing.parser_error.unwrap().contains("Missing check IDs"));
+
+        let duplicate = parse_environment_check_markers(&format!(
+            "{}\n{}\nFLUORCAST_CHECK_SUMMARY_V1|17",
+            successful_environment_report(),
+            check_marker("remote_project_path", "passed", 0, "", "")
+        ));
+        assert_eq!(duplicate.duplicate_ids, vec!["remote_project_path"]);
+        assert!(duplicate
+            .parser_error
+            .unwrap()
+            .contains("Duplicate check IDs"));
+
+        let unknown = parse_environment_check_markers(&format!(
+            "{}\n{}\nFLUORCAST_CHECK_SUMMARY_V1|17",
+            successful_environment_report(),
+            check_marker("unexpected_check", "passed", 0, "", "")
+        ));
+        assert_eq!(unknown.unknown_ids, vec!["unexpected_check"]);
+        assert!(unknown.parser_error.unwrap().contains("Unknown check IDs"));
+
+        let malformed = parse_environment_check_markers(&format!(
+            "{}\nFLUORCAST_CHECK_V1|remote_project_path|passed|0|only-five\nFLUORCAST_CHECK_V1\\tremote_project_path\\tpassed\\t0\\tbad\\tbad\nFLUORCAST_CHECK_SUMMARY_V1|17",
+            successful_environment_report()
+        ));
+        assert!(!malformed.malformed_rows.is_empty());
+        assert!(malformed
+            .parser_error
+            .unwrap()
+            .contains("Malformed result rows"));
+    }
+
+    #[test]
+    fn malformed_base64_marker_does_not_create_check_result() {
+        let mut lines = EXPECTED_ENVIRONMENT_CHECK_IDS
+            .iter()
+            .map(|id| check_marker(id, "passed", 0, "ok", ""))
+            .collect::<Vec<_>>();
+        lines[1] = "FLUORCAST_CHECK_V1|remote_project_path|passed|0|not-valid!|".to_string();
+        lines.push("FLUORCAST_CHECK_SUMMARY_V1|17".to_string());
+
+        let report = parse_environment_check_markers(&lines.join("\n"));
+
+        assert!(report
+            .parser_error
+            .as_deref()
+            .unwrap()
+            .contains("Malformed result rows"));
+        assert!(report
+            .checks
+            .iter()
+            .all(|check| check.id != "remote_project_path"));
+        assert_eq!(report.missing_ids, vec!["remote_project_path"]);
+    }
+
+    #[test]
+    fn a_genuine_failed_check_does_not_hide_later_results() {
+        let mut lines = EXPECTED_ENVIRONMENT_CHECK_IDS
+            .iter()
+            .map(|id| {
+                if *id == "remote_project_path" {
+                    check_marker(id, "failed", 1, "", "missing")
+                } else {
+                    check_marker(id, "passed", 0, "ok", "")
+                }
+            })
+            .collect::<Vec<_>>();
+        lines.push("FLUORCAST_CHECK_SUMMARY_V1|17".to_string());
+
+        let report = parse_environment_check_markers(&lines.join("\n"));
+
+        assert_eq!(report.parser_error, None);
+        assert_eq!(report.checks.len(), 17);
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .find(|check| check.id == "upload_read_delete_smoke")
+                .unwrap()
+                .status,
+            "passed"
+        );
+    }
+
+    #[test]
+    fn environment_script_uses_versioned_markers_json_config_and_stdin_for_remote_ssh() {
+        let script = manual_mfa_environment_checks_script();
+        let remote_ssh_line = script
+            .lines()
+            .find(|line| line.contains("bash -s -- \"$CONFIG_B64\""))
+            .unwrap();
+
+        assert!(script.contains("FLUORCAST_CHECK_V1|%s|%s|%s|%s|%s"));
+        assert!(script.contains("FLUORCAST_CHECK_SUMMARY_V1|17"));
+        assert!(script.contains("CONFIG_B64=\"$2\""));
+        assert!(script.contains("json.loads"));
+        assert!(script.contains("set +e"));
+        assert!(!script.contains("set -e"));
+        assert!(!remote_ssh_line.contains("ssh -n"));
+        assert!(remote_ssh_line.contains("ssh -S \"$CTL\""));
+        assert!(script.contains("-o BatchMode=yes"));
+    }
+
+    #[test]
+    fn environment_remote_script_runner_error_does_not_fabricate_environment_failures() {
+        let report = run_environment_remote_script_fixture(None).unwrap();
+
+        assert_ne!(report.status.code(), Some(0));
+        let parsed = parse_environment_check_markers(&String::from_utf8_lossy(&report.stdout));
+
+        assert_eq!(parsed.checks.len(), 0);
+        assert!(parsed
+            .parser_error
+            .as_deref()
+            .unwrap()
+            .contains("Missing check IDs"));
+        assert!(String::from_utf8_lossy(&report.stderr).contains("missing_config"));
+    }
+
+    #[test]
+    fn environment_remote_script_fixture_returns_all_checks_and_keeps_running_after_failure() {
+        let fixture = create_environment_script_fixture();
+        let config = EnvironmentCheckConfig {
+            remote_project_path: &fixture.project,
+            remote_jobs_path: &fixture.jobs,
+            python_environment_path: &fixture.python,
+        };
+        let config_json = serde_json::to_string(&config).unwrap();
+        let passed_output = run_environment_remote_script_fixture(Some((
+            &base64_encode(config_json.as_bytes()),
+            &fixture.bin,
+            &fixture.home,
+        )))
+        .unwrap();
+        assert_eq!(passed_output.status.code(), Some(0));
+        let mut passed_lines = environment_script_full_report_stdout(&passed_output.stdout);
+        passed_lines.push_str("\nFLUORCAST_CHECK_SUMMARY_V1|17");
+        let passed = parse_environment_check_markers(&passed_lines);
+
+        assert_eq!(passed.parser_error, None);
+        assert_eq!(passed.checks.len(), 17);
+        assert!(
+            passed.checks.iter().all(|check| check.status == "passed"),
+            "failed checks: {:?}",
+            passed
+                .checks
+                .iter()
+                .filter(|check| check.status != "passed")
+                .map(|check| (&check.id, &check.stderr))
+                .collect::<Vec<_>>()
+        );
+
+        let remove_status = Proc::new("bash")
+            .arg("-lc")
+            .arg(format!(
+                "rm -rf '{}'",
+                fixture.emission_model.replace('\'', "'\\''")
+            ))
+            .status()
+            .unwrap();
+        assert!(remove_status.success());
+        let failed_output = run_environment_remote_script_fixture(Some((
+            &base64_encode(config_json.as_bytes()),
+            &fixture.bin,
+            &fixture.home,
+        )))
+        .unwrap();
+        assert_eq!(failed_output.status.code(), Some(0));
+        let mut failed_lines = environment_script_full_report_stdout(&failed_output.stdout);
+        failed_lines.push_str("\nFLUORCAST_CHECK_SUMMARY_V1|17");
+        let failed = parse_environment_check_markers(&failed_lines);
+
+        assert_eq!(failed.parser_error, None);
+        assert_eq!(failed.checks.len(), 17);
+        assert_eq!(
+            failed
+                .checks
+                .iter()
+                .find(|check| check.id == "emission_hybrid_artifacts")
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            failed
+                .checks
+                .iter()
+                .find(|check| check.id == "quantum_yield_hybrid_artifacts")
+                .unwrap()
+                .status,
+            "passed"
+        );
+        assert_eq!(
+            failed
+                .checks
+                .iter()
+                .find(|check| check.id == "upload_read_delete_smoke")
+                .unwrap()
+                .status,
+            "passed"
+        );
+    }
+
+    struct EnvironmentScriptFixture {
+        project: String,
+        jobs: String,
+        python: String,
+        bin: String,
+        home: String,
+        emission_model: String,
+    }
+
+    fn create_environment_script_fixture() -> EnvironmentScriptFixture {
+        let setup = r#"
+set -eu
+root="$(mktemp -d "${TMPDIR:-/tmp}/fluorcast-env.XXXXXX")"
+project="$root/project"
+jobs="$root/jobs"
+bin="$root/bin"
+home="$root/home"
+python="$root/python"
+mkdir -p "$project/scripts" "$jobs" "$bin" "$home"
+mkdir -p "$project/models/experiments_fluodb"
+mkdir -p "$project/models/neural_experiments_fluodb"
+mkdir -p "$project/models/production_hybrid/absorption_nm"
+mkdir -p "$project/models/production_hybrid/emission_nm"
+mkdir -p "$project/models/production_hybrid/quantum_yield"
+printf '#!/usr/bin/env bash\nprintf "Python 3.11.0\\n"\n' > "$python"
+chmod +x "$python"
+printf '# prediction\n' > "$project/scripts/run_prediction_job.py"
+for tool in sbatch squeue sacct; do
+  printf '#!/usr/bin/env bash\nprintf "%s\\n" "$0"\n' > "$bin/$tool"
+  chmod +x "$bin/$tool"
+done
+printf 'export PATH="%s:$PATH"\n' "$bin" > "$home/.profile"
+printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$project" "$jobs" "$python" "$bin" "$home" "$project/models/production_hybrid/emission_nm"
+"#;
+        let output = Proc::new("bash")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().unwrap().write_all(setup.as_bytes())?;
+                child.wait_with_output()
+            })
+            .expect("bash is required for the environment-check script fixture");
+        assert!(
+            output.status.success(),
+            "fixture setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lines = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 6);
+        EnvironmentScriptFixture {
+            project: lines[0].clone(),
+            jobs: lines[1].clone(),
+            python: lines[2].clone(),
+            bin: lines[3].clone(),
+            home: lines[4].clone(),
+            emission_model: lines[5].clone(),
+        }
+    }
+
+    fn run_environment_remote_script_fixture(
+        config_and_path: Option<(&str, &str, &str)>,
+    ) -> std::io::Result<std::process::Output> {
+        let mut command = Proc::new("bash");
+        command
+            .arg("-s")
+            .arg("--")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let script = if let Some((config_b64, bin, home)) = config_and_path {
+            command.arg(config_b64).env("HOME", home);
+            format!(
+                "PATH='{}':$PATH\n{}",
+                bin.replace('\'', "'\\''"),
+                manual_mfa_environment_checks_remote_script()
+            )
+        } else {
+            manual_mfa_environment_checks_remote_script()
+        };
+        if let Some((_, _, home)) = config_and_path {
+            command.env("HOME", home);
+        }
+        let mut child = command.spawn()?;
+        child.stdin.take().unwrap().write_all(script.as_bytes())?;
+        child.wait_with_output()
+    }
+
+    fn environment_script_full_report_stdout(remote_stdout: &[u8]) -> String {
+        format!(
+            "{}\n{}",
+            check_marker(
+                "authenticated_session",
+                "passed",
+                0,
+                "FLUORCAST_AUTH_OK",
+                ""
+            ),
+            String::from_utf8_lossy(remote_stdout)
+        )
     }
 
     #[test]
@@ -5156,7 +5994,7 @@ mod tests {
         let invocation = build_wsl_bash_script_invocation(
             &commands.wsl_distro,
             &commands.check_script_content,
-            &[commands.host.clone()],
+            std::slice::from_ref(&commands.host),
         );
 
         assert_eq!(invocation.program, "wsl.exe");
@@ -5183,8 +6021,8 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn program_runner_keeps_streams_exit_code_and_timeout_distinct() {
+    #[tokio::test]
+    async fn program_runner_keeps_streams_exit_code_and_timeout_distinct() {
         let echo = run_program_with_stdin_timeout(
             "powershell.exe",
             &[
@@ -5195,6 +6033,7 @@ mod tests {
             "script-over-stdin",
             Duration::from_secs(5),
         )
+        .await
         .unwrap();
 
         assert_eq!(echo.status, 7);
@@ -5212,6 +6051,7 @@ mod tests {
             "",
             Duration::from_millis(100),
         )
+        .await
         .unwrap();
 
         assert_eq!(timed_out.status, 124);
@@ -5272,10 +6112,11 @@ mod tests {
         assert!(!invocation.stdin.contains(remote_jobs_path));
     }
 
-    #[test]
-    fn upload_smoke_empty_jobs_path_returns_exit_30_and_is_not_quoted_empty_string() {
+    #[tokio::test]
+    async fn upload_smoke_empty_jobs_path_returns_exit_30_and_is_not_quoted_empty_string() {
         let result =
             run_manual_mfa_upload_smoke_test_result(&settings(), &upload_smoke_command_spec(""))
+                .await
                 .unwrap();
 
         assert_eq!(result.exit_code, 30);
@@ -6071,5 +6912,22 @@ mod tests {
         assert!(invocation.stdin.contains("SLURM_ID=\"$3\""));
         assert!(invocation.stdin.contains("MARKER_ERROR=PATH_EMPTY"));
         assert!(invocation.stdin.contains("ssh \\\n  -n \\\n"));
+    }
+
+    #[test]
+    fn direct_command_new_is_limited_to_documented_visible_terminal_exception() {
+        let source = include_str!("nibi.rs");
+        let pattern = ["Command", "::", "new"].join("");
+        let direct_command_lines = source
+            .lines()
+            .filter(|line| line.contains(&pattern))
+            .collect::<Vec<_>>();
+
+        let expected = format!(
+            "        match {}(\"wt.exe\").args(&args).spawn() {{",
+            pattern
+        );
+        assert_eq!(direct_command_lines, vec![expected.as_str()]);
+        assert!(source.contains("single documented visible process exception"));
     }
 }
