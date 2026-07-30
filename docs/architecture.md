@@ -16,9 +16,22 @@ Job metadata and status snapshots will be stored locally on the researcher's com
 
 A Rust-side connector will use SSH for remote commands, SFTP for file transfer, and Slurm commands for job submission and status. Its responsibilities are to create a remote job directory, upload `input.json`, submit the model repository's prediction entrypoint, poll job state, and download `output.json` and relevant logs. The connector boundary keeps remote-system details out of React components.
 
-On Windows, only the Manual MFA password/Duo login terminal is intentionally visible. All background subprocesses, including WSL, SSH, SCP, capability probes, Slurm commands, uploads, downloads, polling, cleanup, and log/result retrieval, must use the centralized Rust hidden process runner in `src-tauri/src/process.rs`. Adding direct background `Command::new` calls outside that runner is prohibited; the documented `wt.exe` Manual MFA launcher is the only visible exception.
+On Windows, only the Manual MFA password/Duo login terminal is intentionally visible. All background subprocesses, including WSL, SSH, SCP, PuTTY `plink.exe`, PuTTY `pscp.exe`, capability probes, Slurm commands, uploads, downloads, polling, cleanup, and log/result retrieval, must use the centralized Rust hidden process runner in `src-tauri/src/process.rs`. Adding direct background `Command::new` calls outside that runner is prohibited; the documented WSL launcher and the Native Windows `putty.exe` Manual MFA launcher are the only visible exceptions.
 
-Remote environment checks are batched into one frontend invoke and one backend WSL operation that reuses the authenticated SSH ControlMaster socket for one remote shell session. Production installer testing is required for process-window behavior because GUI release executables can differ from development mode.
+Remote environment checks are batched into one frontend invoke and one backend transport operation that reuses the authenticated SSH session for one remote shell session. Production installer testing is required for process-window behavior because GUI release executables can differ from development mode.
+
+The NIBI connector resolves `manual_mfa_ssh_transport` in Rust:
+
+- `auto`: use WSL only when `wsl.exe` exists, the configured distribution exists, and `bash` runs; otherwise use packaged PuTTY tools when all required executables exist.
+- `wsl_open_ssh`: use the existing WSL OpenSSH ControlMaster workflow.
+- `putty`: use packaged PuTTY 0.84 64-bit Windows executables.
+
+The frontend receives a structured capability result containing requested and
+resolved transport, WSL probe state, PuTTY resource state, support status, a
+user-facing message, and sanitized technical detail. Native Windows mode opens
+one visible `putty.exe` window for password and Duo, then uses hidden,
+non-interactive `plink.exe` and `pscp.exe` operations that require the existing
+shared upstream. Passwords and Duo responses are never stored.
 
 ### Prediction engine
 

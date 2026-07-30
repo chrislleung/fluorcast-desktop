@@ -12,8 +12,8 @@ The application accepts a chromophore SMILES string and solvent information, sub
 
 FluorCast Desktop is built with Tauri, React, TypeScript, Rust, and SQLite.
 
-> **Current platform:** Windows 10/11 with WSL2  
-> **Remote compute:** NIBI through the Digital Research Alliance of Canada  
+> **Current platform:** Windows 10/11 with optional WSL2 or packaged Native Windows SSH
+> **Remote compute:** NIBI through the Digital Research Alliance of Canada
 > **Authentication:** SSH plus Duo multi-factor authentication for normal user accounts
 
 ## Release v1 provisioning model
@@ -41,7 +41,7 @@ desktop-specific commands and readiness checklist.
 2. [Connection modes](#connection-modes)
 3. [Requirements](#requirements)
 4. [Install the desktop application](#install-the-desktop-application)
-5. [Install and configure WSL2](#install-and-configure-wsl2)
+5. [Choose an SSH transport](#choose-an-ssh-transport)
 6. [Create an SSH key in WSL](#create-an-ssh-key-in-wsl)
 7. [Add the SSH key to your Alliance account](#add-the-ssh-key-to-your-alliance-account)
 8. [Prepare FluorCast on NIBI](#prepare-fluorcast-on-nibi)
@@ -65,7 +65,7 @@ FluorCast separates the desktop interface from the compute-intensive prediction 
 ```text
 Windows desktop app
         |
-        | WSL2 + SSH
+        | WSL OpenSSH or Native Windows SSH
         v
 NIBI login node
         |
@@ -109,10 +109,16 @@ Use mock mode for interface testing and demonstrations.
 
 This is the normal mode for individual Alliance users.
 
-- The app starts an SSH session inside WSL2.
+- Automatic transport uses WSL only when `wsl.exe`, the configured distribution,
+  and `bash` all work; otherwise it can use packaged PuTTY tools.
+- WSL transport uses the existing WSL OpenSSH ControlMaster workflow.
+- Native Windows transport opens one visible PuTTY window. WSL is not required.
 - You authenticate using your Alliance password and Duo.
-- The authenticated SSH ControlMaster session is reused for later app actions.
+- The authenticated reusable SSH session is reused for later app actions.
 - You normally authenticate once per app session.
+
+Background NIBI operations run hidden and non-interactively. FluorCast does not
+store passwords or Duo responses.
 
 ### Robot automation
 
@@ -129,12 +135,11 @@ This mode is intended only for approved non-interactive Alliance robot accounts.
 Before using production predictions, you need:
 
 - Windows 10 or Windows 11;
-- administrator access for installing WSL2;
 - a Digital Research Alliance of Canada account;
 - access to NIBI;
 - Duo multi-factor authentication configured for the Alliance account;
-- an Ubuntu WSL distribution;
-- an SSH key stored inside WSL;
+- either a working Ubuntu WSL distribution for WSL transport or packaged PuTTY
+  resources for Native Windows transport;
 - a working FluorCast checkout and Python environment on NIBI;
 - internet access.
 
@@ -160,7 +165,19 @@ For mock mode, only the desktop application is required.
 
 ---
 
-## Install and configure WSL2
+## Choose an SSH transport
+
+Automatic mode uses WSL when available and falls back to the packaged Native
+Windows SSH transport when PuTTY resources are staged. Explicit WSL mode requires
+`wsl.exe`, the configured distribution, and `bash` to work. Explicit Native
+Windows mode requires `putty.exe`, `plink.exe`, and `pscp.exe` packaged with the
+app.
+
+When WSL is unavailable, FluorCast shows a compatibility message and keeps mock
+mode, settings, job history, result history, notes, deletion, and appearance
+features available.
+
+### Install and configure WSL2
 
 Open PowerShell as Administrator:
 
@@ -526,7 +543,10 @@ FluorCast Desktop is designed so that:
 - the Alliance password is not stored by the app;
 - Duo approval remains under the user’s control;
 - the SSH private key remains on the user’s computer;
-- authentication is performed through WSL and SSH;
+- authentication is performed through WSL OpenSSH or the packaged PuTTY tools;
+- one visible PuTTY login window is expected in Native Windows mode;
+- background commands are hidden and non-interactive;
+- host keys are never silently replaced by background operations;
 - job history and settings are stored locally in SQLite;
 - remote prediction inputs and outputs are stored in the configured NIBI job directory.
 
@@ -746,6 +766,15 @@ npm run lint
 npm run build
 ```
 
+Prepare packaged PuTTY resources for Native Windows SSH:
+
+```powershell
+scripts\prepare-putty-resources.ps1
+```
+
+Release builds fail clearly if `putty.exe`, `plink.exe`, or `pscp.exe` is
+missing from `src-tauri\resources\putty`.
+
 Build the Tauri packages:
 
 ```powershell
@@ -815,6 +844,7 @@ Before publishing a downloadable build:
 - [ ] Run the full test suite.
 - [ ] Run `npm run lint`.
 - [ ] Run `npm run build`.
+- [ ] Run `scripts\prepare-putty-resources.ps1`.
 - [ ] Run `npm run tauri build`.
 - [ ] Install the generated package on a clean Windows test account or virtual machine.
 - [ ] Test mock mode.
@@ -841,7 +871,7 @@ Before publishing a downloadable build:
 
 Current limitations may include:
 
-- Windows and WSL2 are required for the supported desktop workflow.
+- Remote NIBI predictions require either working WSL OpenSSH or packaged Native Windows SSH resources.
 - Normal NIBI accounts require interactive password and Duo authentication.
 - Robot automation requires separate institutional approval.
 - Production predictions require a separately configured FluorCast environment on NIBI.

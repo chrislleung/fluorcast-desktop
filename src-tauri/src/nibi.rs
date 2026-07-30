@@ -4,7 +4,7 @@ use crate::process::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
@@ -24,11 +24,19 @@ static PERSISTENT_SHELL: OnceLock<Mutex<Option<PersistentShell>>> = OnceLock::ne
 static MANUAL_MFA_TERMINAL_LAUNCH: OnceLock<Mutex<bool>> = OnceLock::new();
 static ENVIRONMENT_CHECK_RUN: OnceLock<Mutex<bool>> = OnceLock::new();
 
+const PUTTY_VERSION: &str = "0.84";
+const PUTTY_SESSION_NAME: &str = "FluorCast-NIBI";
+const MISSING_UPSTREAM_MESSAGE: &str = "Start the NIBI session before running this operation.";
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct NibiSettings {
     #[serde(default = "default_manual_mfa_provider")]
     manual_mfa_provider: String,
+    #[serde(default = "default_nibi_transport")]
+    manual_mfa_ssh_transport: NibiTransport,
+    #[serde(default)]
+    manual_mfa_ssh_backend: String,
     nibi_username: String,
     #[serde(default = "default_normal_login_host")]
     normal_login_host: String,
@@ -55,6 +63,41 @@ pub struct NibiSettings {
     manual_ssh_login_confirmed: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NibiTransport {
+    Auto,
+    WslOpenSsh,
+    Putty,
+}
+
+fn default_nibi_transport() -> NibiTransport {
+    NibiTransport::Auto
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedNibiTransport {
+    WslOpenSsh,
+    Putty,
+    Unsupported,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct NibiTransportCapability {
+    requested_transport: NibiTransport,
+    resolved_transport: ResolvedNibiTransport,
+    wsl_executable_found: bool,
+    wsl_distribution_found: bool,
+    wsl_bash_works: bool,
+    putty_found: bool,
+    plink_found: bool,
+    pscp_found: bool,
+    supported: bool,
+    user_message: String,
+    technical_detail: String,
+}
+
 impl NibiSettings {
     fn private_key_path(&self) -> &str {
         if self.ssh_private_key_path.trim().is_empty() {
@@ -78,6 +121,13 @@ impl NibiSettings {
 
     fn uses_persistent_shell(&self) -> bool {
         self.manual_mfa_provider.trim() == "persistent_shell"
+    }
+
+    fn requested_transport(&self) -> NibiTransport {
+        if self.manual_mfa_ssh_backend.trim() == "putty" {
+            return NibiTransport::Putty;
+        }
+        self.manual_mfa_ssh_transport
     }
 }
 
@@ -291,7 +341,7 @@ impl Default for ManualMfaSessionDiagnostics {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum ManualMfaSessionStatus {
@@ -604,13 +654,29 @@ pub async fn run_nibi_remote_command(
     }
     let remote_command = structured_remote_command_to_shell(&command_spec)?;
     if mode == "interactive_mfa" {
-        return run_manual_mfa_remote_command_result(
-            &settings,
-            &remote_command,
-            command_spec.label,
-            command_spec.redacted_preview,
-        )
-        .await;
+        return match resolve_manual_mfa_transport(&settings).await? {
+            ResolvedNibiTransport::WslOpenSsh => {
+                run_manual_mfa_remote_command_result(
+                    &settings,
+                    &remote_command,
+                    command_spec.label,
+                    command_spec.redacted_preview,
+                )
+                .await
+            }
+            ResolvedNibiTransport::Putty => {
+                run_putty_remote_command_result(
+                    &settings,
+                    &remote_command,
+                    command_spec.label,
+                    command_spec.redacted_preview,
+                )
+                .await
+            }
+            ResolvedNibiTransport::Unsupported => {
+                Err("Setup required: no usable SSH transport.".to_string())
+            }
+        };
     }
     let invocation = if mode == "robot_automation" {
         build_robot_remote_invocation(&settings, &remote_command)?
@@ -644,7 +710,17 @@ pub async fn run_nibi_environment_checks(
     }
 
     let result = if mode == "interactive_mfa" {
-        run_manual_mfa_environment_checks(&settings, &started_at, started).await
+        match resolve_manual_mfa_transport(&settings).await? {
+            ResolvedNibiTransport::WslOpenSsh => {
+                run_manual_mfa_environment_checks(&settings, &started_at, started).await
+            }
+            ResolvedNibiTransport::Putty => {
+                run_putty_environment_checks(&settings, &started_at, started).await
+            }
+            ResolvedNibiTransport::Unsupported => {
+                Err("Setup required: no usable SSH transport.".to_string())
+            }
+        }
     } else {
         Err(
             "Batched environment checks currently require Manual MFA ControlMaster mode."
@@ -682,7 +758,17 @@ pub async fn upload_nibi_file(
         return Ok(());
     }
     if mode == "interactive_mfa" {
-        return upload_file_via_wsl_scp(&settings, &local_path, &remote_path).await;
+        return match resolve_manual_mfa_transport(&settings).await? {
+            ResolvedNibiTransport::WslOpenSsh => {
+                upload_file_via_wsl_scp(&settings, &local_path, &remote_path).await
+            }
+            ResolvedNibiTransport::Putty => {
+                upload_file_via_putty_pscp(&settings, &local_path, &remote_path).await
+            }
+            ResolvedNibiTransport::Unsupported => {
+                Err("Setup required: no usable SSH transport.".to_string())
+            }
+        };
     }
     let target = if mode == "robot_automation" {
         build_robot_scp_target(&settings, &local_path, &remote_path)?
@@ -716,7 +802,17 @@ pub async fn download_nibi_file(
         return Ok(());
     }
     if mode == "interactive_mfa" {
-        return download_file_via_wsl_scp(&settings, &remote_path, &local_path).await;
+        return match resolve_manual_mfa_transport(&settings).await? {
+            ResolvedNibiTransport::WslOpenSsh => {
+                download_file_via_wsl_scp(&settings, &remote_path, &local_path).await
+            }
+            ResolvedNibiTransport::Putty => {
+                download_file_via_putty_pscp(&settings, &remote_path, &local_path).await
+            }
+            ResolvedNibiTransport::Unsupported => {
+                Err("Setup required: no usable SSH transport.".to_string())
+            }
+        };
     }
     let source = if mode == "robot_automation" {
         build_robot_download_target(&settings, &remote_path, &local_path)?
@@ -738,6 +834,9 @@ pub fn get_manual_mfa_session_commands(
     settings: NibiSettings,
 ) -> Result<ManualMfaSessionCommands, String> {
     validate_manual_login_settings(&settings)?;
+    if settings.requested_transport() == NibiTransport::Putty {
+        return Ok(build_putty_manual_mfa_session_commands(&settings));
+    }
     build_manual_mfa_session_commands(&settings)
 }
 
@@ -756,6 +855,14 @@ pub async fn open_manual_mfa_login(
         }
         *running = true;
     }
+    let resolved_transport = resolve_manual_mfa_transport(&settings).await?;
+    if resolved_transport == ResolvedNibiTransport::Putty {
+        let commands = build_putty_manual_mfa_session_commands(&settings);
+        return open_putty_manual_mfa_login(&settings, commands);
+    }
+    if resolved_transport == ResolvedNibiTransport::Unsupported {
+        return Err("Setup required: no usable SSH transport.".to_string());
+    }
     let commands = build_manual_mfa_session_commands(&settings)?;
     let result = launch_manual_mfa_terminal(commands).await;
     if let Ok(mut running) = MANUAL_MFA_TERMINAL_LAUNCH
@@ -772,6 +879,13 @@ pub async fn clean_stale_manual_mfa_session(
     settings: NibiSettings,
 ) -> Result<ManualMfaSessionResult, String> {
     validate_manual_login_settings(&settings)?;
+    match resolve_manual_mfa_transport(&settings).await? {
+        ResolvedNibiTransport::Putty => return close_putty_shared_session(&settings).await,
+        ResolvedNibiTransport::Unsupported => {
+            return Err("Setup required: no usable SSH transport.".to_string())
+        }
+        ResolvedNibiTransport::WslOpenSsh => {}
+    }
     let commands = build_manual_mfa_session_commands(&settings)?;
     let args = vec![commands.host.clone()];
     match run_wsl_bash_script(
@@ -838,6 +952,15 @@ pub async fn test_manual_mfa_session(
     settings: NibiSettings,
 ) -> Result<ManualMfaSessionResult, String> {
     validate_manual_login_settings(&settings)?;
+    match resolve_manual_mfa_transport(&settings).await? {
+        ResolvedNibiTransport::Putty => {
+            return Ok(test_putty_manual_mfa_session(&settings).await);
+        }
+        ResolvedNibiTransport::Unsupported => {
+            return Err("Setup required: no usable SSH transport.".to_string())
+        }
+        ResolvedNibiTransport::WslOpenSsh => {}
+    }
     let commands = build_manual_mfa_session_commands(&settings)?;
     Ok(run_manual_mfa_session_readiness(&commands).await)
 }
@@ -1077,6 +1200,11 @@ pub async fn check_local_ssh_capabilities() -> LocalSshCapabilitiesResult {
         syntax_exit_code,
         recommendation,
     }
+}
+
+#[tauri::command]
+pub async fn detect_nibi_transport(settings: NibiSettings) -> NibiTransportCapability {
+    detect_nibi_transport_capability(&settings).await
 }
 
 #[tauri::command]
@@ -2514,6 +2642,417 @@ fn build_manual_mfa_remote_command_invocation(
     )
 }
 
+async fn upload_file_via_putty_pscp(
+    settings: &NibiSettings,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<(), String> {
+    validate_manual_login_settings(settings)?;
+    validate_remote_path_under_jobs(remote_path, &settings.remote_jobs_path)?;
+    if !Path::new(local_path).is_file() {
+        return Err(format!(
+            "Local upload file was not found: {}",
+            safe_diagnostic_value(local_path)
+        ));
+    }
+    let readiness = test_putty_manual_mfa_session(settings).await;
+    if !readiness.can_run_background_commands {
+        return Err(readiness.message);
+    }
+    let pscp = putty_tool_path("pscp.exe");
+    let target = format!(
+        "{}@{}:{}",
+        settings.nibi_username.trim(),
+        settings.manual_login_host(),
+        remote_path
+    );
+    let args = vec![
+        "-batch".to_string(),
+        "-share".to_string(),
+        "-P".to_string(),
+        "22".to_string(),
+        local_path.to_string(),
+        target,
+    ];
+    let output = run_hidden_command(pscp.to_string_lossy().as_ref(), &args, WSL_SCRIPT_TIMEOUT)
+        .await
+        .map_err(|error| format!("Could not start native Windows upload: {error}"))?;
+    if output.status == 0 {
+        Ok(())
+    } else {
+        Err(output.stderr)
+    }
+}
+
+async fn download_file_via_putty_pscp(
+    settings: &NibiSettings,
+    remote_path: &str,
+    local_path: &str,
+) -> Result<(), String> {
+    validate_manual_login_settings(settings)?;
+    validate_remote_path_under_jobs(remote_path, &settings.remote_jobs_path)?;
+    let readiness = test_putty_manual_mfa_session(settings).await;
+    if !readiness.can_run_background_commands {
+        return Err(readiness.message);
+    }
+    let pscp = putty_tool_path("pscp.exe");
+    let source = format!(
+        "{}@{}:{}",
+        settings.nibi_username.trim(),
+        settings.manual_login_host(),
+        remote_path
+    );
+    let args = vec![
+        "-batch".to_string(),
+        "-share".to_string(),
+        "-P".to_string(),
+        "22".to_string(),
+        source,
+        local_path.to_string(),
+    ];
+    let output = run_hidden_command(pscp.to_string_lossy().as_ref(), &args, WSL_SCRIPT_TIMEOUT)
+        .await
+        .map_err(|error| format!("Could not start native Windows download: {error}"))?;
+    if output.status == 0 {
+        Ok(())
+    } else {
+        Err(output.stderr)
+    }
+}
+
+fn build_putty_manual_mfa_session_commands(settings: &NibiSettings) -> ManualMfaSessionCommands {
+    let target = format!(
+        "{}@{}",
+        settings.nibi_username.trim(),
+        settings.manual_login_host()
+    );
+    let login_command = format!(
+        "putty.exe -ssh -P 22 -l <nibi_username> -share {}",
+        settings.manual_login_host()
+    );
+    ManualMfaSessionCommands {
+        backend: "putty",
+        control_path: PUTTY_SESSION_NAME.to_string(),
+        control_socket_filename: PUTTY_SESSION_NAME.to_string(),
+        control_path_exists: false,
+        script_dir: String::new(),
+        start_script_path: String::new(),
+        check_script_path: String::new(),
+        end_script_path: String::new(),
+        clean_script_path: String::new(),
+        wsl_distro: String::new(),
+        wsl_key_path: String::new(),
+        host: target,
+        wsl_setup_key_commands: String::new(),
+        clean_stale_session_command: "plink.exe -batch -share -N -O exit <nibi_target>".to_string(),
+        windows_terminal_command: String::new(),
+        powershell_launch_command: String::new(),
+        login_command: login_command.clone(),
+        clean_script_content: String::new(),
+        check_script_content: String::new(),
+        end_script_content: String::new(),
+        check_command: "plink.exe -batch -shareexists <nibi_target>".to_string(),
+        test_command: "plink.exe -batch -share <nibi_target> printf FLUORCAST_AUTH_OK".to_string(),
+        end_command: "plink.exe -batch -share -N -O exit <nibi_target>".to_string(),
+        background_command_template: "plink.exe -batch -share <nibi_target> <remote_command>"
+            .to_string(),
+        manual_wsl_login_command: String::new(),
+        redacted_login_command_preview: login_command,
+        redacted_test_command_preview: "plink.exe -batch -shareexists <nibi_target>".to_string(),
+        redacted_end_command_preview: "plink.exe -batch -share -N -O exit <nibi_target>"
+            .to_string(),
+    }
+}
+
+fn putty_resource_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let bundled = parent.join("resources").join("putty");
+            if bundled.exists() {
+                return bundled;
+            }
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("putty")
+}
+
+fn putty_tool_path(name: &str) -> PathBuf {
+    putty_resource_dir().join(name)
+}
+
+fn putty_tool_exists(name: &str) -> bool {
+    putty_tool_path(name).is_file()
+}
+
+fn putty_args_base(settings: &NibiSettings) -> Vec<String> {
+    vec![
+        "-batch".to_string(),
+        "-share".to_string(),
+        "-P".to_string(),
+        "22".to_string(),
+        "-l".to_string(),
+        settings.nibi_username.trim().to_string(),
+        settings.manual_login_host().to_string(),
+    ]
+}
+
+fn putty_readiness_args(settings: &NibiSettings) -> Vec<String> {
+    vec![
+        "-batch".to_string(),
+        "-shareexists".to_string(),
+        "-P".to_string(),
+        "22".to_string(),
+        "-l".to_string(),
+        settings.nibi_username.trim().to_string(),
+        settings.manual_login_host().to_string(),
+    ]
+}
+
+fn classify_putty_output(output: &CommandOutput) -> (&'static str, ManualMfaSessionStatus, String) {
+    let combined = output.combined();
+    let lower = combined.to_lowercase();
+    if output.timed_out || output.status == 124 {
+        return (
+            "timeout",
+            ManualMfaSessionStatus::Timeout,
+            "The native Windows SSH session test timed out.".to_string(),
+        );
+    }
+    if lower.contains("host key is not cached")
+        || lower.contains("host key did not appear")
+        || lower.contains("cached host key")
+    {
+        return ("host_key", ManualMfaSessionStatus::AuthenticationRequired, "NIBI host-key trust must be confirmed in the visible PuTTY window before background commands can run.".to_string());
+    }
+    if is_interactive_login_required_output(&combined)
+        || lower.contains("no connection to share")
+        || lower.contains("no sharing")
+    {
+        return (
+            "no_upstream",
+            ManualMfaSessionStatus::SessionNotFound,
+            MISSING_UPSTREAM_MESSAGE.to_string(),
+        );
+    }
+    if lower.contains("wrong username") || lower.contains("unable to open connection") {
+        return (
+            "target",
+            ManualMfaSessionStatus::Failed,
+            "Native Windows SSH could not reach the configured NIBI target.".to_string(),
+        );
+    }
+    if output.status == 0 {
+        return (
+            "none",
+            ManualMfaSessionStatus::Authenticated,
+            format!("Native Windows SSH session is ready.\n{MANUAL_MFA_OK}"),
+        );
+    }
+    (
+        "remote_failure",
+        ManualMfaSessionStatus::BatchModeReuseFailed,
+        "Native Windows SSH session reuse failed without opening a login prompt.".to_string(),
+    )
+}
+
+async fn test_putty_manual_mfa_session(settings: &NibiSettings) -> ManualMfaSessionResult {
+    let commands = build_putty_manual_mfa_session_commands(settings);
+    let plink = putty_tool_path("plink.exe");
+    let output = if !plink.is_file() {
+        CommandOutput {
+            status: 127,
+            stdout: String::new(),
+            stderr: "Packaged plink.exe is missing.".to_string(),
+            timed_out: false,
+        }
+    } else {
+        let args = putty_readiness_args(settings);
+        match run_hidden_command(
+            plink.to_string_lossy().as_ref(),
+            &args,
+            Duration::from_secs(8),
+        )
+        .await
+        {
+            Ok(output) => CommandOutput {
+                status: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                timed_out: output.timed_out,
+            },
+            Err(error) => CommandOutput {
+                status: 127,
+                stdout: String::new(),
+                stderr: error,
+                timed_out: false,
+            },
+        }
+    };
+    let (failure_code, status, message) = classify_putty_output(&output);
+    let authenticated = status == ManualMfaSessionStatus::Authenticated;
+    ManualMfaSessionResult {
+        status,
+        message,
+        diagnostics: ManualMfaSessionDiagnostics {
+            success: authenticated,
+            authenticated,
+            failure_code: failure_code.to_string(),
+            exit_code: Some(output.status),
+            wsl_distro: String::new(),
+            wsl_user: String::new(),
+            wsl_home: String::new(),
+            resolved_control_path: PUTTY_SESSION_NAME.to_string(),
+            socket_exists: authenticated,
+            master_running: authenticated,
+            authentication_marker_received: authenticated,
+            stdout: output.stdout.clone(),
+            stderr: output.stderr.clone(),
+        },
+        control_path: PUTTY_SESSION_NAME.to_string(),
+        control_path_exists: authenticated,
+        redacted_command_preview: commands.redacted_test_command_preview,
+        can_run_background_commands: authenticated,
+        last_master_check_result: output.combined(),
+        last_auth_ok_result: if authenticated {
+            MANUAL_MFA_OK.to_string()
+        } else {
+            String::new()
+        },
+        last_session_test_stdout: output.stdout,
+        last_session_test_stderr: output.stderr,
+        last_session_test_exit_code: Some(output.status),
+        parsed_session_status: status,
+        selected_backend: "putty",
+        wsl_available: false,
+        wsl_ssh_available: false,
+    }
+}
+
+fn open_putty_manual_mfa_login(
+    settings: &NibiSettings,
+    commands: ManualMfaSessionCommands,
+) -> Result<ManualMfaTerminalLaunchResult, String> {
+    let putty = putty_tool_path("putty.exe");
+    if !putty.is_file() {
+        return Err("Packaged putty.exe is missing. Rebuild the installer resources.".to_string());
+    }
+    // This is one of the documented visible exceptions: Native Windows Manual MFA
+    // must open PuTTY so the user can type the Alliance password and approve Duo.
+    let mut command = Command::new(putty);
+    command
+        .arg("-ssh")
+        .arg("-P")
+        .arg("22")
+        .arg("-l")
+        .arg(settings.nibi_username.trim())
+        .arg("-share")
+        .arg(settings.manual_login_host());
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Could not start visible PuTTY login window: {error}"))?;
+    Ok(ManualMfaTerminalLaunchResult {
+        launched: true,
+        method: TerminalLaunchMethod::Manual,
+        message: format!(
+            "Native Windows SSH login opened in PuTTY. Complete password and Duo there, and keep that one window open until FluorCast work is finished. Process id: {}",
+            child.id()
+        ),
+        error_message: String::new(),
+        timestamp: timestamp_now(),
+        commands,
+        windows_terminal_available: false,
+        powershell_available: false,
+        wsl_available: false,
+        distro_available: false,
+        command_preview: "putty.exe -ssh -P 22 -l <nibi_username> -share nibi.alliancecan.ca".to_string(),
+        generated_script_path: String::new(),
+        script_file_exists: false,
+        launch_method_attempted: "putty".to_string(),
+        launch_error_code: String::new(),
+        manual_wsl_command: String::new(),
+    })
+}
+
+async fn close_putty_shared_session(
+    settings: &NibiSettings,
+) -> Result<ManualMfaSessionResult, String> {
+    let plink = putty_tool_path("plink.exe");
+    let mut args = putty_args_base(settings);
+    args.extend(["-N".to_string(), "-O".to_string(), "exit".to_string()]);
+    let output = run_hidden_command(
+        plink.to_string_lossy().as_ref(),
+        &args,
+        Duration::from_secs(8),
+    )
+    .await;
+    let command_output = match output {
+        Ok(output) => CommandOutput {
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            timed_out: output.timed_out,
+        },
+        Err(error) => CommandOutput {
+            status: 127,
+            stdout: String::new(),
+            stderr: error,
+            timed_out: false,
+        },
+    };
+    let mut result = test_putty_manual_mfa_session(settings).await;
+    result.status = ManualMfaSessionStatus::Disconnected;
+    result.message = if command_output.status == 0 {
+        "Native Windows SSH shared session closed.".to_string()
+    } else {
+        "No reusable native Windows SSH session was closed.".to_string()
+    };
+    result.can_run_background_commands = false;
+    Ok(result)
+}
+
+async fn run_putty_remote_command_result(
+    settings: &NibiSettings,
+    remote_command: &str,
+    label: String,
+    redacted_preview: Option<String>,
+) -> Result<RemoteCommandResult, String> {
+    validate_manual_login_settings(settings)?;
+    let preview = redacted_preview.unwrap_or_else(|| label.clone());
+    let started = Instant::now();
+    let readiness = test_putty_manual_mfa_session(settings).await;
+    if !readiness.can_run_background_commands {
+        return Ok(RemoteCommandResult {
+            exit_code: readiness.last_session_test_exit_code.unwrap_or(1),
+            stdout: readiness.last_session_test_stdout,
+            stderr: readiness.message,
+            duration_ms: started.elapsed().as_millis(),
+            command_label: label,
+            redacted_command_preview: preview,
+            timed_out: matches!(readiness.status, ManualMfaSessionStatus::Timeout),
+        });
+    }
+    let plink = putty_tool_path("plink.exe");
+    let mut args = putty_args_base(settings);
+    args.push(remote_command.to_string());
+    let output = run_hidden_command(
+        plink.to_string_lossy().as_ref(),
+        &args,
+        command_timeout(settings, remote_command),
+    )
+    .await?;
+    Ok(RemoteCommandResult {
+        exit_code: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        duration_ms: started.elapsed().as_millis(),
+        command_label: label,
+        redacted_command_preview: preview,
+        timed_out: output.timed_out,
+    })
+}
+
 async fn run_manual_mfa_environment_checks(
     settings: &NibiSettings,
     started_at: &str,
@@ -2595,6 +3134,101 @@ async fn run_manual_mfa_environment_checks(
         process_visibility: "hidden".to_string(),
         backend_process_launches: 1,
         wsl_process_launches: 1,
+        ssh_remote_sessions: ssh_launch_count,
+    })
+}
+
+async fn run_putty_environment_checks(
+    settings: &NibiSettings,
+    started_at: &str,
+    started: Instant,
+) -> Result<EnvironmentCheckReport, String> {
+    validate_manual_login_settings(settings)?;
+    validate_remote_path(&settings.remote_project_path, "Remote project path")?;
+    validate_remote_path(&settings.remote_jobs_path, "Remote jobs path")?;
+    validate_remote_path(&settings.python_environment_path, "Python executable path")?;
+    let config = EnvironmentCheckConfig {
+        remote_project_path: settings.remote_project_path.trim(),
+        remote_jobs_path: settings.remote_jobs_path.trim(),
+        python_environment_path: settings.python_environment_path.trim(),
+    };
+    let config_json = serde_json::to_string(&config)
+        .map_err(|error| format!("Could not serialize environment-check configuration: {error}"))?;
+    let encoded_config = base64_encode(config_json.as_bytes());
+    let remote_command = putty_environment_checks_remote_command(&encoded_config);
+    let script = manual_mfa_environment_checks_remote_script();
+    let plink = putty_tool_path("plink.exe");
+    let mut args = putty_args_base(settings);
+    args.push(remote_command);
+    let output = run_hidden_command_with_stdin(
+        plink.to_string_lossy().as_ref(),
+        &args,
+        &script,
+        Duration::from_secs(90),
+    )
+    .await
+    .map(|output| CommandOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        timed_out: output.timed_out,
+    })?;
+    let sanitized_stderr = output.stderr.clone();
+    let combined_stdout = putty_environment_checks_marker_stdout(&output);
+    let mut parsed = parse_environment_check_markers(&combined_stdout);
+    if output.status != 0 && parsed.parser_error.is_none() {
+        parsed.parser_error = Some(format!(
+            "Environment-check runner exited with status {}.",
+            output.status
+        ));
+    }
+    let status = if output.timed_out {
+        "timeout"
+    } else if parsed.parser_error.is_some() || output.status != 0 {
+        "runner_error"
+    } else if parsed.checks.iter().all(|check| check.status == "passed") {
+        "passed"
+    } else {
+        "failed"
+    };
+    let ssh_launch_count = if parsed
+        .checks
+        .iter()
+        .any(|check| check.id == "authenticated_session" && check.status == "passed")
+    {
+        1
+    } else {
+        0
+    };
+    let diagnostics = EnvironmentCheckDiagnostics {
+        operation_status: status.to_string(),
+        wsl_launch_count: 0,
+        ssh_launch_count,
+        expected_check_count: EXPECTED_ENVIRONMENT_CHECK_IDS.len(),
+        parsed_check_count: parsed.checks.len(),
+        duplicate_ids: parsed.duplicate_ids,
+        unknown_ids: parsed.unknown_ids,
+        missing_ids: parsed.missing_ids,
+        malformed_rows: parsed.malformed_rows,
+        parser_error: parsed.parser_error,
+        ssh_exit_code: Some(output.status),
+        timed_out: output.timed_out,
+        sanitized_stderr,
+        total_duration_ms: started.elapsed().as_millis() as u64,
+    };
+    Ok(EnvironmentCheckReport {
+        status: status.to_string(),
+        checks: parsed.checks,
+        diagnostics,
+        started_at: started_at.to_string(),
+        completed_at: timestamp_now(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        operation_name: "run_nibi_environment_checks".to_string(),
+        timed_out: output.timed_out,
+        process_exit_code: Some(output.status),
+        process_visibility: "hidden".to_string(),
+        backend_process_launches: 1,
+        wsl_process_launches: 0,
         ssh_remote_sessions: ssh_launch_count,
     })
 }
@@ -2762,6 +3396,46 @@ fn parse_environment_check_markers(stdout: &str) -> ParsedEnvironmentCheckReport
 fn decode_marker_field(value: &str) -> Result<String, String> {
     let bytes = base64_decode(value)?;
     String::from_utf8(bytes).map_err(|_| "is not valid UTF-8".to_string())
+}
+
+fn encode_environment_check_marker_field(value: &str) -> String {
+    base64_encode(value.as_bytes())
+}
+
+fn environment_check_marker(
+    id: &str,
+    status: &str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    format!(
+        "{ENVIRONMENT_CHECK_MARKER}{id}|{status}|{exit_code}|{}|{}",
+        encode_environment_check_marker_field(stdout),
+        encode_environment_check_marker_field(stderr)
+    )
+}
+
+fn authenticated_session_passed_marker() -> String {
+    environment_check_marker("authenticated_session", "passed", 0, MANUAL_MFA_OK, "")
+}
+
+fn putty_environment_checks_remote_command(encoded_config: &str) -> String {
+    format!("bash -s -- {}", shell_quote(encoded_config))
+}
+
+fn putty_environment_checks_marker_stdout(output: &CommandOutput) -> String {
+    let mut lines = vec![authenticated_session_passed_marker()];
+    if !output.stdout.trim().is_empty() {
+        lines.push(output.stdout.trim_end_matches(['\r', '\n']).to_string());
+    }
+    if output.status == 0 && !output.timed_out {
+        lines.push(format!(
+            "{ENVIRONMENT_CHECK_SUMMARY_MARKER}{}",
+            EXPECTED_ENVIRONMENT_CHECK_IDS.len()
+        ));
+    }
+    lines.join("\n")
 }
 
 fn environment_check_summary(id: &str, status: &str) -> String {
@@ -4007,6 +4681,115 @@ async fn wsl_distro_available(distro: &str) -> bool {
     wsl_available_for_distro(distro).await
 }
 
+async fn detect_nibi_transport_capability(settings: &NibiSettings) -> NibiTransportCapability {
+    let requested = settings.requested_transport();
+    let wsl_executable_found = executable_found("wsl.exe").await;
+    let wsl_distribution_found = if wsl_executable_found {
+        wsl_distribution_exists(&settings.manual_mfa_wsl_distro).await
+    } else {
+        false
+    };
+    let wsl_bash_works = if wsl_distribution_found {
+        wsl_available_for_distro(&settings.manual_mfa_wsl_distro).await
+    } else {
+        false
+    };
+    let putty_found = putty_tool_exists("putty.exe");
+    let plink_found = putty_tool_exists("plink.exe");
+    let pscp_found = putty_tool_exists("pscp.exe");
+    capability_from_probe(
+        requested,
+        wsl_executable_found,
+        wsl_distribution_found,
+        wsl_bash_works,
+        putty_found,
+        plink_found,
+        pscp_found,
+    )
+}
+
+fn capability_from_probe(
+    requested_transport: NibiTransport,
+    wsl_executable_found: bool,
+    wsl_distribution_found: bool,
+    wsl_bash_works: bool,
+    putty_found: bool,
+    plink_found: bool,
+    pscp_found: bool,
+) -> NibiTransportCapability {
+    let putty_ready = putty_found && plink_found && pscp_found;
+    let wsl_ready = wsl_executable_found && wsl_distribution_found && wsl_bash_works;
+    let resolved_transport = match requested_transport {
+        NibiTransport::WslOpenSsh if wsl_ready => ResolvedNibiTransport::WslOpenSsh,
+        NibiTransport::WslOpenSsh => ResolvedNibiTransport::Unsupported,
+        NibiTransport::Putty if putty_ready => ResolvedNibiTransport::Putty,
+        NibiTransport::Putty => ResolvedNibiTransport::Unsupported,
+        NibiTransport::Auto if wsl_ready => ResolvedNibiTransport::WslOpenSsh,
+        NibiTransport::Auto if putty_ready => ResolvedNibiTransport::Putty,
+        NibiTransport::Auto => ResolvedNibiTransport::Unsupported,
+    };
+    let supported = resolved_transport != ResolvedNibiTransport::Unsupported;
+    let user_message = match resolved_transport {
+        ResolvedNibiTransport::WslOpenSsh => "Ready: WSL transport".to_string(),
+        ResolvedNibiTransport::Putty => "Ready: Native Windows transport".to_string(),
+        ResolvedNibiTransport::Unsupported if requested_transport == NibiTransport::WslOpenSsh => {
+            "WSL unavailable. Remote NIBI functionality cannot use the selected transport."
+                .to_string()
+        }
+        ResolvedNibiTransport::Unsupported => {
+            "Setup required: no usable SSH transport.".to_string()
+        }
+    };
+    let technical_detail = format!(
+        "requested={requested_transport:?}; resolved={resolved_transport:?}; wsl_executable_found={wsl_executable_found}; wsl_distribution_found={wsl_distribution_found}; wsl_bash_works={wsl_bash_works}; putty_found={putty_found}; plink_found={plink_found}; pscp_found={pscp_found}; putty_version={PUTTY_VERSION}"
+    );
+    NibiTransportCapability {
+        requested_transport,
+        resolved_transport,
+        wsl_executable_found,
+        wsl_distribution_found,
+        wsl_bash_works,
+        putty_found,
+        plink_found,
+        pscp_found,
+        supported,
+        user_message,
+        technical_detail,
+    }
+}
+
+async fn resolve_manual_mfa_transport(
+    settings: &NibiSettings,
+) -> Result<ResolvedNibiTransport, String> {
+    let capability = detect_nibi_transport_capability(settings).await;
+    Ok(capability.resolved_transport)
+}
+
+async fn executable_found(program: &str) -> bool {
+    let args = vec!["/C".to_string(), "where".to_string(), program.to_string()];
+    run_hidden_command("cmd.exe", &args, Duration::from_secs(5))
+        .await
+        .map(|output| output.status == 0)
+        .unwrap_or(false)
+}
+
+async fn wsl_distribution_exists(distro: &str) -> bool {
+    if distro.trim().is_empty() {
+        return false;
+    }
+    let args = vec!["-l".to_string(), "-q".to_string()];
+    run_hidden_command("wsl.exe", &args, Duration::from_secs(5))
+        .await
+        .map(|output| {
+            output.status == 0
+                && output
+                    .stdout
+                    .lines()
+                    .any(|line| line.trim().eq_ignore_ascii_case(distro.trim()))
+        })
+        .unwrap_or(false)
+}
+
 async fn wsl_available() -> bool {
     wsl_available_for_distro(&default_wsl_distro()).await
 }
@@ -4918,6 +5701,8 @@ mod tests {
     fn settings() -> NibiSettings {
         NibiSettings {
             manual_mfa_provider: "controlmaster".to_string(),
+            manual_mfa_ssh_transport: NibiTransport::Auto,
+            manual_mfa_ssh_backend: "wsl".to_string(),
             nibi_username: "alice".to_string(),
             normal_login_host: "nibi.alliancecan.ca".to_string(),
             robot_login_host: "robot.nibi.alliancecan.ca".to_string(),
@@ -4943,6 +5728,115 @@ mod tests {
             stderr: stderr.to_string(),
             timed_out: status == 124,
         }
+    }
+
+    #[test]
+    fn auto_selects_wsl_only_when_wsl_fully_works() {
+        let capability =
+            capability_from_probe(NibiTransport::Auto, true, true, true, true, true, true);
+        assert_eq!(
+            capability.resolved_transport,
+            ResolvedNibiTransport::WslOpenSsh
+        );
+        assert!(capability.supported);
+        assert_eq!(capability.user_message, "Ready: WSL transport");
+    }
+
+    #[test]
+    fn auto_selects_putty_when_wsl_cannot_run_bash() {
+        let capability =
+            capability_from_probe(NibiTransport::Auto, true, true, false, true, true, true);
+        assert_eq!(capability.resolved_transport, ResolvedNibiTransport::Putty);
+        assert_eq!(capability.user_message, "Ready: Native Windows transport");
+    }
+
+    #[test]
+    fn explicit_wsl_is_unsupported_when_wsl_is_absent_or_incomplete() {
+        for (wsl_exe, distro, bash) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+        ] {
+            let capability = capability_from_probe(
+                NibiTransport::WslOpenSsh,
+                wsl_exe,
+                distro,
+                bash,
+                true,
+                true,
+                true,
+            );
+            assert_eq!(
+                capability.resolved_transport,
+                ResolvedNibiTransport::Unsupported
+            );
+            assert!(!capability.supported);
+            assert!(capability.user_message.contains("WSL unavailable"));
+        }
+    }
+
+    #[test]
+    fn explicit_putty_requires_all_three_packaged_tools() {
+        let complete =
+            capability_from_probe(NibiTransport::Putty, false, false, false, true, true, true);
+        assert_eq!(complete.resolved_transport, ResolvedNibiTransport::Putty);
+
+        for (putty, plink, pscp) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let missing = capability_from_probe(
+                NibiTransport::Putty,
+                false,
+                false,
+                false,
+                putty,
+                plink,
+                pscp,
+            );
+            assert_eq!(
+                missing.resolved_transport,
+                ResolvedNibiTransport::Unsupported
+            );
+            assert!(!missing.supported);
+        }
+    }
+
+    #[test]
+    fn putty_commands_document_visible_and_hidden_process_roles() {
+        let commands = build_putty_manual_mfa_session_commands(&settings());
+        assert_eq!(commands.backend, "putty");
+        assert!(commands.login_command.contains("putty.exe"));
+        assert!(commands.login_command.contains("-share"));
+        assert!(commands.test_command.contains("plink.exe -batch"));
+        assert!(commands
+            .background_command_template
+            .contains("plink.exe -batch"));
+    }
+
+    #[test]
+    fn putty_output_classification_distinguishes_missing_upstream_and_host_key() {
+        let missing = CommandOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "No connection to share".to_string(),
+            timed_out: false,
+        };
+        let (code, status, message) = classify_putty_output(&missing);
+        assert_eq!(code, "no_upstream");
+        assert_eq!(status, ManualMfaSessionStatus::SessionNotFound);
+        assert_eq!(message, MISSING_UPSTREAM_MESSAGE);
+
+        let host_key = CommandOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "The server's host key is not cached in the registry".to_string(),
+            timed_out: false,
+        };
+        let (code, status, _) = classify_putty_output(&host_key);
+        assert_eq!(code, "host_key");
+        assert_eq!(status, ManualMfaSessionStatus::AuthenticationRequired);
     }
 
     fn manual_mfa_invocation_for(command_spec: RemoteCommandSpecInput) -> WslBashScriptInvocation {
@@ -5239,12 +6133,108 @@ mod tests {
         assert!(script.contains("FLUORCAST_CHECK_V1|%s|%s|%s|%s|%s"));
         assert!(script.contains("FLUORCAST_CHECK_SUMMARY_V1|17"));
         assert!(script.contains("CONFIG_B64=\"$2\""));
+        assert!(script.contains("HOST=\"$1\""));
+        assert!(script.contains("ssh -n"));
+        assert!(script.contains("ControlMaster socket"));
+        assert!(script.contains("cm-nibi.sock"));
         assert!(script.contains("json.loads"));
         assert!(script.contains("set +e"));
         assert!(!script.contains("set -e"));
         assert!(!remote_ssh_line.contains("ssh -n"));
         assert!(remote_ssh_line.contains("ssh -S \"$CTL\""));
         assert!(script.contains("-o BatchMode=yes"));
+        assert_eq!(
+            script
+                .matches(&manual_mfa_environment_checks_remote_script())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn environment_remote_script_is_transport_agnostic_marker_producer() {
+        let script = manual_mfa_environment_checks_remote_script();
+
+        assert!(script.contains("CONFIG_B64=\"${1:-}\""));
+        assert!(script.contains("FLUORCAST_CHECK_V1|%s|%s|%s|%s|%s"));
+        assert!(!script.contains("ssh"));
+        assert!(!script.contains("ControlPath"));
+        assert!(!script.contains("ControlMaster"));
+        assert!(!script.contains("WSL"));
+        assert!(!script.contains("wsl"));
+        assert!(!script.contains("Plink"));
+        assert!(!script.contains("plink"));
+        assert!(!script.contains("hostname"));
+        assert!(!script.contains("username"));
+    }
+
+    #[test]
+    fn putty_environment_check_command_sends_only_encoded_config_to_remote_bash() {
+        let settings = settings();
+        let encoded = base64_encode(
+            br#"{"remote_project_path":"/p","remote_jobs_path":"/j","python_environment_path":"/py"}"#,
+        );
+        let command = putty_environment_checks_remote_command(&encoded);
+        let args = putty_args_base(&settings);
+        let target = settings.manual_login_host();
+
+        assert!(command.starts_with("bash -s -- "));
+        assert_eq!(command.matches(&encoded).count(), 1);
+        assert_eq!(command.split_whitespace().count(), 4);
+        assert!(!command.contains(target));
+        assert!(!command.contains(settings.nibi_username.trim()));
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == target).count(), 1);
+    }
+
+    #[test]
+    fn putty_environment_checks_use_remote_script_and_parse_readiness_plus_remote_markers() {
+        let remote_stdout = EXPECTED_ENVIRONMENT_CHECK_IDS[1..]
+            .iter()
+            .map(|id| check_marker(id, "passed", 0, "ok", ""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(remote_stdout.matches("FLUORCAST_CHECK_V1|").count(), 16);
+        let combined = putty_environment_checks_marker_stdout(&CommandOutput {
+            status: 0,
+            stdout: remote_stdout,
+            stderr: String::new(),
+            timed_out: false,
+        });
+        let parsed = parse_environment_check_markers(&combined);
+
+        assert!(combined.starts_with(&authenticated_session_passed_marker()));
+        assert_eq!(combined.matches("FLUORCAST_CHECK_SUMMARY_V1|17").count(), 1);
+        assert_eq!(parsed.parser_error, None);
+        assert_eq!(parsed.checks.len(), 17);
+        assert_eq!(parsed.missing_ids, Vec::<String>::new());
+        assert!(parsed.checks.iter().all(|check| check.status == "passed"));
+    }
+
+    #[test]
+    fn putty_failed_remote_process_preserves_passed_authenticated_session() {
+        let combined = putty_environment_checks_marker_stdout(&CommandOutput {
+            status: 65,
+            stdout: String::new(),
+            stderr: "FLUORCAST_RUNNER_ERROR|config_decode_failed".to_string(),
+            timed_out: false,
+        });
+        let parsed = parse_environment_check_markers(&combined);
+        let auth = parsed
+            .checks
+            .iter()
+            .find(|check| check.id == "authenticated_session")
+            .unwrap();
+
+        assert_eq!(auth.status, "passed");
+        assert_eq!(auth.exit_code, Some(0));
+        assert_eq!(auth.stdout, "FLUORCAST_AUTH_OK");
+        assert!(parsed
+            .parser_error
+            .as_deref()
+            .unwrap()
+            .contains("Missing check IDs"));
+        assert_eq!(parsed.missing_ids.len(), 16);
+        assert!(!combined.contains("FLUORCAST_CHECK_SUMMARY_V1|17"));
     }
 
     #[test]
@@ -6915,7 +7905,7 @@ printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$project" "$jobs" "$python" "$bin" "$home" "$
     }
 
     #[test]
-    fn direct_command_new_is_limited_to_documented_visible_terminal_exception() {
+    fn direct_command_new_is_limited_to_documented_visible_login_exceptions() {
         let source = include_str!("nibi.rs");
         let pattern = ["Command", "::", "new"].join("");
         let direct_command_lines = source
@@ -6923,11 +7913,15 @@ printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$project" "$jobs" "$python" "$bin" "$home" "$
             .filter(|line| line.contains(&pattern))
             .collect::<Vec<_>>();
 
-        let expected = format!(
+        let expected_wt = format!(
             "        match {}(\"wt.exe\").args(&args).spawn() {{",
             pattern
         );
-        assert_eq!(direct_command_lines, vec![expected.as_str()]);
-        assert!(source.contains("single documented visible process exception"));
+        let expected_putty = format!("    let mut command = {}(putty);", pattern);
+        assert_eq!(
+            direct_command_lines,
+            vec![expected_putty.as_str(), expected_wt.as_str()]
+        );
+        assert!(source.contains("visible exceptions"));
     }
 }

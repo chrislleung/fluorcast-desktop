@@ -83,6 +83,7 @@ pub fn run() {
             nibi::persistent_shell_stop,
             nibi::persistent_shell_test_readiness,
             nibi::check_local_ssh_capabilities,
+            nibi::detect_nibi_transport,
             nibi::test_manual_mfa_session,
             nibi::test_nibi_connection,
             nibi::test_robot_automation,
