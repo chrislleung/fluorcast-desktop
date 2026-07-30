@@ -9,3 +9,4 @@ src-tauri/target
 .vscode/*
 !.vscode/extensions.json
 release
+src-tauri/resources/putty/*.exe

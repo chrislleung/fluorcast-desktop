@@ -11,11 +11,15 @@ export type ConnectionMode = (typeof connectionModes)[number];
 export const backendModes = ["mock", "nibi"] as const;
 export type BackendMode = (typeof backendModes)[number];
 
+export const nibiTransportModes = ["auto", "wsl_open_ssh", "putty"] as const;
+export type NibiTransportMode = (typeof nibiTransportModes)[number];
+
 export type NibiSettings = {
   connection_mode: RemoteConnectionMode;
   backend_mode: BackendMode;
   manual_mfa_provider: "persistent_shell" | "controlmaster";
-  manual_mfa_ssh_backend: "wsl";
+  manual_mfa_ssh_backend: "wsl" | "putty";
+  manual_mfa_ssh_transport?: NibiTransportMode;
   manual_mfa_wsl_distro: string;
   nibi_username: string;
   normal_login_host: string;
@@ -45,6 +49,7 @@ export const defaultNibiSettings: NibiSettings = {
   backend_mode: "mock",
   manual_mfa_provider: "controlmaster",
   manual_mfa_ssh_backend: "wsl",
+  manual_mfa_ssh_transport: "auto",
   manual_mfa_wsl_distro: "Ubuntu",
   nibi_username: "user",
   normal_login_host: "nibi.alliancecan.ca",
@@ -94,6 +99,20 @@ function normalizeManualMfaProvider(value: unknown): NibiSettings["manual_mfa_pr
     return value;
   }
   return "controlmaster";
+}
+
+function normalizeNibiTransport(value: unknown): NibiTransportMode {
+  if (value === "wsl") {
+    return "wsl_open_ssh";
+  }
+  if (nibiTransportModes.includes(value as NibiTransportMode)) {
+    return value as NibiTransportMode;
+  }
+  return defaultNibiSettings.manual_mfa_ssh_transport;
+}
+
+function legacyTransportBackend(transport: NibiTransportMode): NibiSettings["manual_mfa_ssh_backend"] {
+  return transport === "putty" ? "putty" : "wsl";
 }
 
 export function safeWslControlSocketName(username: string, host: string): string {
@@ -149,12 +168,16 @@ export function normalizeNibiSettings(value: unknown): NibiSettings {
     value.manual_login_verified ?? value.manual_ssh_login_confirmed,
     defaultNibiSettings.manual_login_verified,
   );
+  const transport = normalizeNibiTransport(
+    value.manual_mfa_ssh_transport ?? value.manual_mfa_ssh_backend,
+  );
 
   return {
     connection_mode: connectionMode,
     backend_mode: connectionMode === "mock" ? "mock" : "nibi",
     manual_mfa_provider: normalizeManualMfaProvider(value.manual_mfa_provider),
-    manual_mfa_ssh_backend: "wsl",
+    manual_mfa_ssh_backend: legacyTransportBackend(transport),
+    manual_mfa_ssh_transport: transport,
     manual_mfa_wsl_distro: stringValue(
       value.manual_mfa_wsl_distro,
       defaultNibiSettings.manual_mfa_wsl_distro,
@@ -223,10 +246,15 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
     if (trimmed.connection_mode === "robot_automation" && !trimmed.robot_login_host) {
       errors.robot_login_host = "Robot login host is required for robot automation mode.";
     }
-    if (trimmed.connection_mode === "interactive_mfa" && !trimmed.wsl_ssh_private_key_path) {
+    if (
+      trimmed.connection_mode === "interactive_mfa"
+      && trimmed.manual_mfa_ssh_transport !== "putty"
+      && !trimmed.wsl_ssh_private_key_path
+    ) {
       errors.wsl_ssh_private_key_path = "WSL private key path is required for manual MFA mode.";
     } else if (
       trimmed.connection_mode === "interactive_mfa"
+      && trimmed.manual_mfa_ssh_transport !== "putty"
       && !isSupportedWslPrivateKeyPath(trimmed.wsl_ssh_private_key_path)
     ) {
       errors.wsl_ssh_private_key_path = "WSL private key path must be /home, $HOME/, or ~/.";
@@ -262,6 +290,7 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
 
   if (
     trimmed.connection_mode === "interactive_mfa"
+    && trimmed.manual_mfa_ssh_transport !== "putty"
     && trimmed.wsl_ssh_private_key_path
     && /[\0\r\n"';&|`<>\\\t]/.test(trimmed.wsl_ssh_private_key_path)
   ) {
@@ -269,6 +298,7 @@ export function validateNibiSettings(settings: NibiSettings): NibiSettingsErrors
   }
   if (
     trimmed.connection_mode === "interactive_mfa"
+    && trimmed.manual_mfa_ssh_transport !== "putty"
     && trimmed.wsl_ssh_private_key_path
     && (
       trimmed.wsl_ssh_private_key_path.replace(/^\$HOME\//, "").replace(/^~\//, "").includes("$")
@@ -319,11 +349,13 @@ export function trimNibiSettings(settings: NibiSettings): NibiSettings {
   const sshPrivateKeyPath = settings.ssh_private_key_path.trim();
   const username = settings.nibi_username.trim();
   const manualLoginVerified = settings.manual_login_verified;
+  const transport = normalizeNibiTransport(settings.manual_mfa_ssh_transport ?? settings.manual_mfa_ssh_backend);
   return {
     connection_mode: settings.connection_mode,
     backend_mode: settings.connection_mode === "mock" ? "mock" : "nibi",
     manual_mfa_provider: normalizeManualMfaProvider(settings.manual_mfa_provider),
-    manual_mfa_ssh_backend: "wsl",
+    manual_mfa_ssh_backend: legacyTransportBackend(transport),
+    manual_mfa_ssh_transport: transport,
     manual_mfa_wsl_distro: settings.manual_mfa_wsl_distro.trim() || defaultNibiSettings.manual_mfa_wsl_distro,
     nibi_username: username,
     normal_login_host: normalLoginHost,

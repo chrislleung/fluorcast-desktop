@@ -34,6 +34,7 @@ import type {
   ManualMfaTerminalLaunchResult,
   ManualMfaSessionUiState,
   LocalSshCapabilitiesResult,
+  NibiTransportCapability,
 } from "../../lib/remote";
 import { ConnectionModeSetting } from "./ConnectionModeSetting";
 
@@ -254,6 +255,7 @@ export function ConnectionSettingsPanel({
   const [manualMfaCommands, setManualMfaCommands] = useState<ManualMfaSessionCommands | null>(null);
   const [manualMfaStatus, setManualMfaStatus] = useState("");
   const [localSshCapabilities, setLocalSshCapabilities] = useState<LocalSshCapabilitiesResult | null>(null);
+  const [transportCapability, setTransportCapability] = useState<NibiTransportCapability | null>(null);
   const [isManualMfaWorking, setIsManualMfaWorking] = useState(false);
   const manualMfaOperationIdRef = useRef(0);
   const startManualMfaLaunchInFlightRef = useRef(false);
@@ -274,8 +276,55 @@ export function ConnectionSettingsPanel({
   const warnings = validateNibiSettingsWarnings(values);
   const manualSshCommand = buildManualSshCommand(values);
   const displayedManualMfaCommands = values.connection_mode === "interactive_mfa"
+    && (values.manual_mfa_ssh_transport ?? "auto") !== "putty"
     ? manualMfaCommands ?? buildManualMfaSessionCommands(values)
     : null;
+
+  useEffect(() => {
+    if (values.connection_mode !== "interactive_mfa") {
+      setTransportCapability(null);
+      return;
+    }
+    let cancelled = false;
+    void Promise.resolve(invoke<NibiTransportCapability>("detect_nibi_transport", {
+      settings: trimNibiSettings(values),
+    })).then((result) => {
+      if (!cancelled) {
+        setTransportCapability(result ?? {
+          requested_transport: values.manual_mfa_ssh_transport ?? "auto",
+          resolved_transport: "wsl_open_ssh",
+          wsl_executable_found: true,
+          wsl_distribution_found: true,
+          wsl_bash_works: true,
+          putty_found: false,
+          plink_found: false,
+          pscp_found: false,
+          supported: true,
+          user_message: "Ready: WSL transport",
+          technical_detail: "defaulted test capability",
+        });
+      }
+    }).catch((error) => {
+      if (!cancelled) {
+        setTransportCapability({
+          requested_transport: values.manual_mfa_ssh_transport ?? "auto",
+          resolved_transport: "unsupported",
+          wsl_executable_found: false,
+          wsl_distribution_found: false,
+          wsl_bash_works: false,
+          putty_found: false,
+          plink_found: false,
+          pscp_found: false,
+          supported: false,
+          user_message: error instanceof Error ? error.message : "Setup required: no usable SSH transport.",
+          technical_detail: "",
+        });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [values]);
 
   useEffect(() => {
     setValues(normalizeUnavailableConnectionModeForUi(nibiSettings));
@@ -301,6 +350,8 @@ export function ConnectionSettingsPanel({
   function updateField(field: keyof NibiSettings, value: string) {
     const typedValue = field === "connection_mode"
       ? (value as ConnectionMode)
+      : field === "manual_mfa_ssh_transport"
+      ? (value as NibiSettings["manual_mfa_ssh_transport"])
       : field === "manual_mfa_provider"
       ? (value as NibiSettings["manual_mfa_provider"])
       : value;
@@ -653,7 +704,7 @@ export function ConnectionSettingsPanel({
       setManualMfaStatus(launch.message);
     } catch (error) {
       if (isCurrentManualMfaOperation(operationId)) {
-        setManualMfaStatus(error instanceof Error ? error.message : "Could not open a terminal automatically. Copy the WSL login command and run it manually.");
+        setManualMfaStatus(error instanceof Error ? error.message : "Could not open the NIBI login window automatically.");
       }
     } finally {
       if (isCurrentManualMfaOperation(operationId)) {
@@ -698,7 +749,7 @@ export function ConnectionSettingsPanel({
       }
     } catch (error) {
       if (isCurrentManualMfaOperation(operationId)) {
-        setManualMfaStatus(error instanceof Error ? error.message : "Stale WSL session cleanup could not run.");
+        setManualMfaStatus(error instanceof Error ? error.message : "NIBI session cleanup could not run.");
       }
     } finally {
       if (isCurrentManualMfaOperation(operationId)) {
@@ -710,20 +761,30 @@ export function ConnectionSettingsPanel({
   const isMockMode = values.connection_mode === "mock";
   const isManualMfaMode = values.connection_mode === "interactive_mfa";
   const isRobotAutomationMode = values.connection_mode === "robot_automation";
+  const selectedTransport = values.manual_mfa_ssh_transport ?? "auto";
+  const resolvedTransport = transportCapability?.resolved_transport
+    ?? (selectedTransport === "putty" ? "putty" : "wsl_open_ssh");
+  const isNativeWindowsTransport = isManualMfaMode && resolvedTransport === "putty";
+  const isTransportUnsupported = isManualMfaMode && transportCapability?.supported === false;
+  const explicitWslUnavailable = isTransportUnsupported && selectedTransport === "wsl_open_ssh";
   const isManualSessionReady = manualMfaSession.status === "authenticated"
     || manualMfaSession.can_run_background_commands;
   const isRobotAutomationReady = values.robot_access_verified;
   const nibiTarget = `${values.nibi_username || "<username>"}@${values.normal_login_host || "nibi.alliancecan.ca"}`;
   const resolvedWslUser = manualMfaSession.wsl_user || "Unknown until tested";
   const resolvedWslHome = manualMfaSession.wsl_home || "Unknown until tested";
-  const resolvedControlPath = manualMfaSession.control_path
-    || displayedManualMfaCommands?.control_path
-    || "$HOME/.fluorcast/ssh/cm-nibi.sock";
+  const resolvedControlPath = isNativeWindowsTransport
+    ? "FluorCast-NIBI"
+    : manualMfaSession.control_path
+      || displayedManualMfaCommands?.control_path
+      || "$HOME/.fluorcast/ssh/cm-nibi.sock";
   const mostRecentManualAction = manualMfaStatus || manualMfaSession.last_session_test_result || "No action run yet.";
   const canRunRemoteEnvironmentChecks = isManualMfaMode
-    ? isManualSessionReady
+    ? isManualSessionReady && !isTransportUnsupported
     : isRobotAutomationMode && isRobotAutomationReady;
-  const remoteEnvironmentDisabledMessage = isManualMfaMode && !isManualSessionReady
+  const remoteEnvironmentDisabledMessage = isTransportUnsupported
+    ? transportCapability?.user_message ?? "Setup required: no usable SSH transport."
+    : isManualMfaMode && !isManualSessionReady
     ? "Log into NIBI first before running remote environment checks."
     : isRobotAutomationMode && !isRobotAutomationReady
     ? "Verify robot automation before running remote environment checks."
@@ -810,6 +871,42 @@ export function ConnectionSettingsPanel({
             ) : null}
             {isManualMfaMode ? (
               <label>
+                <span>SSH transport</span>
+                <select
+                  name="manual_mfa_ssh_transport"
+                  onChange={(event) => updateField("manual_mfa_ssh_transport", event.target.value)}
+                  value={values.manual_mfa_ssh_transport ?? "auto"}
+                >
+                  <option value="auto">Automatic</option>
+                  <option value="wsl_open_ssh">WSL</option>
+                  <option value="putty">Native Windows</option>
+                </select>
+                <small>
+                  {(values.manual_mfa_ssh_transport ?? "auto") === "auto"
+                    ? "Use WSL when available; otherwise use the packaged native Windows SSH transport."
+                    : values.manual_mfa_ssh_transport === "putty"
+                    ? "Use the packaged PuTTY SSH tools. WSL is not required."
+                    : "Use the Windows Subsystem for Linux OpenSSH workflow."}
+                </small>
+              </label>
+            ) : null}
+            {isManualMfaMode && transportCapability ? (
+              <div className="warning-callout" role="status">
+                <p>{transportCapability.user_message}</p>
+                {transportCapability.resolved_transport === "putty" ? (
+                  <p>Active transport: Native Windows SSH.</p>
+                ) : null}
+              </div>
+            ) : null}
+            {explicitWslUnavailable ? (
+              <div className="warning-callout" role="alert">
+                <p>
+                  WSL unavailable. Remote NIBI functionality cannot use the selected transport.
+                </p>
+              </div>
+            ) : null}
+            {isManualMfaMode && !isNativeWindowsTransport ? (
+              <label>
                 <span>WSL distribution</span>
                 <input
                   name="manual_mfa_wsl_distro"
@@ -883,7 +980,7 @@ export function ConnectionSettingsPanel({
             <h3 id="ssh-key-heading">SSH key</h3>
             <span>{isManualMfaMode ? "WSL private key" : "Private key"}</span>
           </div>
-        {isManualMfaMode ? (
+        {isManualMfaMode && !isNativeWindowsTransport ? (
         <label>
           <span>WSL private key path</span>
           <input
@@ -909,7 +1006,7 @@ export function ConnectionSettingsPanel({
           </small>
         </label>
         ) : null}
-        {isManualMfaMode ? (
+        {isManualMfaMode && !isNativeWindowsTransport ? (
           <WslSshKeySetupInstructions />
         ) : null}
         {isRobotAutomationMode ? (
@@ -1264,27 +1361,36 @@ export function ConnectionSettingsPanel({
         <section className="manual-login-panel" aria-labelledby="manual-login-heading">
           <div>
             <h3 id="manual-login-heading">NIBI Session</h3>
-            <p>Start one WSL SSH ControlMaster session, then verify FluorCast can reuse it without another password or Duo prompt.</p>
+            <p>
+              {isNativeWindowsTransport
+                ? "Start one visible PuTTY login window, complete password and Duo there, then keep it open while FluorCast reuses the native Windows SSH session."
+                : "Start one WSL SSH ControlMaster session, then verify FluorCast can reuse it without another password or Duo prompt."}
+            </p>
           </div>
 
           <div className="diagnostic-grid">
-            <div><span className="step-label">WSL distribution</span><code>{values.manual_mfa_wsl_distro || "Ubuntu"}</code></div>
-            <div><span className="step-label">Resolved WSL user</span><code>{resolvedWslUser}</code></div>
-            <div><span className="step-label">Resolved WSL HOME</span><code>{resolvedWslHome}</code></div>
+            <div><span className="step-label">Active transport</span><code>{isNativeWindowsTransport ? "Native Windows SSH" : "WSL transport"}</code></div>
+            {!isNativeWindowsTransport ? (
+              <>
+                <div><span className="step-label">WSL distribution</span><code>{values.manual_mfa_wsl_distro || "Ubuntu"}</code></div>
+                <div><span className="step-label">Resolved WSL user</span><code>{resolvedWslUser}</code></div>
+                <div><span className="step-label">Resolved WSL HOME</span><code>{resolvedWslHome}</code></div>
+              </>
+            ) : null}
             <div><span className="step-label">NIBI target</span><code>{nibiTarget}</code></div>
-            <div><span className="step-label">Resolved ControlPath</span><code>{resolvedControlPath}</code></div>
+            <div><span className="step-label">{isNativeWindowsTransport ? "PuTTY session" : "Resolved ControlPath"}</span><code>{resolvedControlPath}</code></div>
             <div><span className="step-label">Session status</span><strong>{manualMfaSession.status.replaceAll("_", " ")}</strong></div>
             <div><span className="step-label">Most recent action result</span><strong>{mostRecentManualAction}</strong></div>
           </div>
 
           <div className="button-row manual-login-actions">
-            <button className="secondary-button" disabled={isManualMfaWorking} onClick={cleanStaleManualMfaSession} type="button">
-              Clean stale WSL session
+            <button className="secondary-button" disabled={isManualMfaWorking || isTransportUnsupported} onClick={cleanStaleManualMfaSession} type="button">
+              {isNativeWindowsTransport ? "Close native session" : "Clean stale WSL session"}
             </button>
-            <button className="secondary-button" disabled={isManualMfaWorking} onClick={startManualMfaLogin} type="button">
+            <button className="secondary-button" disabled={isManualMfaWorking || isTransportUnsupported} onClick={startManualMfaLogin} type="button">
               Start NIBI session
             </button>
-            <button className="secondary-button" disabled={isManualMfaWorking} onClick={testManualMfaSession} type="button">
+            <button className="secondary-button" disabled={isManualMfaWorking || isTransportUnsupported} onClick={testManualMfaSession} type="button">
               Test authenticated session
             </button>
             <button

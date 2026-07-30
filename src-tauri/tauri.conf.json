@@ -40,6 +40,9 @@
       "icons/icon.ico"
     ],
     "shortDescription": "Desktop controller for FluorCast predictions",
-    "longDescription": "Prepare, submit, monitor, and manage molecular fluorescence prediction jobs running on Nibi."
+    "longDescription": "Prepare, submit, monitor, and manage molecular fluorescence prediction jobs running on Nibi.",
+    "resources": [
+      "resources/putty/*"
+    ]
   }
 }

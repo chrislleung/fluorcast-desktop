@@ -26,8 +26,22 @@ export type ManualMfaSessionStatus =
   | "disconnected"
   | "failed";
 
+export type NibiTransportCapability = {
+  requested_transport: "auto" | "wsl_open_ssh" | "putty";
+  resolved_transport: "wsl_open_ssh" | "putty" | "unsupported";
+  wsl_executable_found: boolean;
+  wsl_distribution_found: boolean;
+  wsl_bash_works: boolean;
+  putty_found: boolean;
+  plink_found: boolean;
+  pscp_found: boolean;
+  supported: boolean;
+  user_message: string;
+  technical_detail: string;
+};
+
 export type ManualMfaSessionCommands = {
-  backend: "wsl";
+  backend: "wsl" | "putty";
   control_path: string;
   control_path_exists: boolean;
   control_socket_filename: string;
@@ -83,7 +97,7 @@ export type ManualMfaSessionResult = {
   last_session_test_stderr: string;
   last_session_test_exit_code: number | null;
   parsed_session_status: ManualMfaSessionStatus;
-  selected_backend: "wsl" | "persistent_shell";
+  selected_backend: "wsl" | "putty" | "persistent_shell";
   wsl_available: boolean | null;
   wsl_ssh_available: boolean | null;
 };
@@ -134,7 +148,7 @@ export type ManualMfaSessionUiState = {
   last_session_test_stderr: string;
   last_session_test_exit_code: number | null;
   parsed_session_status: ManualMfaSessionStatus;
-  selected_backend: "wsl" | "persistent_shell";
+  selected_backend: "wsl" | "putty" | "persistent_shell";
   wsl_available: boolean | null;
   wsl_ssh_available: boolean | null;
   wsl_distro: string;
@@ -570,7 +584,7 @@ export function applyManualMfaSessionResult(
     last_session_test_stderr: result.last_session_test_stderr ?? "",
     last_session_test_exit_code: result.last_session_test_exit_code ?? null,
     parsed_session_status: result.parsed_session_status ?? result.status,
-    selected_backend: "wsl",
+    selected_backend: result.selected_backend,
     wsl_available: result.wsl_available,
     wsl_ssh_available: result.wsl_ssh_available,
     wsl_distro: result.wsl_distro || markers.WSL_DISTRO || current.wsl_distro,
@@ -608,7 +622,7 @@ export function applyManualMfaTerminalLaunchResult(
     last_session_test_result: launch.message,
     control_path_exists: commands.control_path_exists,
     can_run_background_commands: false,
-    selected_backend: "wsl",
+    selected_backend: launch.commands.backend,
     wsl_available: launch.wsl_available,
     wsl_ssh_available: null,
     wsl_distro: commands.wsl_distro,
